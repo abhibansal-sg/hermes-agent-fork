@@ -3171,6 +3171,73 @@ class SessionStore:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: Optional[str] = None,
+        *,
+        platform_message_id: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        tool_calls: Any = None,
+        tool_call_id: Optional[str] = None,
+        display_kind: Optional[str] = None,
+        display_metadata: Optional[Dict[str, Any]] = None,
+        timestamp: Any = None,
+        observed: bool = False,
+    ) -> Optional[int]:
+        """Persist one transcript message through the canonical write path.
+
+        Public append seam for the GPT-Live event pipeline (H1a): durable
+        Live events arrive already normalized and must land with role, tool
+        info, display kind/metadata, a caller-provided timestamp and the
+        ``platform_message_id`` idempotency field — a shape that
+        ``append_to_transcript()``'s dict mapping does not carry (it drops
+        ``display_kind`` and ``display_metadata``).
+
+        Delegates straight to ``SessionDB.append_message()`` — the same
+        single write path ``_append_transcript_message()`` uses. No new
+        table, no second write path, no bypassed validation: the
+        compression-lock and compression-ended checks inside
+        ``SessionDB.append_message()`` apply unchanged, and this wrapper
+        adds an explicit session-existence check so unknown sessions fail
+        cleanly with ``ValueError`` instead of a raw FK constraint error.
+
+        Idempotency is keyed on ``platform_message_id`` (Live's
+        ``event_id``) using the same pre-check guard as the gateway's
+        transient-failure dedupe (#47237): a duplicate event is skipped,
+        never re-inserted, and no idempotency table is added.
+
+        Returns the new message row id, or ``None`` when nothing was
+        written — either no DB is available (in-memory session, matching
+        the class-wide no-DB convention) or the ``platform_message_id``
+        was already persisted. Raises ``ValueError`` for an empty role or
+        an unknown session.
+        """
+        if not role:
+            raise ValueError("append_message requires a non-empty role")
+        if not self._db:
+            return None
+        if not self._db.get_session(session_id):
+            raise ValueError(f"Unknown session: {session_id!r}")
+        if platform_message_id and self._db.has_platform_message_id(
+            session_id, platform_message_id
+        ):
+            return None
+        return self._db.append_message(
+            session_id=session_id,
+            role=role,
+            content=content,
+            tool_name=tool_name,
+            tool_calls=tool_calls,
+            tool_call_id=tool_call_id,
+            platform_message_id=platform_message_id,
+            observed=observed,
+            timestamp=timestamp,
+            display_kind=display_kind,
+            display_metadata=display_metadata,
+        )
+
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> bool:
         """Replace the entire transcript for a session with new messages.
 
