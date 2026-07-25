@@ -158,3 +158,126 @@ def resolve_codex_live_auth_source(
 # Short alias for callers that do not need to name the implementation detail.
 resolve_live_auth_source = resolve_codex_live_auth_source
 
+
+LIVE_AUTH_BRIDGE_UNSUPPORTED = "live_auth_bridge_unsupported"
+_SECRET_KEYS = frozenset({
+    "accessToken",
+    "access_token",
+    "refreshToken",
+    "refresh_token",
+    "authorization",
+    "cookie",
+    "cookies",
+})
+
+
+@dataclass(frozen=True)
+class CodexAuthPreflight:
+    """Pure app-server auth plan; execution remains owned by the caller."""
+
+    mode: str
+    login_method: Optional[str]
+    login_params: Optional[dict[str, str]]
+    read_method: str = "account/read"
+    read_params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CodexAccountVerification:
+    ok: bool
+    code: str
+    account_id: Optional[str] = field(default=None, repr=False)
+
+
+def build_external_login_request(source: CodexLiveAuthSource) -> dict[str, Any]:
+    """Build the memory-only app-server external login request."""
+    if source.mode != "external" or not source.available:
+        raise ValueError("external Codex auth is not available")
+    if not source.access_token or not source.account_id:
+        raise ValueError("external Codex auth is incomplete")
+    params: dict[str, Any] = {
+        "type": "chatgptAuthTokens",
+        "accessToken": source.access_token,
+        "chatgptAccountId": source.account_id,
+    }
+    if source.plan_type:
+        params["chatgptPlanType"] = source.plan_type
+    return {"method": "account/login/start", "params": params}
+
+
+def build_account_read_request() -> dict[str, Any]:
+    return {"method": "account/read", "params": {}}
+
+
+def build_auth_preflight(source: CodexLiveAuthSource) -> CodexAuthPreflight:
+    """Select external memory-login or bundled managed-auth compatibility."""
+    if source.mode == "external" and source.available:
+        request = build_external_login_request(source)
+        return CodexAuthPreflight(
+            mode="external",
+            login_method=request["method"],
+            login_params=request["params"],
+        )
+    return CodexAuthPreflight(
+        mode="managed",
+        login_method=None,
+        login_params=None,
+    )
+
+
+def verify_codex_account(
+    response: Mapping[str, Any], expected_account_id: str
+) -> CodexAccountVerification:
+    """Verify account/read is a ChatGPT account for the expected identity."""
+    account = response.get("account")
+    if not isinstance(account, Mapping):
+        account = response
+    account_type = (
+        account.get("type")
+        or account.get("accountType")
+        or account.get("account_type")
+    )
+    if str(account_type or "").strip().lower() not in {"chatgpt", "chatgpt_account"}:
+        return CodexAccountVerification(False, "account_type_mismatch")
+    account_id = _claim_string(
+        account,
+        "chatgptAccountId",
+        "chatgpt_account_id",
+        "id",
+    )
+    if not account_id or account_id != expected_account_id:
+        return CodexAccountVerification(False, "account_identity_mismatch")
+    return CodexAccountVerification(True, "verified", account_id)
+
+
+def classify_external_login_error(error: BaseException) -> str:
+    """Map app-server rejection to a stable, non-sensitive classification."""
+    code = str(getattr(error, "code", "") or "").lower()
+    message = str(getattr(error, "message", "") or error).lower()
+    unsupported_markers = (
+        "chatgpTauthtokens".lower(),
+        "unsupported",
+        "invalid params",
+        "unknown auth",
+        "method not found",
+    )
+    if code in {"-32601", "-32602", LIVE_AUTH_BRIDGE_UNSUPPORTED} or any(
+        marker in message for marker in unsupported_markers
+    ):
+        return LIVE_AUTH_BRIDGE_UNSUPPORTED
+    return "live_auth_bridge_failed"
+
+
+def redact_auth_payload(value: Any) -> Any:
+    """Return evidence-safe data without tokens, cookies, or auth headers."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): "[REDACTED]" if str(key) in _SECRET_KEYS else redact_auth_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_auth_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_auth_payload(item) for item in value)
+    return value
+

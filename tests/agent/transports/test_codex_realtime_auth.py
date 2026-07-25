@@ -6,7 +6,16 @@ import base64
 import json
 import time
 
-from agent.transports.codex_realtime import resolve_codex_live_auth_source
+from agent.transports.codex_realtime import (
+    LIVE_AUTH_BRIDGE_UNSUPPORTED,
+    build_account_read_request,
+    build_auth_preflight,
+    build_external_login_request,
+    classify_external_login_error,
+    redact_auth_payload,
+    resolve_codex_live_auth_source,
+    verify_codex_account,
+)
 
 
 def _jwt(claims: dict) -> str:
@@ -111,3 +120,73 @@ def test_missing_account_claim_does_not_export_seeded_secret():
     assert result.error_code == "missing_account_id"
     assert result.access_token is None
 
+
+def test_external_login_request_has_exact_memory_only_shape():
+    token = _jwt({
+        "exp": time.time() + 3600,
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct-live"},
+    })
+    source = resolve_codex_live_auth_source(_resolver(token))
+
+    request = build_external_login_request(source)
+
+    assert request == {
+        "method": "account/login/start",
+        "params": {
+            "type": "chatgptAuthTokens",
+            "accessToken": token,
+            "chatgptAccountId": "acct-live",
+        },
+    }
+    assert "refreshToken" not in request["params"]
+
+
+def test_managed_preflight_does_not_construct_external_login():
+    source = resolve_codex_live_auth_source(_resolver("malformed"))
+
+    plan = build_auth_preflight(source)
+
+    assert plan.mode == "managed"
+    assert plan.login_method is None
+    assert plan.login_params is None
+    assert build_account_read_request() == {"method": "account/read", "params": {}}
+
+
+def test_account_read_verifies_type_and_expected_identity():
+    verified = verify_codex_account(
+        {"account": {"type": "chatgpt", "id": "acct-live"}}, "acct-live"
+    )
+    wrong_type = verify_codex_account(
+        {"account": {"type": "api_key", "id": "acct-live"}}, "acct-live"
+    )
+    wrong_identity = verify_codex_account(
+        {"account": {"type": "chatgpt", "id": "other"}}, "acct-live"
+    )
+
+    assert verified.ok and verified.code == "verified"
+    assert not wrong_type.ok and wrong_type.code == "account_type_mismatch"
+    assert not wrong_identity.ok and wrong_identity.code == "account_identity_mismatch"
+
+
+def test_external_login_rejection_is_stable_and_non_sensitive():
+    class Rejected:
+        code = -32602
+        message = "chatgptAuthTokens unsupported; token=secret"
+
+    assert classify_external_login_error(Rejected()) == LIVE_AUTH_BRIDGE_UNSUPPORTED
+
+
+def test_redaction_removes_auth_material_recursively():
+    payload = {
+        "accessToken": "access-secret",
+        "nested": {"refresh_token": "refresh-secret", "status": "ok"},
+        "authorization": "Bearer access-secret",
+    }
+
+    redacted = redact_auth_payload(payload)
+
+    assert redacted == {
+        "accessToken": "[REDACTED]",
+        "nested": {"refresh_token": "[REDACTED]", "status": "ok"},
+        "authorization": "[REDACTED]",
+    }
