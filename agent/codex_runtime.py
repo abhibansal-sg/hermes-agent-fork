@@ -1377,6 +1377,8 @@ class RealtimeHandoffRouter:
         source: Optional[str] = None,
         direct_answer: Optional[str] = None,
         live_tool_definitions: Optional[list[dict[str, Any]]] = None,
+        call_id: Optional[str] = None,
+        remote_item_id: Optional[str] = None,
     ) -> dict[str, Any]:
         from agent.realtime_prompt import build_realtime_delegation_envelope
         from agent.realtime_prompt import (
@@ -1420,6 +1422,14 @@ class RealtimeHandoffRouter:
         from contextlib import nullcontext
 
         overlay = nullcontext()
+        projection_metadata = {
+            "kind": "gpt_live",
+            "handoff_id": str(handoff_id),
+            "call_id": str(call_id or ""),
+            "generation": int(generation),
+        }
+        if remote_item_id:
+            projection_metadata["remote_item_id"] = str(remote_item_id)
         try:
             from gateway.session_context import get_gpt_live_context
             from gateway.gpt_live_foreground import scoped_executor_tool_overlay
@@ -1429,21 +1439,40 @@ class RealtimeHandoffRouter:
                 if (
                     live_context["native_session_id"] != session_id
                     or live_context["generation"] != generation
+                    or (call_id is not None and live_context["call_id"] != call_id)
                 ):
                     return {"status": "stale_live_context", "executor_turns": 0}
+                projection_metadata["call_id"] = live_context["call_id"]
                 overlay = scoped_executor_tool_overlay(
                     self._agent, live_tool_definitions
                 )
         except ImportError:
             pass
-        with overlay:
-            result = self._agent.run_conversation(
-                user_message=envelope,
-                system_message=build_realtime_conversation_start_overlay(),
-                conversation_history=messages,
-                persist_user_message=original_user_message,
-                task_id=effective_task_id,
-            )
+        if _has_realtime_projection(
+            messages,
+            handoff_id=handoff_id,
+            call_id=projection_metadata["call_id"],
+            generation=generation,
+            remote_item_id=remote_item_id,
+        ):
+            completed.add(key)
+            return {"status": "duplicate", "executor_turns": 0}
+        previous_metadata = getattr(self._agent, "_gpt_live_projection_metadata", None)
+        self._agent._gpt_live_projection_metadata = projection_metadata
+        try:
+            with overlay:
+                result = self._agent.run_conversation(
+                    user_message=envelope,
+                    system_message=build_realtime_conversation_start_overlay(),
+                    conversation_history=messages,
+                    persist_user_message=original_user_message,
+                    task_id=effective_task_id,
+                )
+        finally:
+            if previous_metadata is None:
+                self._agent.__dict__.pop("_gpt_live_projection_metadata", None)
+            else:
+                self._agent._gpt_live_projection_metadata = previous_metadata
         if getattr(self._agent, "session_id", None) != session_id:
             raise RuntimeError("realtime handoff changed the active Hermes session")
         completed.add(key)
@@ -1451,9 +1480,160 @@ class RealtimeHandoffRouter:
             "status": "executor_handoff",
             "executor_turns": 1,
             "result": result,
+            "handoff_id": str(handoff_id),
+            "call_id": projection_metadata["call_id"],
+            "generation": int(generation),
         }
 
 
 def route_realtime_handoff(agent, **kwargs: Any) -> dict[str, Any]:
     """Convenience ingress for the active foreground Hermes agent."""
     return RealtimeHandoffRouter(agent).route(**kwargs)
+
+
+def _has_realtime_projection(
+    messages: list[dict],
+    *,
+    handoff_id: str,
+    call_id: str,
+    generation: int,
+    remote_item_id: Optional[str] = None,
+) -> bool:
+    for message in messages or []:
+        metadata = message.get("display_metadata") if isinstance(message, dict) else None
+        if not isinstance(metadata, dict) or metadata.get("kind") != "gpt_live":
+            continue
+        if (
+            metadata.get("handoff_id") == str(handoff_id)
+            and metadata.get("call_id") == str(call_id)
+            and metadata.get("generation") == int(generation)
+            and (
+                remote_item_id is None
+                or metadata.get("remote_item_id") == str(remote_item_id)
+            )
+        ):
+            return True
+    return False
+
+
+def persist_realtime_transcript_item(
+    agent: Any,
+    *,
+    call_id: str,
+    generation: int,
+    remote_item_id: str,
+    role: str,
+    content: str,
+) -> bool:
+    """Project one completed Live item through the native message flush."""
+    if role not in {"user", "assistant"} or not isinstance(content, str) or not content:
+        return False
+    if not isinstance(remote_item_id, str) or not remote_item_id.strip():
+        return False
+    messages = getattr(agent, "_session_messages", None)
+    if not isinstance(messages, list):
+        return False
+    metadata = {
+        "kind": "gpt_live",
+        "call_id": str(call_id),
+        "generation": int(generation),
+        "remote_item_id": remote_item_id,
+        "completed": True,
+    }
+    if any(
+        isinstance(item, dict)
+        and item.get("display_metadata") == metadata
+        for item in messages
+    ):
+        return False
+    messages.append({"role": role, "content": content, "display_metadata": metadata})
+    flush = getattr(agent, "_flush_messages_to_session_db", None)
+    if not callable(flush):
+        messages.pop()
+        return False
+    flush(messages)
+    return True
+
+
+def apply_realtime_conversation_end_overlay(agent: Any) -> str:
+    """Record the end overlay for the next real turn without invoking a model."""
+    from agent.realtime_prompt import build_realtime_conversation_end_overlay
+
+    overlay = build_realtime_conversation_end_overlay()
+    agent._gpt_live_realtime_end_overlay = overlay
+    return overlay
+
+
+class RealtimeConversationCoordinator:
+    """Own the existing realtime lifecycle and one native-session Live lease."""
+
+    def __init__(self, agent: Any, *, call_id: str, lifecycle: Any = None):
+        self.agent = agent
+        self.call_id = str(call_id)
+        self.lifecycle = lifecycle
+        self.generation: Optional[int] = None
+        self._lease = None
+
+    def start(self, *, generation: Optional[int] = None, **lifecycle_kwargs: Any) -> dict[str, Any]:
+        from gateway.gpt_live_foreground import acquire_live_foreground_lease
+        from gateway.session_context import set_gpt_live_context
+
+        if self._lease is not None:
+            return {"status": "started", "generation": self.generation}
+        if self.lifecycle is not None:
+            result = self.lifecycle.start(**lifecycle_kwargs)
+            if result.get("status") != "started":
+                return result
+            generation = result.get("generation", generation)
+        if generation is None:
+            generation = int(getattr(self.lifecycle, "generation", 0) or 0)
+        lease = acquire_live_foreground_lease(
+            getattr(self.agent, "session_id", ""), self.call_id, generation
+        )
+        if lease is None:
+            return {"status": "foreground_busy"}
+        self._lease = lease
+        self.generation = int(generation)
+        set_gpt_live_context(
+            active=True,
+            call_id=self.call_id,
+            generation=self.generation,
+            native_session_id=getattr(self.agent, "session_id", ""),
+        )
+        return {"status": "started", "generation": self.generation}
+
+    def handoff(self, **kwargs: Any) -> dict[str, Any]:
+        if self._lease is None or self.generation is None:
+            return {"status": "inactive", "executor_turns": 0}
+        return route_realtime_handoff(
+            self.agent,
+            generation=self.generation,
+            call_id=self.call_id,
+            **kwargs,
+        )
+
+    def stop(self, *, apply_end_overlay: bool = True, **_kwargs: Any) -> None:
+        from gateway.gpt_live_foreground import foreground_leases
+        from gateway.session_context import clear_gpt_live_context
+
+        if self.lifecycle is not None and getattr(self.lifecycle, "state", "") not in {"stopped", "idle"}:
+            try:
+                self.lifecycle.stop()
+            except Exception:
+                pass
+        if apply_end_overlay:
+            apply_realtime_conversation_end_overlay(self.agent)
+        if self._lease is not None:
+            self._lease.release()
+        foreground_leases.release_session(getattr(self.agent, "session_id", ""))
+        self._lease = None
+        clear_gpt_live_context()
+
+    def startup_failed(self) -> None:
+        self.stop(apply_end_overlay=False)
+
+    def cancellation(self) -> None:
+        self.stop()
+
+    def desk_disconnect(self) -> None:
+        self.stop()

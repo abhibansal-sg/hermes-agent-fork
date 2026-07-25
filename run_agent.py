@@ -2097,6 +2097,10 @@ class AIAgent:
                         and not msg.get("_compressed_summary_has_user_turn")
                         else msg.get("display_kind")
                     ),
+                    display_metadata=(
+                        msg.get("display_metadata")
+                        or getattr(self, "_gpt_live_projection_metadata", None)
+                    ),
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
