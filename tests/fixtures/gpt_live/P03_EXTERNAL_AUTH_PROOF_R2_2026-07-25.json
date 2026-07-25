@@ -1,0 +1,14 @@
+{
+  "binary": "codex-cli 0.144.1",
+  "method_names": [
+    "initialize",
+    "account/login/start",
+    "account/read"
+  ],
+  "auth_source": "external:hermes-auth-store:available",
+  "live_attempts": 1,
+  "status": "live_auth_bridge_unsupported",
+  "compatibility": "managed-auth-only",
+  "account_match": "not_attempted_after_login_rejection",
+  "token_secret_scan": "pass"
+}
