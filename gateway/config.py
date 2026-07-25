@@ -147,6 +147,72 @@ def _coerce_optional_positive_int(value: Any, key: str) -> Optional[int]:
     return parsed
 
 
+def _coerce_bounded_int(
+    value: Any,
+    key: str,
+    default: int,
+    min_value: int,
+    max_value: int,
+) -> int:
+    """Coerce an integer config value inside bounded range."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        logger.warning(
+            "Ignoring invalid %s=%r (expected integer in %d..%d)",
+            key,
+            value,
+            min_value,
+            max_value,
+        )
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid %s=%r (expected integer in %d..%d)",
+            key,
+            value,
+            min_value,
+            max_value,
+        )
+        return default
+    if parsed < min_value or parsed > max_value:
+        logger.warning(
+            "Ignoring invalid %s=%r (expected integer in %d..%d)",
+            key,
+            value,
+            min_value,
+            max_value,
+        )
+        return default
+    return parsed
+
+
+def _coerce_optional_absolute_path(value: Any, key: str) -> str:
+    """Validate optional absolute dependency path settings."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        logger.warning(
+            "Ignoring invalid %s=%r (expected absolute path string or empty)",
+            key,
+            value,
+        )
+        return ""
+    value = value.strip()
+    if not value:
+        return ""
+    if not os.path.isabs(value):
+        logger.warning(
+            "Ignoring invalid %s=%r (expected absolute path when set)",
+            key,
+            value,
+        )
+        return ""
+    return value
+
+
 _SYSTEMD_WATCHDOG_MAX_SECONDS = 2_147_483_647
 
 
@@ -812,6 +878,209 @@ class StreamingConfig:
         )
 
 
+@dataclass
+class GPTLiveConfig:
+    """Configuration for GPT-Live realtime voice integration."""
+
+    enabled: bool = False
+    model: str = "gpt-live-1-codex"
+    protocol_version: str = "v3"
+    voice: str = "sol"
+    mode: str = "full_duplex"
+    codex_binary: str = ""
+    devicecheck_addon: str = ""
+    start_timeout_seconds: int = 45
+    tool_timeout_seconds: int = 30
+    approval_timeout_seconds: int = 120
+    reconnect_window_seconds: int = 120
+    cooldown_default_seconds: int = 300
+    cooldown_max_seconds: int = 3600
+    max_call_minutes: int = 30
+    max_concurrent_tools: int = 1
+    command_queue_limit: int = 32
+    notification_queue_limit: int = 512
+    max_request_bytes: int = 1_048_576
+    max_sdp_bytes: int = 524_288
+    max_tool_arguments_bytes: int = 262_144
+    max_tool_result_bytes: int = 65_536
+    live_tool_allowlist: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "model": self.model,
+            "protocol_version": self.protocol_version,
+            "voice": self.voice,
+            "mode": self.mode,
+            "codex_binary": self.codex_binary,
+            "devicecheck_addon": self.devicecheck_addon,
+            "start_timeout_seconds": self.start_timeout_seconds,
+            "tool_timeout_seconds": self.tool_timeout_seconds,
+            "approval_timeout_seconds": self.approval_timeout_seconds,
+            "reconnect_window_seconds": self.reconnect_window_seconds,
+            "cooldown_default_seconds": self.cooldown_default_seconds,
+            "cooldown_max_seconds": self.cooldown_max_seconds,
+            "max_call_minutes": self.max_call_minutes,
+            "max_concurrent_tools": self.max_concurrent_tools,
+            "command_queue_limit": self.command_queue_limit,
+            "notification_queue_limit": self.notification_queue_limit,
+            "max_request_bytes": self.max_request_bytes,
+            "max_sdp_bytes": self.max_sdp_bytes,
+            "max_tool_arguments_bytes": self.max_tool_arguments_bytes,
+            "max_tool_result_bytes": self.max_tool_result_bytes,
+            "live_tool_allowlist": list(self.live_tool_allowlist),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GPTLiveConfig":
+        data = _coerce_dict(data)
+        defaults = cls()
+
+        model = data.get("model")
+        if not isinstance(model, str) or not model.strip():
+            model = defaults.model
+
+        protocol_version = data.get("protocol_version")
+        if not isinstance(protocol_version, str):
+            protocol_version = defaults.protocol_version
+        protocol_version = protocol_version.strip() if protocol_version else defaults.protocol_version
+        if protocol_version not in {"v2", "v3"}:
+            protocol_version = defaults.protocol_version
+
+        voice = data.get("voice")
+        if not isinstance(voice, str) or not voice.strip():
+            voice = defaults.voice
+
+        mode = data.get("mode")
+        if not isinstance(mode, str):
+            mode = defaults.mode
+        mode = mode.strip() if mode else defaults.mode
+        if mode not in {"full_duplex", "half_duplex"}:
+            mode = defaults.mode
+
+        allowlist_raw = data.get("live_tool_allowlist", [])
+        allowlist: list[str] = []
+        if isinstance(allowlist_raw, list):
+            for item in allowlist_raw:
+                if isinstance(item, str):
+                    item = item.strip()
+                    if item:
+                        allowlist.append(item)
+
+        return cls(
+            enabled=_coerce_bool(data.get("enabled"), False),
+            model=model,
+            protocol_version=protocol_version,
+            voice=voice,
+            mode=mode,
+            codex_binary=_coerce_optional_absolute_path(
+                data.get("codex_binary"), "gpt_live.codex_binary"
+            ),
+            devicecheck_addon=_coerce_optional_absolute_path(
+                data.get("devicecheck_addon"), "gpt_live.devicecheck_addon"
+            ),
+            start_timeout_seconds=_coerce_bounded_int(
+                data.get("start_timeout_seconds"),
+                "gpt_live.start_timeout_seconds",
+                defaults.start_timeout_seconds,
+                1,
+                300,
+            ),
+            tool_timeout_seconds=_coerce_bounded_int(
+                data.get("tool_timeout_seconds"),
+                "gpt_live.tool_timeout_seconds",
+                defaults.tool_timeout_seconds,
+                1,
+                300,
+            ),
+            approval_timeout_seconds=_coerce_bounded_int(
+                data.get("approval_timeout_seconds"),
+                "gpt_live.approval_timeout_seconds",
+                defaults.approval_timeout_seconds,
+                1,
+                300,
+            ),
+            reconnect_window_seconds=_coerce_bounded_int(
+                data.get("reconnect_window_seconds"),
+                "gpt_live.reconnect_window_seconds",
+                defaults.reconnect_window_seconds,
+                0,
+                600,
+            ),
+            cooldown_default_seconds=_coerce_bounded_int(
+                data.get("cooldown_default_seconds"),
+                "gpt_live.cooldown_default_seconds",
+                defaults.cooldown_default_seconds,
+                0,
+                3_600,
+            ),
+            cooldown_max_seconds=_coerce_bounded_int(
+                data.get("cooldown_max_seconds"),
+                "gpt_live.cooldown_max_seconds",
+                defaults.cooldown_max_seconds,
+                0,
+                28_800,
+            ),
+            max_call_minutes=_coerce_bounded_int(
+                data.get("max_call_minutes"),
+                "gpt_live.max_call_minutes",
+                defaults.max_call_minutes,
+                1,
+                120,
+            ),
+            max_concurrent_tools=_coerce_bounded_int(
+                data.get("max_concurrent_tools"),
+                "gpt_live.max_concurrent_tools",
+                defaults.max_concurrent_tools,
+                1,
+                32,
+            ),
+            command_queue_limit=_coerce_bounded_int(
+                data.get("command_queue_limit"),
+                "gpt_live.command_queue_limit",
+                defaults.command_queue_limit,
+                1,
+                512,
+            ),
+            notification_queue_limit=_coerce_bounded_int(
+                data.get("notification_queue_limit"),
+                "gpt_live.notification_queue_limit",
+                defaults.notification_queue_limit,
+                1,
+                2_048,
+            ),
+            max_request_bytes=_coerce_bounded_int(
+                data.get("max_request_bytes"),
+                "gpt_live.max_request_bytes",
+                defaults.max_request_bytes,
+                4_096,
+                16_777_216,
+            ),
+            max_sdp_bytes=_coerce_bounded_int(
+                data.get("max_sdp_bytes"),
+                "gpt_live.max_sdp_bytes",
+                defaults.max_sdp_bytes,
+                4_096,
+                16_777_216,
+            ),
+            max_tool_arguments_bytes=_coerce_bounded_int(
+                data.get("max_tool_arguments_bytes"),
+                "gpt_live.max_tool_arguments_bytes",
+                defaults.max_tool_arguments_bytes,
+                1_024,
+                5_242_880,
+            ),
+            max_tool_result_bytes=_coerce_bounded_int(
+                data.get("max_tool_result_bytes"),
+                "gpt_live.max_tool_result_bytes",
+                defaults.max_tool_result_bytes,
+                1_024,
+                1_572_864,
+            ),
+            live_tool_allowlist=allowlist,
+        )
+
+
 # -----------------------------------------------------------------------------
 # Built-in platform connection checkers
 # -----------------------------------------------------------------------------
@@ -942,6 +1211,7 @@ class GatewayConfig:
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
+    gpt_live: GPTLiveConfig = field(default_factory=GPTLiveConfig)
 
     # Session store pruning: drop SessionEntry records older than this many
     # days from the in-memory dict and sessions.json.  Keeps the store from
@@ -1074,6 +1344,7 @@ class GatewayConfig:
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
+            "gpt_live": self.gpt_live.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
             "profile_routes": [
                 asdict(r) if is_dataclass(r) and not isinstance(r, type) else r
@@ -1212,6 +1483,7 @@ class GatewayConfig:
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
+            gpt_live=GPTLiveConfig.from_dict(data.get("gpt_live", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
         )
@@ -1380,6 +1652,16 @@ def load_gateway_config() -> GatewayConfig:
                 streaming_cfg = gateway_section.get("streaming")
             if isinstance(streaming_cfg, dict):
                 gw_data["streaming"] = streaming_cfg
+
+            # gpt_live settings: accept both ``gpt_live:`` and
+            # ``gateway.gpt_live:`` with top-level precedence.
+            gpt_live_cfg = yaml_cfg.get("gpt_live")
+            if gpt_live_cfg is None and isinstance(gateway_section, dict):
+                gpt_live_cfg = gateway_section.get("gpt_live")
+            if "gpt_live" in yaml_cfg:
+                gw_data["gpt_live"] = gpt_live_cfg
+            elif gpt_live_cfg is not None:
+                gw_data["gpt_live"] = gpt_live_cfg
 
             if "reset_triggers" in yaml_cfg:
                 gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
