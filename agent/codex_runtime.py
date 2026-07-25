@@ -1354,3 +1354,83 @@ __all__ = [
     "_consume_codex_event_stream",
     "make_codex_app_server_event_bridge",
 ]
+class RealtimeHandoffRouter:
+    """Route GPT-Live backend help through the active Hermes executor.
+
+    This is intentionally a small ingress seam.  It does not create a
+    session, persist an envelope, dispatch a tool, or enqueue Mailroom work.
+    """
+
+    def __init__(self, agent):
+        self._agent = agent
+
+    def route(
+        self,
+        *,
+        handoff_id: str,
+        generation: int,
+        input_text: str,
+        transcript_delta: str,
+        messages: list[dict],
+        effective_task_id: str,
+        original_user_message: Any = None,
+        source: Optional[str] = None,
+        direct_answer: Optional[str] = None,
+    ) -> dict[str, Any]:
+        from agent.realtime_prompt import build_realtime_delegation_envelope
+
+        if direct_answer is not None:
+            return {
+                "status": "direct_answer",
+                "final_response": direct_answer,
+                "executor_turns": 0,
+            }
+
+        current_generation = getattr(self._agent, "_gpt_live_realtime_generation", None)
+        if current_generation is None:
+            setattr(self._agent, "_gpt_live_realtime_generation", generation)
+            current_generation = generation
+        if current_generation != generation:
+            return {
+                "status": "stale_generation",
+                "executor_turns": 0,
+            }
+
+        completed = getattr(self._agent, "_gpt_live_handoff_keys", None)
+        if completed is None:
+            completed = set()
+            setattr(self._agent, "_gpt_live_handoff_keys", completed)
+        key = (generation, str(handoff_id))
+        if key in completed:
+            return {
+                "status": "duplicate",
+                "executor_turns": 0,
+            }
+
+        envelope = build_realtime_delegation_envelope(
+            input_text,
+            transcript_delta,
+            source=source,
+        )
+        session_id = getattr(self._agent, "session_id", None)
+        result = run_codex_app_server_turn(
+            self._agent,
+            user_message=envelope,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=False,
+        )
+        if getattr(self._agent, "session_id", None) != session_id:
+            raise RuntimeError("realtime handoff changed the active Hermes session")
+        completed.add(key)
+        return {
+            "status": "executor_handoff",
+            "executor_turns": 1,
+            "result": result,
+        }
+
+
+def route_realtime_handoff(agent, **kwargs: Any) -> dict[str, Any]:
+    """Convenience ingress for the active foreground Hermes agent."""
+    return RealtimeHandoffRouter(agent).route(**kwargs)

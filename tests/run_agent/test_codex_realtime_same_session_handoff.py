@@ -1,0 +1,107 @@
+"""H09 same-session GPT-Live handoff tests."""
+
+from __future__ import annotations
+
+from agent import codex_runtime
+
+
+class Agent:
+    def __init__(self):
+        self.session_id = "native-session-1"
+        self.platform = "desktop"
+
+
+def _kwargs():
+    return {
+        "handoff_id": "handoff-1",
+        "generation": 7,
+        "input_text": "Find the answer",
+        "transcript_delta": "find the answer",
+        "messages": [{"role": "user", "content": "existing"}],
+        "effective_task_id": "native-session-1",
+    }
+
+
+def test_backend_handoff_uses_existing_executor_once_and_preserves_session(monkeypatch):
+    agent = Agent()
+    calls = []
+
+    def fake_executor(agent, **kwargs):
+        calls.append((agent, kwargs))
+        return {"final_response": "authoritative result"}
+
+    monkeypatch.setattr(codex_runtime, "run_codex_app_server_turn", fake_executor)
+
+    result = codex_runtime.route_realtime_handoff(agent, **_kwargs())
+
+    assert result["status"] == "executor_handoff"
+    assert result["executor_turns"] == 1
+    assert len(calls) == 1
+    assert calls[0][0] is agent
+    assert calls[0][1]["user_message"].startswith("<realtime_delegation>")
+    assert agent.session_id == "native-session-1"
+    assert agent.platform == "desktop"
+
+
+def test_same_handoff_id_and_generation_cannot_repeat_executor_work(monkeypatch):
+    agent = Agent()
+    calls = []
+    monkeypatch.setattr(
+        codex_runtime,
+        "run_codex_app_server_turn",
+        lambda agent, **kwargs: calls.append(kwargs) or {"final_response": "ok"},
+    )
+
+    first = codex_runtime.route_realtime_handoff(agent, **_kwargs())
+    duplicate = codex_runtime.route_realtime_handoff(agent, **_kwargs())
+    tail = codex_runtime.route_realtime_handoff(
+        agent, **{**_kwargs(), "source": "transcript_tail_flush"}
+    )
+
+    assert first["executor_turns"] == 1
+    assert duplicate["status"] == "duplicate"
+    assert tail["status"] == "duplicate"
+    assert len(calls) == 1
+
+
+def test_direct_live_answer_creates_zero_executor_turns(monkeypatch):
+    agent = Agent()
+    calls = []
+    monkeypatch.setattr(
+        codex_runtime,
+        "run_codex_app_server_turn",
+        lambda *args, **kwargs: calls.append(True),
+    )
+
+    result = codex_runtime.route_realtime_handoff(
+        agent, **{**_kwargs(), "direct_answer": "No backend needed"}
+    )
+
+    assert result == {
+        "status": "direct_answer",
+        "final_response": "No backend needed",
+        "executor_turns": 0,
+    }
+    assert calls == []
+
+
+def test_new_generation_can_route_once_without_creating_a_child(monkeypatch):
+    agent = Agent()
+    calls = []
+    monkeypatch.setattr(
+        codex_runtime,
+        "run_codex_app_server_turn",
+        lambda agent, **kwargs: calls.append(kwargs) or {"final_response": "ok"},
+    )
+
+    codex_runtime.route_realtime_handoff(agent, **_kwargs())
+    agent._gpt_live_realtime_generation = 8
+    result = codex_runtime.route_realtime_handoff(
+        agent, **{**_kwargs(), "generation": 8, "handoff_id": "handoff-2"}
+    )
+
+    assert result["executor_turns"] == 1
+    assert len(calls) == 2
+    assert not hasattr(agent, "parent_session_id")
+    assert not hasattr(agent, "mailroom_task")
+
