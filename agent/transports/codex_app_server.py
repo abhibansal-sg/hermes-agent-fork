@@ -143,6 +143,7 @@ class CodexAppServerClient:
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._notifications: queue.Queue = queue.Queue()
         self._server_requests: queue.Queue = queue.Queue()
         self._stderr_lines: list[str] = []
@@ -187,6 +188,7 @@ class CodexAppServerClient:
         if self._closed:
             return
         self._closed = True
+        self._wake_pending_requests("codex app-server client is closed")
         try:
             if self._proc.stdin and not self._proc.stdin.closed:
                 self._proc.stdin.close()
@@ -222,7 +224,8 @@ class CodexAppServerClient:
         q: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[rid] = _Pending(queue=q, method=method)
-        self._send({"id": rid, "method": method, "params": params or {}})
+        with self._send_lock:
+            self._send({"id": rid, "method": method, "params": params or {}})
         try:
             msg = q.get(timeout=timeout)
         except queue.Empty:
@@ -242,11 +245,13 @@ class CodexAppServerClient:
 
     def notify(self, method: str, params: Optional[dict] = None) -> None:
         """Send a JSON-RPC notification (no id, no response expected)."""
-        self._send({"method": method, "params": params or {}})
+        with self._send_lock:
+            self._send({"method": method, "params": params or {}})
 
     def respond(self, request_id: Any, result: dict) -> None:
         """Reply to a server-initiated request (e.g. approval prompts)."""
-        self._send({"id": request_id, "result": result})
+        with self._send_lock:
+            self._send({"id": request_id, "result": result})
 
     def respond_error(
         self, request_id: Any, code: int, message: str, data: Optional[Any] = None
@@ -255,7 +260,8 @@ class CodexAppServerClient:
         err: dict[str, Any] = {"code": code, "message": message}
         if data is not None:
             err["data"] = data
-        self._send({"id": request_id, "error": err})
+        with self._send_lock:
+            self._send({"id": request_id, "error": err})
 
     def take_notification(self, timeout: float = 0.0) -> Optional[dict]:
         """Pop the next streaming notification, or return None on timeout.
@@ -335,6 +341,8 @@ class CodexAppServerClient:
         except Exception as exc:
             with self._stderr_lock:
                 self._stderr_lines.append(f"<stdout reader error> {exc}")
+        finally:
+            self._wake_pending_requests("codex app-server stdout reader ended")
 
     def _dispatch(self, msg: dict) -> None:
         # Reply (has id + result/error, no method)
@@ -354,6 +362,20 @@ class CodexAppServerClient:
         # Notification (no id)
         if "method" in msg:
             self._notifications.put(msg)
+
+    def _wake_pending_requests(self, message: str) -> None:
+        """Wake all pending requests with a stable redacted transport error."""
+        with self._pending_lock:
+            if not self._pending:
+                return
+            pending = list(self._pending.values())
+            self._pending.clear()
+        payload = {"error": {"code": -32000, "message": message}}
+        for item in pending:
+            try:
+                item.queue.put_nowait(payload)
+            except queue.Full:  # pragma: no cover - defensive
+                pass
 
     def _read_stderr(self) -> None:
         if self._proc.stderr is None:

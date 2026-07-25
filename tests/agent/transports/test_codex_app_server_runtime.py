@@ -7,6 +7,11 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import io
+import queue
+import threading
+import time
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -378,3 +383,91 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("HOME", "/users/alice")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("HOME") == "/users/alice"
+
+
+class TestCodexAppServerConcurrencyAndShutdown:
+    """Transport-level serialization and deterministic exit wake behavior."""
+
+    @staticmethod
+    def _build_fake_popen(monkeypatch, stdout: bytes = b"") -> None:
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO(stdout)
+                self.stderr = io.BytesIO()
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self.returncode = 0
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        return cas
+
+    def test_request_send_is_serialized(self, monkeypatch) -> None:
+        cas = self._build_fake_popen(monkeypatch, stdout=b"")
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+        original_send = client._send
+
+        def fake_send(payload: dict) -> None:
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            # Keep response deterministic and fast.
+            time.sleep(0.005)
+            with active_lock:
+                active -= 1
+            client._dispatch({"id": payload["id"], "result": {"ok": True}})
+
+        monkeypatch.setattr(client, "_send", fake_send)
+
+        def worker() -> None:
+            result = client.request("echo", params={"value": 1}, timeout=1.0)
+            assert result == {"ok": True}
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+        assert not any(t.is_alive() for t in threads)
+        assert max_active == 1
+
+        # Restore send helper for this client to avoid surprises in future callers.
+        monkeypatch.setattr(client, "_send", original_send)
+
+    def test_close_wakes_pending_requests_with_stable_error(self, monkeypatch) -> None:
+        cas = self._build_fake_popen(monkeypatch, stdout=b"")
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        q: queue.Queue = queue.Queue(maxsize=1)
+
+        with client._pending_lock:
+            client._pending[1] = cas._Pending(
+                queue=q,
+                method="thread/start",
+            )
+
+        client.close()
+        msg = q.get(timeout=1.0)
+        assert "error" in msg
+        assert msg["error"]["code"] == -32000
+        assert msg["error"]["message"] == "codex app-server client is closed"
