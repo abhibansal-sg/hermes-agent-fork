@@ -1,0 +1,255 @@
+{
+  "capture_id": "p02-handoff-expiry-2026-07-25",
+  "captures": {
+    "default": {
+      "capture_version": 1,
+      "captured_at": "2026-07-25T00:49:45Z",
+      "client_managed_handoffs": false,
+      "codex_turns_completed": 0,
+      "codex_turns_started": 0,
+      "handoff_requests": 0,
+      "model": "gpt-live-1-codex",
+      "outcome": "pass",
+      "probe_timing": {
+        "session_end_monotonic": null,
+        "session_start_monotonic": 945168.918986291,
+        "tool_call_seen_monotonic": null
+      },
+      "protocol_version": "v3",
+      "provenance": "standalone-live-handoff-probe",
+      "realtime_session_id": "019f96bf-780d-7c50-a12f-3a53a600e758",
+      "realtime_start_params": {
+        "codexResponseHandoffMode": "bemTags",
+        "codexResponseItemPrefix": null,
+        "codexResponsesAsItems": false,
+        "flushTranscriptTailOnSessionEnd": true,
+        "includeStartupContext": false,
+        "initialItems": [],
+        "model": "gpt-live-1-codex",
+        "outputModality": "audio",
+        "prompt": "You are a concise voice assistant. Use registered tools when explicitly requested. Hand off tasks requiring Codex work through the negotiated delegation path.",
+        "realtimeSessionId": null,
+        "threadId": "019f96bf-780d-7c50-a12f-3a53a600e758",
+        "transport": {
+          "type": "webrtc"
+        },
+        "version": "v3",
+        "voice": "sol"
+      },
+      "redaction_version": "v1",
+      "source_digest": "b61c88a17a718024fb22fcc8ad244b8996b1b1f792c40627365c1e59967901eb",
+      "source_path": "/Volumes/MainData/Developer/products/gpt-live-one/src/standalone_live.py",
+      "stats": {
+        "avas_session_started": true,
+        "close_reason": null,
+        "codex_turns_completed": 0,
+        "codex_turns_started": 0,
+        "delegation_type": "client",
+        "handoff_requests": 0,
+        "last_error": null,
+        "model": "gpt-live-1-codex",
+        "tool_calls": 0,
+        "version": "v3",
+        "webrtc_connected": true
+      },
+      "thread_id": "019f96bf-780d-7c50-a12f-3a53a600e758",
+      "thread_start_params": {
+        "config": {
+          "features.realtime_conversation": true,
+          "realtime": {}
+        },
+        "dynamicTools": [
+          {
+            "description": "Return the supplied text exactly for tool-path verification.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text"
+              ],
+              "type": "object"
+            },
+            "name": "echo_probe",
+            "type": "function"
+          }
+        ],
+        "ephemeral": true,
+        "model": "gpt-live-1-codex",
+        "serviceName": "codex_desktop",
+        "threadSource": "user"
+      },
+      "tool_calls": 0
+    },
+    "client_managed_handoffs": {
+      "capture_version": 1,
+      "captured_at": "2026-07-25T00:50:15Z",
+      "client_managed_handoffs": true,
+      "codex_turns_completed": 0,
+      "codex_turns_started": 0,
+      "handoff_requests": 0,
+      "model": "gpt-live-1-codex",
+      "outcome": "pass",
+      "probe_timing": {
+        "session_end_monotonic": null,
+        "session_start_monotonic": 945198.761903541,
+        "tool_call_seen_monotonic": null
+      },
+      "protocol_version": "v3",
+      "provenance": "standalone-live-handoff-probe",
+      "realtime_session_id": "019f96bf-ec9c-7480-b0ae-7b62921796e5",
+      "realtime_start_params": {
+        "clientManagedHandoffs": true,
+        "codexResponseHandoffMode": "bemTags",
+        "codexResponseItemPrefix": null,
+        "codexResponsesAsItems": false,
+        "flushTranscriptTailOnSessionEnd": true,
+        "includeStartupContext": false,
+        "initialItems": [],
+        "model": "gpt-live-1-codex",
+        "outputModality": "audio",
+        "prompt": "You are a concise voice assistant. Use registered tools when explicitly requested. Hand off tasks requiring Codex work through the negotiated delegation path.",
+        "realtimeSessionId": null,
+        "threadId": "019f96bf-ec9c-7480-b0ae-7b62921796e5",
+        "transport": {
+          "type": "webrtc"
+        },
+        "version": "v3",
+        "voice": "sol"
+      },
+      "redaction_version": "v1",
+      "source_digest": "b61c88a17a718024fb22fcc8ad244b8996b1b1f792c40627365c1e59967901eb",
+      "source_path": "/Volumes/MainData/Developer/products/gpt-live-one/src/standalone_live.py",
+      "stats": {
+        "avas_session_started": true,
+        "close_reason": null,
+        "codex_turns_completed": 0,
+        "codex_turns_started": 0,
+        "delegation_type": "client",
+        "handoff_requests": 0,
+        "last_error": null,
+        "model": "gpt-live-1-codex",
+        "tool_calls": 0,
+        "version": "v3",
+        "webrtc_connected": true
+      },
+      "thread_id": "019f96bf-ec9c-7480-b0ae-7b62921796e5",
+      "thread_start_params": {
+        "config": {
+          "features.realtime_conversation": true,
+          "realtime": {}
+        },
+        "dynamicTools": [
+          {
+            "description": "Return the supplied text exactly for tool-path verification.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text"
+              ],
+              "type": "object"
+            },
+            "name": "echo_probe",
+            "type": "function"
+          }
+        ],
+        "ephemeral": true,
+        "model": "gpt-live-1-codex",
+        "serviceName": "codex_desktop",
+        "threadSource": "user"
+      },
+      "tool_calls": 0
+    },
+    "tool_expiry_probe": {
+      "capture_version": 1,
+      "captured_at": "2026-07-25T00:50:46Z",
+      "client_managed_handoffs": false,
+      "codex_turns_completed": 0,
+      "codex_turns_started": 0,
+      "handoff_requests": 0,
+      "model": "gpt-live-1-codex",
+      "outcome": "pass",
+      "probe_timing": {
+        "session_end_monotonic": null,
+        "session_start_monotonic": 945229.203118375,
+        "tool_call_seen_monotonic": null
+      },
+      "protocol_version": "v3",
+      "provenance": "standalone-live-handoff-probe",
+      "realtime_session_id": "019f96c0-6376-7842-9b76-cede1bbb55d9",
+      "realtime_start_params": {
+        "codexResponseHandoffMode": "bemTags",
+        "codexResponseItemPrefix": null,
+        "codexResponsesAsItems": false,
+        "flushTranscriptTailOnSessionEnd": true,
+        "includeStartupContext": false,
+        "initialItems": [],
+        "model": "gpt-live-1-codex",
+        "outputModality": "audio",
+        "prompt": "You are a concise voice assistant. Use registered tools when explicitly requested. Hand off tasks requiring Codex work through the negotiated delegation path.",
+        "realtimeSessionId": null,
+        "threadId": "019f96c0-6376-7842-9b76-cede1bbb55d9",
+        "transport": {
+          "type": "webrtc"
+        },
+        "version": "v3",
+        "voice": "sol"
+      },
+      "redaction_version": "v1",
+      "source_digest": "b61c88a17a718024fb22fcc8ad244b8996b1b1f792c40627365c1e59967901eb",
+      "source_path": "/Volumes/MainData/Developer/products/gpt-live-one/src/standalone_live.py",
+      "stats": {
+        "avas_session_started": true,
+        "close_reason": null,
+        "codex_turns_completed": 0,
+        "codex_turns_started": 0,
+        "delegation_type": "client",
+        "handoff_requests": 0,
+        "last_error": null,
+        "model": "gpt-live-1-codex",
+        "tool_calls": 0,
+        "version": "v3",
+        "webrtc_connected": true
+      },
+      "thread_id": "019f96c0-6376-7842-9b76-cede1bbb55d9",
+      "thread_start_params": {
+        "config": {
+          "features.realtime_conversation": true,
+          "realtime": {}
+        },
+        "dynamicTools": [
+          {
+            "description": "Return the supplied text exactly for tool-path verification.",
+            "inputSchema": {
+              "additionalProperties": false,
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text"
+              ],
+              "type": "object"
+            },
+            "name": "echo_probe",
+            "type": "function"
+          }
+        ],
+        "ephemeral": true,
+        "model": "gpt-live-1-codex",
+        "serviceName": "codex_desktop",
+        "threadSource": "user"
+      },
+      "tool_calls": 0
+    }
+  }
+}

@@ -78,9 +78,79 @@
         "schema_contains_item_tool_call",
         "schema_contains_dynamic_tool_call_params"
       ]
+    },
+    {
+      "id": "p02_handoff_mode_summary",
+      "provenance_classification": "service_evidence",
+      "source": {
+        "path": "/Volumes/MainData/Developer/products/gpt-live-one/artifacts/p02-handoff-expiry/P02_HANDOFF_SUMMARY_2026-07-25.json",
+        "sha256": "294108c45223f641ed7ec913869614759e5ec404a8546400ef84c789938b0859",
+        "size_bytes": 8682,
+        "status": "available"
+      },
+      "committed": {
+        "filename": "P02_HANDOFF_SUMMARY_2026-07-25.json",
+        "sha256": "294108c45223f641ed7ec913869614759e5ec404a8546400ef84c789938b0859",
+        "size_bytes": 8682
+      },
+      "timing_units": "monotonic_seconds",
+      "capture_version": 1,
+      "redaction_version": "v1",
+      "model": "gpt-live-1-codex",
+      "protocol": "v3",
+      "capabilities": [
+        "handoff_mode_payload_capture",
+        "client_managed_handoffs_observed",
+        "mode_timing_captured",
+        "replay_correlation_available"
+      ],
+      "expected_assertions": [
+        "mode_probe_contains_default_and_client_managed_entries",
+        "client_managed_flag_false_in_default_true_in_client_mode",
+        "tool_call_counts_are_captured_per_mode",
+        "handoff_requests_captured_as_zero_in_default_and_client_modes"
+      ]
+    },
+    {
+      "id": "p02_handoff_replay",
+      "provenance_classification": "service_evidence",
+      "source": {
+        "path": "/Volumes/MainData/Developer/products/gpt-live-one/artifacts/p02-handoff-expiry/P02_HANDOFF_REPLAY_2026-07-25.jsonl",
+        "sha256": "3c38c807017a98a3cf1948446cafb2ff79b5d6aeba17fcf73b9e80f999ba33a8",
+        "size_bytes": 11695,
+        "status": "available"
+      },
+      "committed": {
+        "filename": "P02_HANDOFF_REPLAY_2026-07-25.jsonl",
+        "sha256": "3c38c807017a98a3cf1948446cafb2ff79b5d6aeba17fcf73b9e80f999ba33a8",
+        "size_bytes": 11695
+      },
+      "timing_units": "monotonic_seconds",
+      "capture_version": 1,
+      "redaction_version": "v1",
+      "model": "gpt-live-1-codex",
+      "protocol": "v3",
+      "capabilities": [
+        "realtime_transcript_replay",
+        "ordering_preserved_with_mode"
+      ],
+      "expected_assertions": [
+        "replay_rows_are_parseable_json",
+        "replay_contains_all_modes",
+        "replay_has_monotonic_order_within_mode"
+      ]
     }
   ],
   "unavailable": [
+    {
+      "id": "transcript_replay",
+      "provenance_classification": "missing_service_evidence",
+      "status": "unavailable",
+      "committed": {
+        "filename": null
+      },
+      "reason": "P01 transcript replay fixture was not captured as a service-issued tool/response pairing was not observed."
+    },
     {
       "id": "dynamic_tool_call_request",
       "provenance_classification": "missing_service_evidence",
@@ -100,22 +170,13 @@
       "reason": "service-issued item/tool/call response fixture from P01 is unavailable in the checked-in artifacts"
     },
     {
-      "id": "transcript_replay",
-      "provenance_classification": "missing_service_evidence",
-      "status": "unavailable",
-      "committed": {
-        "filename": null
-      },
-      "reason": "real realtime transcript replay fixture was not produced for this packet"
-    },
-    {
       "id": "clientManagedHandoffs_comparison",
       "provenance_classification": "missing_service_evidence",
       "status": "unavailable",
       "committed": {
         "filename": null
       },
-      "reason": "default-vs-clientManagedHandoffs comparison was not available"
+      "reason": "P02 handoff comparison was inferred from service stats and no Codex handoff path transition was emitted."
     },
     {
       "id": "remote_expiry_measurement",

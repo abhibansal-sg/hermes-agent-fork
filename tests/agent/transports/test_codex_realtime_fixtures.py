@@ -72,7 +72,14 @@ def test_manifest_matches_available_fixtures() -> None:
 
         assert expected_source_sha == expected_committed_sha
         assert expected_source_size == expected_committed_size
-        assert fixture.get("provenance_classification") == "historical_recovered"
+        provenance = fixture.get("provenance_classification")
+        assert provenance in {"historical_recovered", "service_evidence"}
+        if provenance == "service_evidence":
+            assert fixture["capture_version"] == 1
+            assert isinstance(fixture.get("redaction_version"), str)
+            assert fixture.get("model")
+            assert fixture.get("protocol")
+            assert fixture.get("timing_units") == "monotonic_seconds"
         assert "expected_assertions" in fixture
 
 
@@ -166,6 +173,8 @@ def test_app_server_schema_assertions() -> None:
         "RECOVERED_REALTIME_DYNAMIC_TOOLS_2026-07-24.json",
         "LIVE_MODEL_CATALOG_2026-07-25.json",
         "codex_app_server_protocol.schemas.json",
+        "P02_HANDOFF_SUMMARY_2026-07-25.json",
+        "P02_HANDOFF_REPLAY_2026-07-25.jsonl",
     ],
 )
 def test_committed_fixtures_have_no_seeded_secrets(committed_filename: str) -> None:
@@ -179,3 +188,36 @@ def test_committed_fixtures_have_no_seeded_secrets(committed_filename: str) -> N
                 f"{committed_filename}: suspicious credential-like string matching "
                 f"{pattern.pattern}: {match.group(0)[:40]!r}"
             )
+
+
+def test_p02_handoff_fixtures_capture_shape() -> None:
+    manifest = _load_manifest()
+    fixtures = {fixture["id"]: fixture for fixture in manifest["fixtures"]}
+
+    summary = fixtures["p02_handoff_mode_summary"]
+    assert summary["source"]["path"].endswith("P02_HANDOFF_SUMMARY_2026-07-25.json")
+    assert summary["committed"]["filename"] == "P02_HANDOFF_SUMMARY_2026-07-25.json"
+
+    replay = fixtures["p02_handoff_replay"]
+    assert replay["source"]["path"].endswith("P02_HANDOFF_REPLAY_2026-07-25.jsonl")
+    assert replay["committed"]["filename"] == "P02_HANDOFF_REPLAY_2026-07-25.jsonl"
+
+    summary_data = _load_json(FIXTURE_DIR / "P02_HANDOFF_SUMMARY_2026-07-25.json")
+    captures = summary_data["captures"]
+    assert set(captures.keys()) == {
+        "default",
+        "client_managed_handoffs",
+        "tool_expiry_probe",
+    }
+    assert captures["default"]["client_managed_handoffs"] is False
+    assert captures["client_managed_handoffs"]["client_managed_handoffs"] is True
+    assert captures["default"]["tool_calls"] == 0
+    assert captures["client_managed_handoffs"]["tool_calls"] == 0
+
+    replay_lines = [
+        line for line in (FIXTURE_DIR / "P02_HANDOFF_REPLAY_2026-07-25.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    methods = [json.loads(line)["method"] for line in replay_lines]
+    assert "thread/realtime/started" in methods
+    assert "thread/realtime/transcript/done" in methods
