@@ -1,0 +1,139 @@
+{
+  "manifest_format_version": "1.0",
+  "artifact_set_id": "gpt-live-h02-r-2026-07-25",
+  "redaction_version": "1.0",
+  "fixtures": [
+    {
+      "id": "recovered_realtime_dynamic_tools_2026-07-24_json",
+      "provenance_classification": "historical_recovered",
+      "source": {
+        "path": "/Volumes/MainData/Developer/products/gpt-live-one/artifacts/RECOVERED_REALTIME_DYNAMIC_TOOLS_2026-07-24.json",
+        "sha256": "b234bb7a1c7a10b851dcf075b39ecf5b9a96e9ee097d398e7fc65e5f1d0c2080",
+        "size_bytes": 41758,
+        "status": "available"
+      },
+      "committed": {
+        "filename": "RECOVERED_REALTIME_DYNAMIC_TOOLS_2026-07-24.json",
+        "sha256": "b234bb7a1c7a10b851dcf075b39ecf5b9a96e9ee097d398e7fc65e5f1d0c2080",
+        "size_bytes": 41758
+      },
+      "capabilities": [
+        "historical_dynamic_tool_snapshot",
+        "exact_tool_count=20",
+        "expected_namespaces=codex_app,plugin_management"
+      ],
+      "expected_assertions": [
+        "recovered_tools_has_dynamic_tools_container",
+        "recovered_tools_total_count_20",
+        "recovered_tools_group_namespaced_by_codex_app_and_plugin_management",
+        "recovered_tools_has_automation_update_and_uninstall_plugin"
+      ]
+    },
+    {
+      "id": "live_model_catalog_2026-07-25_json",
+      "provenance_classification": "historical_recovered",
+      "source": {
+        "path": "/Volumes/MainData/Developer/products/gpt-live-one/artifacts/LIVE_MODEL_CATALOG_2026-07-25.json",
+        "sha256": "be7297ff8637b02ebf233b7be70daa8850162837a8bdcea6e8c2f3796cf5017e",
+        "size_bytes": 1925,
+        "status": "available"
+      },
+      "committed": {
+        "filename": "LIVE_MODEL_CATALOG_2026-07-25.json",
+        "sha256": "be7297ff8637b02ebf233b7be70daa8850162837a8bdcea6e8c2f3796cf5017e",
+        "size_bytes": 1925
+      },
+      "capabilities": [
+        "gpt_live_model_catalog",
+        "alias_and_route_assertions"
+      ],
+      "expected_assertions": [
+        "model_catalog_has_gpt_live_models",
+        "model_aliases_include_gpt_live_1_codex_v3",
+        "model_catalog_captured_metadata_present"
+      ]
+    },
+    {
+      "id": "codex_app_server_protocol_schemas_json",
+      "provenance_classification": "historical_recovered",
+      "source": {
+        "path": "/Volumes/MainData/Developer/products/gpt-live-one/artifacts/codex-proto/codex_app_server_protocol.schemas.json",
+        "sha256": "706c5f35a032fdf44dbe99cf0f82ce75b8b5eee21bf9036d8263f07bf8b3a9a5",
+        "size_bytes": 585592,
+        "status": "available"
+      },
+      "committed": {
+        "filename": "codex_app_server_protocol.schemas.json",
+        "sha256": "706c5f35a032fdf44dbe99cf0f82ce75b8b5eee21bf9036d8263f07bf8b3a9a5",
+        "size_bytes": 585592
+      },
+      "capabilities": [
+        "app_server_protocol_schema",
+        "jsonrpc_request_shapes",
+        "realtime_method_definitions"
+      ],
+      "expected_assertions": [
+        "schema_contains_initialize_and_thread_start",
+        "schema_contains_realtime_start",
+        "schema_contains_item_tool_call",
+        "schema_contains_dynamic_tool_call_params"
+      ]
+    }
+  ],
+  "unavailable": [
+    {
+      "id": "dynamic_tool_call_request",
+      "provenance_classification": "missing_service_evidence",
+      "status": "unavailable",
+      "committed": {
+        "filename": null
+      },
+      "reason": "service-issued item/tool/call request fixture from P01 is unavailable in the checked-in artifacts"
+    },
+    {
+      "id": "dynamic_tool_call_response",
+      "provenance_classification": "missing_service_evidence",
+      "status": "unavailable",
+      "committed": {
+        "filename": null
+      },
+      "reason": "service-issued item/tool/call response fixture from P01 is unavailable in the checked-in artifacts"
+    },
+    {
+      "id": "transcript_replay",
+      "provenance_classification": "missing_service_evidence",
+      "status": "unavailable",
+      "committed": {
+        "filename": null
+      },
+      "reason": "real realtime transcript replay fixture was not produced for this packet"
+    },
+    {
+      "id": "clientManagedHandoffs_comparison",
+      "provenance_classification": "missing_service_evidence",
+      "status": "unavailable",
+      "committed": {
+        "filename": null
+      },
+      "reason": "default-vs-clientManagedHandoffs comparison was not available"
+    },
+    {
+      "id": "remote_expiry_measurement",
+      "provenance_classification": "missing_service_evidence",
+      "status": "unavailable",
+      "committed": {
+        "filename": null
+      },
+      "reason": "remote tool/approval expiry measurement fixture is unavailable"
+    },
+    {
+      "id": "gpt_live_namespace_invocation",
+      "provenance_classification": "missing_service_evidence",
+      "status": "unavailable",
+      "committed": {
+        "filename": null
+      },
+      "reason": "GPT-Live namespace invocation fixture was not captured"
+    }
+  ]
+}
