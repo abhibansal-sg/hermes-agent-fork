@@ -1,0 +1,12 @@
+{
+  "id": 7,
+  "result": {
+    "success": true,
+    "contentItems": [
+      {
+        "type": "inputText",
+        "text": "LIVE_TOOL_OK"
+      }
+    ]
+  }
+}

@@ -1,0 +1,3 @@
+{"item_id":"19ec1d9b","type":"userMessage","text":"Hi"}
+{"item_id":"6f5b2d11","type":"agentMessage","text":"How can I help?"}
+{"item_id":"3c2f7f3a","type":"toolCall","text":"ask_hermes"}

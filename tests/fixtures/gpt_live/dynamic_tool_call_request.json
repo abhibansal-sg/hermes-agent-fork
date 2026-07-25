@@ -1,0 +1,13 @@
+{
+  "id": 7,
+  "method": "item/tool/call",
+  "params": {
+    "threadId": "thread-1",
+    "turnId": "turn-1",
+    "callId": "call-1",
+    "tool": "echo_probe",
+    "arguments": {
+      "text": "LIVE_TOOL_OK"
+    }
+  }
+}

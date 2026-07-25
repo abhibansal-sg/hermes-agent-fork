@@ -1,0 +1,71 @@
+{
+  "captured_at": "2026-07-25",
+  "public_models": [
+    {
+      "display_name": "GPT-Live-1",
+      "published_callable_api_id": null,
+      "status": "public ChatGPT product model"
+    },
+    {
+      "display_name": "GPT-Live-1 mini",
+      "published_callable_api_id": null,
+      "status": "public ChatGPT product model"
+    }
+  ],
+  "intelligence_routes": [
+    {
+      "selection": "Instant",
+      "live_model": "GPT-Live-1",
+      "background_model": "GPT-5.5 Instant",
+      "reasoning_effort": null
+    },
+    {
+      "selection": "Medium",
+      "live_model": "GPT-Live-1",
+      "background_model": "GPT-5.5 Thinking",
+      "reasoning_effort": "medium"
+    },
+    {
+      "selection": "High",
+      "live_model": "GPT-Live-1",
+      "background_model": "GPT-5.5 Thinking",
+      "reasoning_effort": "high"
+    },
+    {
+      "selection": "Mini",
+      "live_model": "GPT-Live-1 mini",
+      "background_model": "GPT-5.5 Instant",
+      "reasoning_effort": null
+    }
+  ],
+  "locally_recovered_aliases": [
+    {
+      "model": "gpt-live-1-codex",
+      "protocol_version": "v3",
+      "surface": "ChatGPT desktop Voice in Codex",
+      "status": "current effective alias; live-proven"
+    },
+    {
+      "model": "gpt-live-1-boulder-alpha",
+      "protocol_version": "v1",
+      "surface": "ChatGPT desktop renderer fallback",
+      "status": "stale; currently denied"
+    },
+    {
+      "model": "gpt-realtime",
+      "protocol_version": null,
+      "surface": "public Realtime API legacy bridge",
+      "status": "separate from the private ChatGPT/Codex Live path"
+    }
+  ],
+  "not_recovered": [
+    "private endpoint alias for Instant",
+    "private endpoint alias for Medium",
+    "private endpoint alias for High",
+    "private iPhone alias for GPT-Live-1 mini"
+  ],
+  "sources": [
+    "https://openai.com/index/introducing-gpt-live/",
+    "https://help.openai.com/en/articles/20001274-gpt-live-faq"
+  ]
+}

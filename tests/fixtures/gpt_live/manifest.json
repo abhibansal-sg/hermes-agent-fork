@@ -1,0 +1,162 @@
+{
+  "manifest_version": "1",
+  "artifact_set": "gpt-live-p00-h02",
+  "generated_at": "2026-07-25T08:07:00Z",
+  "redaction_version": "2.0.0",
+  "redaction_patterns": [
+    "sk-",
+    "OPENAI_API_KEY",
+    "xoxb-",
+    "ghp_",
+    "eyJ"
+  ],
+  "source_materials": [
+    {
+      "id": "standalone_recovered_tools",
+      "path": "RECOVERED_REALTIME_DYNAMIC_TOOLS_2026-07-24.json",
+      "source": "/Volumes/MainData/Developer/products/gpt-live-one/artifacts/RECOVERED_REALTIME_DYNAMIC_TOOLS_2026-07-24.json",
+      "sha256": "b234bb7a1c7a10b851dcf075b39ecf5b9a96e9ee097d398e7fc65e5f1d0c2080",
+      "notes": "Sanitized recovered definitions used by standalone harness"
+    },
+    {
+      "id": "standalone_model_catalog",
+      "path": "LIVE_MODEL_CATALOG_2026-07-25.json",
+      "source": "/Volumes/MainData/Developer/products/gpt-live-one/artifacts/LIVE_MODEL_CATALOG_2026-07-25.json",
+      "sha256": "be7297ff8637b02ebf233b7be70daa8850162837a8bdcea6e8c2f3796cf5017e",
+      "notes": "Public/live route evidence used for default model/routing assertions"
+    },
+    {
+      "id": "app_server_protocol_schema",
+      "path": "codex_app_server_protocol.schemas.json",
+      "source": "/Volumes/MainData/Developer/products/gpt-live-one/artifacts/codex-proto/codex_app_server_protocol.schemas.json",
+      "sha256": "706c5f35a032fdf44dbe99cf0f82ce75b8b5eee21bf9036d8263f07bf8b3a9a5",
+      "notes": "Static schema fixture for protocol digest checks"
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "recovered_dynamic_tools",
+      "file": "recovered_realtime_tools.json",
+      "sha256": "b234bb7a1c7a10b851dcf075b39ecf5b9a96e9ee097d398e7fc65e5f1d0c2080",
+      "status": "available",
+      "size_bytes": 41758,
+      "capabilities": [
+        "codex_namespace_count",
+        "plugin_management_namespace_present",
+        "tool_capture_screen_context"
+      ],
+      "expected": {
+        "namespace_count": 2,
+        "tool_count": 20,
+        "has_capture_screen_context": true,
+        "has_ask_hermes": false,
+        "has_plugin_management_namespace": true
+      }
+    },
+    {
+      "id": "live_model_catalog",
+      "file": "live_model_catalog.json",
+      "sha256": "be7297ff8637b02ebf233b7be70daa8850162837a8bdcea6e8c2f3796cf5017e",
+      "status": "available",
+      "size_bytes": 1925,
+      "capabilities": [
+        "model_aliases",
+        "protocol_version_recovery"
+      ],
+      "expected": {
+        "default_alias": "gpt-live-1-codex",
+        "active_protocol_version": "v3",
+        "alias_status": "current effective alias; live-proven"
+      }
+    },
+    {
+      "id": "app_server_protocol_schema",
+      "file": "codex_app_server_protocol.schemas.json",
+      "sha256": "706c5f35a032fdf44dbe99cf0f82ce75b8b5eee21bf9036d8263f07bf8b3a9a5",
+      "status": "available",
+      "size_bytes": 585592,
+      "capabilities": [
+        "app_server_protocol_digest",
+        "schema_contract"
+      ],
+      "expected": {
+        "schema_root": "definitions",
+        "contains_thread_start": true
+      }
+    },
+    {
+      "id": "tool_call_request",
+      "file": "dynamic_tool_call_request.json",
+      "sha256": "7f9fdeeb7653a0cf09ef812194ef45c3bdf4f1459d4b3325089a60ab7b486f77",
+      "status": "available",
+      "size_bytes": 219,
+      "capabilities": [
+        "tool_call_shape",
+        "tool_call_request"
+      ],
+      "expected": {
+        "id": 7,
+        "method": "item/tool/call",
+        "tool": "echo_probe"
+      }
+    },
+    {
+      "id": "tool_call_response",
+      "file": "dynamic_tool_call_response.json",
+      "sha256": "f2c8516ab3dba75861ff101ddb4f10201bccb41b68eb9fd11cb7e4ec6d406e3b",
+      "status": "available",
+      "size_bytes": 158,
+      "capabilities": [
+        "tool_call_shape",
+        "tool_call_response"
+      ],
+      "expected": {
+        "success": true
+      }
+    },
+    {
+      "id": "transcript_replay",
+      "file": "transcript_replay.jsonl",
+      "sha256": "ec9dfbd6a0dc33ff6696f60d039e820b64defcff375f3ba17e1015cea78b66b8",
+      "status": "available",
+      "size_bytes": 187,
+      "capabilities": [
+        "transcript_replay_dedup"
+      ],
+      "expected": {
+        "expected_items": 3,
+        "expected_duplicates": 0
+      }
+    },
+    {
+      "id": "recoverable_realtime_rollout",
+      "file": "recovered_realtime_rollout.jsonl",
+      "sha256": null,
+      "status": "unavailable",
+      "capabilities": [
+        "rollout_forensic_trace"
+      ],
+      "missing_reason": "Not copied from evidence workspace into harness checkout to avoid PII/credential drift and keep repository self-contained.",
+      "expected": {
+        "available": false
+      }
+    }
+  ],
+  "assertions": {
+    "required_fixture_ids": [
+      "recovered_dynamic_tools",
+      "live_model_catalog",
+      "app_server_protocol_schema",
+      "tool_call_request",
+      "tool_call_response",
+      "transcript_replay"
+    ],
+    "required_capability_groups": [
+      "codex_namespace_count",
+      "model_aliases",
+      "app_server_protocol_digest",
+      "tool_call_shape",
+      "transcript_replay_dedup"
+    ]
+  }
+}
