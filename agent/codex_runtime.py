@@ -1378,6 +1378,9 @@ class RealtimeHandoffRouter:
         direct_answer: Optional[str] = None,
     ) -> dict[str, Any]:
         from agent.realtime_prompt import build_realtime_delegation_envelope
+        from agent.realtime_prompt import (
+            build_realtime_conversation_start_overlay,
+        )
 
         if direct_answer is not None:
             return {
@@ -1413,13 +1416,12 @@ class RealtimeHandoffRouter:
             source=source,
         )
         session_id = getattr(self._agent, "session_id", None)
-        result = run_codex_app_server_turn(
-            self._agent,
+        result = self._agent.run_conversation(
             user_message=envelope,
-            original_user_message=original_user_message,
-            messages=messages,
-            effective_task_id=effective_task_id,
-            should_review_memory=False,
+            system_message=build_realtime_conversation_start_overlay(),
+            conversation_history=messages,
+            persist_user_message=original_user_message,
+            task_id=effective_task_id,
         )
         if getattr(self._agent, "session_id", None) != session_id:
             raise RuntimeError("realtime handoff changed the active Hermes session")
