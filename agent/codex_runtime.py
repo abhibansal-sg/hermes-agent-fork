@@ -1480,9 +1480,6 @@ class RealtimeHandoffRouter:
             "status": "executor_handoff",
             "executor_turns": 1,
             "result": result,
-            "handoff_id": str(handoff_id),
-            "call_id": projection_metadata["call_id"],
-            "generation": int(generation),
         }
 
 
