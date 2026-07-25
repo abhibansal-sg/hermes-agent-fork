@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agent import codex_runtime
 
 
@@ -105,3 +107,99 @@ def test_new_generation_can_route_once_without_creating_a_child(monkeypatch):
     assert not hasattr(agent, "parent_session_id")
     assert not hasattr(agent, "mailroom_task")
 
+
+def test_stale_generation_creates_zero_executor_turns(monkeypatch):
+    agent = Agent()
+    agent._gpt_live_realtime_generation = 8
+    calls = []
+    monkeypatch.setattr(
+        codex_runtime,
+        "run_codex_app_server_turn",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    result = codex_runtime.route_realtime_handoff(agent, **_kwargs())
+
+    assert result == {
+        "status": "stale_generation",
+        "executor_turns": 0,
+    }
+    assert calls == []
+    assert agent.session_id == "native-session-1"
+    assert agent.platform == "desktop"
+
+
+def test_executor_error_propagates_without_completing_handoff(monkeypatch):
+    agent = Agent()
+    calls = []
+
+    def failing_executor(agent, **kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("executor failed")
+
+    monkeypatch.setattr(codex_runtime, "run_codex_app_server_turn", failing_executor)
+
+    with pytest.raises(RuntimeError, match="executor failed"):
+        codex_runtime.route_realtime_handoff(agent, **_kwargs())
+
+    assert calls and len(calls) == 1
+    assert agent.session_id == "native-session-1"
+    assert agent.platform == "desktop"
+    assert (7, "handoff-1") not in agent._gpt_live_handoff_keys
+
+    monkeypatch.setattr(
+        codex_runtime,
+        "run_codex_app_server_turn",
+        lambda agent, **kwargs: {"final_response": "retry succeeded"},
+    )
+    retry = codex_runtime.route_realtime_handoff(agent, **_kwargs())
+    assert retry["status"] == "executor_handoff"
+
+
+def test_cancellation_propagates_without_completing_handoff(monkeypatch):
+    agent = Agent()
+    calls = []
+
+    def cancelled_executor(agent, **kwargs):
+        calls.append(kwargs)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(codex_runtime, "run_codex_app_server_turn", cancelled_executor)
+
+    with pytest.raises(KeyboardInterrupt):
+        codex_runtime.route_realtime_handoff(agent, **_kwargs())
+
+    assert calls and len(calls) == 1
+    assert agent.session_id == "native-session-1"
+    assert agent.platform == "desktop"
+    assert (7, "handoff-1") not in agent._gpt_live_handoff_keys
+
+
+def test_successful_result_is_returned_exactly_once(monkeypatch):
+    agent = Agent()
+    calls = []
+    executor_result = {
+        "final_response": "authoritative result",
+        "completed": True,
+    }
+
+    def successful_executor(agent, **kwargs):
+        calls.append(kwargs)
+        return executor_result
+
+    monkeypatch.setattr(codex_runtime, "run_codex_app_server_turn", successful_executor)
+
+    first = codex_runtime.route_realtime_handoff(agent, **_kwargs())
+    replay = codex_runtime.route_realtime_handoff(agent, **_kwargs())
+
+    assert first == {
+        "status": "executor_handoff",
+        "executor_turns": 1,
+        "result": executor_result,
+    }
+    assert replay == {
+        "status": "duplicate",
+        "executor_turns": 0,
+    }
+    assert "result" not in replay
+    assert len(calls) == 1
