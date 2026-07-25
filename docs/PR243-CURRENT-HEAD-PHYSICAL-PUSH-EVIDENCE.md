@@ -1,7 +1,7 @@
 # PR #243 current-head physical push evidence
 
-Date: 2026-07-24  
-Code head: `518fde7e409f47ca96d7f61a074384b35ac816d1`  
+Date: 2026-07-24
+Code head: `518fde7e409f47ca96d7f61a074384b35ac816d1`
 Device: physical iPhone 16 Pro Max,
 `07EE6E1F-3258-5E27-8167-C7CF8842E62D`
 
