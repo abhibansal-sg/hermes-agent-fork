@@ -255,6 +255,17 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
         {"role": "user", "content": "earlier"},
         {"role": "assistant", "content": "prior answer"},
     ]
+    persisted = session_db.get_messages(session_id)
+    persisted_messages = [
+        {"role": message["role"], "content": message["content"]}
+        for message in persisted
+    ]
+    assert persisted_messages == [
+        {"role": "user", "content": "earlier"},
+        {"role": "assistant", "content": "prior answer"},
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": "fresh answer"},
+    ]
 
 
 @pytest.mark.asyncio

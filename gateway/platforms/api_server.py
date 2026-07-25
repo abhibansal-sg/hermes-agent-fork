@@ -3361,6 +3361,18 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        full_history = self._build_response_conversation_history(
+            history,
+            user_message,
+            result,
+            final_response,
+        )
+        db = await self._ensure_session_db_async()
+        await asyncio.to_thread(
+            db.replace_messages,
+            effective_session_id or session_id,
+            full_history,
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
