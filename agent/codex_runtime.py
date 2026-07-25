@@ -1376,6 +1376,7 @@ class RealtimeHandoffRouter:
         original_user_message: Any = None,
         source: Optional[str] = None,
         direct_answer: Optional[str] = None,
+        live_tool_definitions: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         from agent.realtime_prompt import build_realtime_delegation_envelope
         from agent.realtime_prompt import (
@@ -1416,13 +1417,33 @@ class RealtimeHandoffRouter:
             source=source,
         )
         session_id = getattr(self._agent, "session_id", None)
-        result = self._agent.run_conversation(
-            user_message=envelope,
-            system_message=build_realtime_conversation_start_overlay(),
-            conversation_history=messages,
-            persist_user_message=original_user_message,
-            task_id=effective_task_id,
-        )
+        from contextlib import nullcontext
+
+        overlay = nullcontext()
+        try:
+            from gateway.session_context import get_gpt_live_context
+            from gateway.gpt_live_foreground import scoped_executor_tool_overlay
+
+            live_context = get_gpt_live_context()
+            if live_context["active"]:
+                if (
+                    live_context["native_session_id"] != session_id
+                    or live_context["generation"] != generation
+                ):
+                    return {"status": "stale_live_context", "executor_turns": 0}
+                overlay = scoped_executor_tool_overlay(
+                    self._agent, live_tool_definitions
+                )
+        except ImportError:
+            pass
+        with overlay:
+            result = self._agent.run_conversation(
+                user_message=envelope,
+                system_message=build_realtime_conversation_start_overlay(),
+                conversation_history=messages,
+                persist_user_message=original_user_message,
+                task_id=effective_task_id,
+            )
         if getattr(self._agent, "session_id", None) != session_id:
             raise RuntimeError("realtime handoff changed the active Hermes session")
         completed.add(key)

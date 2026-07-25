@@ -13866,6 +13866,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation,
         )
 
+        _foreground_text_lease = None
+        try:
+            from gateway.gpt_live_foreground import acquire_text_foreground_lease
+
+            _foreground_text_lease = acquire_text_foreground_lease(
+                session_entry.session_id,
+                session_key,
+                run_generation,
+            )
+        except Exception:
+            logger.debug("Failed to acquire native text foreground lease", exc_info=True)
+        if _foreground_text_lease is None:
+            self._clear_session_env(_session_env_tokens)
+            return "A realtime voice call is active for this session. Please try again when it ends."
+
         try:
             # Emit agent:start hook
             hook_ctx = {
@@ -14616,6 +14631,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            if _foreground_text_lease is not None:
+                _foreground_text_lease.release()
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 

@@ -113,6 +113,14 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# GPT-Live identity is task-local, just like the native session identity. The
+# process-local foreground lease remains the authority for ownership; these
+# values let tools and executor seams reject stale or cross-session callers.
+_GPT_LIVE_ACTIVE: ContextVar = ContextVar("HERMES_GPT_LIVE_ACTIVE", default=False)
+_GPT_LIVE_CALL_ID: ContextVar = ContextVar("HERMES_GPT_LIVE_CALL_ID", default="")
+_GPT_LIVE_GENERATION: ContextVar = ContextVar("HERMES_GPT_LIVE_GENERATION", default=None)
+_GPT_LIVE_SESSION_ID: ContextVar = ContextVar("HERMES_GPT_LIVE_SESSION_ID", default="")
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -213,6 +221,42 @@ def set_session_vars(
     return tokens
 
 
+def set_gpt_live_context(
+    *,
+    active: bool,
+    call_id: str = "",
+    generation: int | None = None,
+    native_session_id: str = "",
+) -> list:
+    """Bind the current task to one GPT-Live call identity."""
+    if active and (not call_id or generation is None or not native_session_id):
+        raise ValueError("active GPT-Live context requires call, generation, and session")
+    return [
+        _GPT_LIVE_ACTIVE.set(bool(active)),
+        _GPT_LIVE_CALL_ID.set(str(call_id) if active else ""),
+        _GPT_LIVE_GENERATION.set(int(generation) if active else None),
+        _GPT_LIVE_SESSION_ID.set(str(native_session_id) if active else ""),
+    ]
+
+
+def clear_gpt_live_context() -> None:
+    """Clear GPT-Live state for the current task."""
+    _GPT_LIVE_ACTIVE.set(False)
+    _GPT_LIVE_CALL_ID.set("")
+    _GPT_LIVE_GENERATION.set(None)
+    _GPT_LIVE_SESSION_ID.set("")
+
+
+def get_gpt_live_context() -> dict[str, Any]:
+    """Return the current task's GPT-Live identity without process globals."""
+    return {
+        "active": bool(_GPT_LIVE_ACTIVE.get()),
+        "call_id": _GPT_LIVE_CALL_ID.get(),
+        "generation": _GPT_LIVE_GENERATION.get(),
+        "native_session_id": _GPT_LIVE_SESSION_ID.get(),
+    }
+
+
 def clear_session_vars(tokens: list) -> None:
     """Mark session context variables as explicitly cleared.
 
@@ -244,6 +288,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    clear_gpt_live_context()
     try:
         from agent.runtime_cwd import clear_session_cwd
 
