@@ -221,3 +221,64 @@ def test_p02_handoff_fixtures_capture_shape() -> None:
     methods = [json.loads(line)["method"] for line in replay_lines]
     assert "thread/realtime/started" in methods
     assert "thread/realtime/transcript/done" in methods
+
+
+def test_prompt_block_catalog_manifest_entry_and_shape() -> None:
+    manifest = _load_manifest()
+    fixtures = {fixture["id"]: fixture for fixture in manifest["fixtures"]}
+    fixture = fixtures["desktop_live_prompt_blocks_2026-07-25_json"]
+
+    source = fixture["source"]
+    committed = fixture["committed"]
+    source_path = Path(source["path"])
+    committed_path = FIXTURE_DIR / committed["filename"]
+
+    assert source_path.exists()
+    assert committed_path.exists()
+    assert _sha256(source_path) == source["sha256"]
+    assert _sha256(committed_path) == committed["sha256"]
+    assert source["size_bytes"] == source_path.stat().st_size
+    assert committed["size_bytes"] == committed_path.stat().st_size
+
+    assert source["sha256"] == committed["sha256"]
+    assert source["size_bytes"] == committed["size_bytes"]
+
+    fixture_data = _load_json(committed_path)
+    assert fixture_data["captured_at"] == "2026-07-25"
+    assert fixture_data["scope"].startswith("Sanitized structural catalog")
+    assert fixture_data["session_meta"]["identity"]["originator"] == "Codex Desktop"
+    assert fixture_data["session_meta"]["identity"]["source"] == "vscode"
+    assert fixture_data["session_meta"]["identity"]["thread_source"] == "realtime_voice"
+    assert fixture_data["session_meta"]["keys"] == [
+        "base_instructions",
+        "cli_version",
+        "context_window",
+        "cwd",
+        "dynamic_tools",
+        "history_mode",
+        "id",
+        "model_provider",
+        "originator",
+        "session_id",
+        "source",
+        "thread_source",
+        "timestamp",
+    ]
+
+    initial_blocks = fixture_data["initial_developer_blocks"]
+    assert [b["slug"] for b in initial_blocks] == [
+        "app_context",
+        "memory",
+        "realtime_conversation",
+        "permissions",
+        "apps",
+        "plugins",
+        "skills",
+    ]
+    assert fixture_data["realtime_delegation"]["observed_count"] == 42
+    assert fixture_data["realtime_delegation"]["counts"]["input_transcript_delta"] == 30
+    assert fixture_data["realtime_delegation"]["counts"]["source_input_transcript_delta"] == 12
+
+    handoff_prefix = fixture_data["realtime_delegation"]["required_fields_in_order"]
+    assert handoff_prefix == ["input", "transcript_delta"]
+    assert fixture_data["realtime_delegation"]["optional_prefix_fields"] == ["source"]

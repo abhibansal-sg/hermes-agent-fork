@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-07-25",
+  "scope": "Sanitized structural catalog of the delegated Codex executor prompt and realtime handoff envelopes. It does not contain transcript text, credentials, SDP, audio, or the unrecovered GPT-Live intermediary prompt.",
+  "source": {
+    "rollout": "/Users/abbhinnav/.codex/sessions/2026/07/24/rollout-2026-07-24T17-40-46-019f937f-b0e9-7380-a20d-debed73f20fe.jsonl",
+    "sha256": "b0267d876a0887028b18e2c1e44d56d97a9d4b38a5c6e064f0f2b2b4aeb8d3e2"
+  },
+  "session_meta": {
+    "keys": [
+      "base_instructions",
+      "cli_version",
+      "context_window",
+      "cwd",
+      "dynamic_tools",
+      "history_mode",
+      "id",
+      "model_provider",
+      "originator",
+      "session_id",
+      "source",
+      "thread_source",
+      "timestamp"
+    ],
+    "identity": {
+      "originator": "Codex Desktop",
+      "source": "vscode",
+      "thread_source": "realtime_voice",
+      "model_provider": "custom",
+      "history_mode": "legacy"
+    },
+    "base_instructions": {
+      "bytes": 17766,
+      "sha256": "cbefa6b0bede0e332d957fca70ccacf9f12f4c0ecdf81b819e5cbe1a3b16e265",
+      "top_level_headings": [
+        "Personality",
+        "Working with the user",
+        "Rules for getting work done",
+        "Destructive Actions",
+        "Using skills"
+      ]
+    },
+    "dynamic_tools": {
+      "namespace_count": 2,
+      "tool_count": 20,
+      "namespaces": [
+        {
+          "name": "codex_app",
+          "tool_count": 19
+        },
+        {
+          "name": "plugin_management",
+          "tool_count": 1
+        }
+      ]
+    }
+  },
+  "initial_developer_blocks": [
+    {
+      "order": 0,
+      "slug": "app_context",
+      "opening": "<app-context>",
+      "bytes": 33950,
+      "sha256": "8699675eb6d4b0efacdcf0624115cb272f3565e797024bab14b2dc7e1fb7be6b"
+    },
+    {
+      "order": 1,
+      "slug": "memory",
+      "opening": "## Memory",
+      "bytes": 13848,
+      "sha256": "8641b509ee9774ea4245e8e04be143672f8aceba7f3689595c01afb61cfe3dc4"
+    },
+    {
+      "order": 2,
+      "slug": "realtime_conversation",
+      "opening": "<realtime_conversation>",
+      "bytes": 844,
+      "sha256": "361de5e6b84779501345bd1f561f9032ae4bc668b620b4ed79d2dbded2f24663"
+    },
+    {
+      "order": 3,
+      "slug": "permissions",
+      "opening": "<permissions instructions>",
+      "bytes": 362,
+      "sha256": "681b5ba580483b28751dbafd95e30f80ebb6ab9cc2d3ca4462f0f187d0784070"
+    },
+    {
+      "order": 4,
+      "slug": "apps",
+      "opening": "<apps_instructions>",
+      "bytes": 646,
+      "sha256": "b4536c3dbcedfee06f46c2230eb1080dc225b45187715f41095289bacba3759a"
+    },
+    {
+      "order": 5,
+      "slug": "plugins",
+      "opening": "<plugins_instructions>",
+      "bytes": 1014,
+      "sha256": "81d37acb6feff552b562f712b1e854339d90a0b19aa9f271047cca787f77a51a"
+    },
+    {
+      "order": 6,
+      "slug": "skills",
+      "opening": "<skills_instructions>",
+      "bytes": 16271,
+      "sha256": "8c9452f1a990bf438d9794ae76b22794aaa300c2e32b5d5b04c358ab2eed296b"
+    }
+  ],
+  "additional_runtime_blocks": [
+    "multi_agent_executor_instructions",
+    "multi_agent_mode",
+    "collaboration_mode",
+    "recommended_plugins",
+    "environment_context",
+    "turn_aborted",
+    "realtime_conversation_end"
+  ],
+  "turn_context": {
+    "observed_count": 42,
+    "keys": [
+      "approval_policy",
+      "approvals_reviewer",
+      "collaboration_mode",
+      "comp_hash",
+      "current_date",
+      "cwd",
+      "effort",
+      "file_system_sandbox_policy",
+      "model",
+      "multi_agent_mode",
+      "multi_agent_version",
+      "permission_profile",
+      "personality",
+      "realtime_active",
+      "sandbox_policy",
+      "summary",
+      "timezone",
+      "turn_id",
+      "workspace_roots"
+    ]
+  },
+  "realtime_delegation": {
+    "observed_count": 42,
+    "role": "user",
+    "required_fields_in_order": [
+      "input",
+      "transcript_delta"
+    ],
+    "optional_prefix_fields": [
+      "source"
+    ],
+    "observed_source_values": [
+      "transcript_tail_flush"
+    ],
+    "counts": {
+      "input_transcript_delta": 30,
+      "source_input_transcript_delta": 12
+    }
+  },
+  "realtime_conversation": {
+    "role": "developer",
+    "start_semantics": [
+      "The Codex executor is behind a realtime intermediary.",
+      "The user does not address the executor directly.",
+      "The executor receives the latest transcript and mode metadata.",
+      "Transcript text may be unpunctuated or contain recognition errors.",
+      "The executor should avoid work when backend help is unnecessary.",
+      "Responses should be concise and action-oriented for the intermediary."
+    ],
+    "end_semantics": [
+      "Realtime conversation ended.",
+      "Subsequent typed input is not transcript-style text."
+    ]
+  },
+  "confirmed_realtime_start_fields": [
+    "threadId",
+    "model",
+    "version",
+    "transport",
+    "voice",
+    "outputModality",
+    "prompt",
+    "includeStartupContext",
+    "flushTranscriptTailOnSessionEnd",
+    "codexResponsesAsItems",
+    "codexResponseItemPrefix",
+    "codexResponseHandoffMode",
+    "initialItems",
+    "realtimeSessionId",
+    "clientManagedHandoffs"
+  ],
+  "unrecovered": [
+    "Exact Desktop value of thread/realtime/start.prompt",
+    "Complete remote-only GPT-Live intermediary system instructions",
+    "Any remotely gated GPT-Live-only tool manifest",
+    "A live-proven Hermes OAuth to chatgptAuthTokens bridge"
+  ]
+}

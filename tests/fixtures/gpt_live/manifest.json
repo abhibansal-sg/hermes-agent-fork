@@ -139,6 +139,32 @@
         "replay_contains_all_modes",
         "replay_has_monotonic_order_within_mode"
       ]
+    },
+    {
+      "id": "desktop_live_prompt_blocks_2026-07-25_json",
+      "provenance_classification": "historical_recovered",
+      "source": {
+        "path": "/Volumes/MainData/Developer/products/gpt-live-one/artifacts/DESKTOP_LIVE_PROMPT_BLOCK_CATALOG_2026-07-25.json",
+        "sha256": "f11eed089bc8bfa31d16fb847806edc0d73a614d3d0d11ad7285322bbb7aed44",
+        "size_bytes": 5487,
+        "status": "available"
+      },
+      "committed": {
+        "filename": "desktop_live_prompt_blocks.json",
+        "sha256": "f11eed089bc8bfa31d16fb847806edc0d73a614d3d0d11ad7285322bbb7aed44",
+        "size_bytes": 5487
+      },
+      "capabilities": [
+        "executor_handoff_prompt_block_recovery",
+        "realtime_delegation_structure",
+        "handoff_field_order"
+      ],
+      "expected_assertions": [
+        "session_meta_keys_recovered",
+        "realtime_delegation_42_entries",
+        "handoff_field_order_preserved",
+        "unrecovered_field_inventory_stated"
+      ]
     }
   ],
   "unavailable": [
