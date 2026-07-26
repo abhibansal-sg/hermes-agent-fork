@@ -1,5 +1,15 @@
 # Hermes Mobile — Release Notes
 
+## Build 133 — Notification Privacy — 2026-07-26
+
+### Fixed
+
+- Forgetting a gateway now removes the phone’s APNs token from the push registry before erasing its credentials, so an unpaired app no longer receives notifications.
+
+### Worth testing
+
+- Choose **Forget Gateway & Remove Local Data**, then trigger activity from the former gateway and confirm no notification reaches the unpaired phone.
+
 ## Build 113 — Mobile Foundation — 2026-07-16
 
 ### What’s new
