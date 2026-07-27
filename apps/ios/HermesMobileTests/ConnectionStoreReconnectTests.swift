@@ -1077,6 +1077,94 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
     }
 
+    func testReconnectDrainsOfflinePromptForPassiveSelectionWithoutResume() async throws {
+        let (connection, sessions, chat) = makeStore()
+        let reconnectGate = SuspensionGate()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PassiveReconnectOutbox-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(
+            configuration: WorkRepositoryConfiguration(containerURL: directory),
+            observation: observation
+        )
+        let scope = try WorkScope(serverID: "https://gateway.test", profileID: "default")
+        let queue = QueueStore(
+            repository: repository,
+            observation: observation,
+            scopeProvider: { scope },
+            activeSessionProvider: { sessions.activeStoredId },
+            connectedProvider: { connection.phase == .connected }
+        )
+        var resumeCalls = 0
+        var submittedRuntime: String?
+        var transportReady = true
+        let processor = OutboxProcessor(repository: repository, dependencies: .init(
+            currentScope: { scope },
+            activeStoredSessionID: { sessions.activeStoredId },
+            isTransportReady: { transportReady },
+            createDestination: { _ in
+                XCTFail("existing-session prompt must not create a destination")
+                throw URLError(.badServerResponse)
+            },
+            resolveRuntime: { storedID in
+                XCTAssertEqual(storedID, "B")
+                return "runtime-B"
+            },
+            uploadAsset: { _, _ in
+                XCTFail("plain prompt must not upload")
+                throw URLError(.badServerResponse)
+            },
+            willSubmit: { _, _ in },
+            submit: { job, runtimeID, _ in
+                submittedRuntime = runtimeID
+                return OutboxSubmitResult(
+                    status: "streaming",
+                    accepted: true,
+                    clientMessageID: job.clientMessageID
+                )
+            }
+        ))
+        queue.installProcessor(processor)
+        connection.queueStore = queue
+
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        sessions.transcriptFetch = { _ in [] }
+        sessions.activeListRPC = { SessionActiveListResult(sessions: []) }
+        sessions.resumeRPC = { _, _ in
+            resumeCalls += 1
+            return self.stagedResumeResult(sessionId: "must-not-resume", resumed: "B")
+        }
+        sessions.open(sessionSummary("B"))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertNil(sessions.activeRuntimeId)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+
+        connection.connectRPC = { _, _, _ in
+            await reconnectGate.suspend()
+            transportReady = true
+        }
+        transportReady = false
+        connection._handleGatewayStateForTesting(.failed("offline"))
+        await reconnectGate.waitUntilEntered()
+        let queued = await queue.enqueue("send after reconnect", storedSessionId: "B", wake: true)
+        XCTAssertNotNil(queued)
+        await processor.waitUntilIdleForTesting()
+        XCTAssertNil(submittedRuntime, "the prompt must remain durable while transport is unavailable")
+
+        await reconnectGate.release()
+        await connection.waitForReconnectForTesting()
+        await processor.waitUntilIdleForTesting()
+
+        XCTAssertEqual(resumeCalls, 0, "reconnect must not drive a passive selection")
+        XCTAssertNil(sessions.activeRuntimeId)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertEqual(submittedRuntime, "runtime-B",
+                       "reconnect must wake the outbox even without a visible runtime")
+    }
+
     // MARK: - ABH-448 connection-generation fencing
 
     func testLateOpenAndClosedFromForgottenGenerationCannotRestoreConnection() async {

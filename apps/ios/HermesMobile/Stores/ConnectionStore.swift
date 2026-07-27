@@ -3053,14 +3053,10 @@ final class ConnectionStore {
         if sessionStore.activeStoredId != nil {
             await chatStore.backfill()
             guard isActiveGeneration(generation) else { return false }
-            // Flush the offline outbox now the transcript is current — but only
-            // with a live runtime session, or the queue would burn through with
-            // a "No active session" error (see QueueStore drain notes).
-            if sessionStore.activeRuntimeId != nil {
-                // ABH-465: the durable outbox drains itself — wake() schedules the
-                // flush without blocking reconnect (drain-in-line was the old queue).
-                queueStore?.wake()
-            }
+            // The durable outbox resolves or creates its own runtime destination.
+            // A passively-opened session intentionally has no active runtime, so
+            // gating this wake on one would strand prompts queued while offline.
+            queueStore?.wake()
         }
         await sessionStore.refresh()
         guard isActiveGeneration(generation) else { return false }
