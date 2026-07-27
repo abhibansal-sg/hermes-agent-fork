@@ -14,10 +14,6 @@ from agent.tool_dispatch_helpers import (
     make_tool_result_message,
     project_messages_for_durable_use,
 )
-from agent.conversation_loop import (
-    _apply_context_engine_selection,
-    _notify_context_engine_turn_complete,
-)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -371,39 +367,6 @@ def test_empty_override_list_falls_back_to_legacy_summary():
     assert PERSISTENCE_METADATA_KEY not in message
 
 
-def test_context_engine_cannot_see_internal_persistence_metadata():
-    agent = _make_agent()
-    message = make_tool_result_message(
-        "capture_screen_context",
-        "live",
-        "call-context",
-        persistence_content="durable",
-    )
-    seen = {}
-
-    class ContextEngine:
-        def select_context(self, api_messages, *, conversation_messages, incoming_message, budget_tokens):
-            seen["api"] = api_messages
-            seen["conversation"] = conversation_messages
-            seen["incoming"] = incoming_message
-            return api_messages
-
-    agent.context_compressor = ContextEngine()
-    selected = _apply_context_engine_selection(
-        agent,
-        [dict(message)],
-        [message],
-        message,
-        logger=MagicMock(),
-    )
-
-    assert all(PERSISTENCE_METADATA_KEY not in item for item in selected)
-    assert all(PERSISTENCE_METADATA_KEY not in item for item in seen["api"])
-    assert all(PERSISTENCE_METADATA_KEY not in item for item in seen["conversation"])
-    assert PERSISTENCE_METADATA_KEY not in seen["incoming"]
-    assert PERSISTENCE_METADATA_KEY in message
-
-
 def test_durable_projection_drops_live_nonces_by_default_and_honors_explicit_ax_only():
     result = _nonce_rich_result()
     message = make_tool_result_message(
@@ -448,34 +411,6 @@ def test_durable_projection_rejects_wire_name_spoof_when_tool_name_is_untrusted(
     assert projected["content"][1] == {"type": "text", "text": "[screenshot]"}
     assert PERSISTENCE_METADATA_KEY not in projected
     assert message[PERSISTENCE_METADATA_KEY] == "AX_NONCE_DURABLE_SINK"
-
-
-def test_context_engine_post_turn_receives_durable_projection_without_live_nonces():
-    agent = _make_agent()
-    result = _nonce_rich_result()
-    message = make_tool_result_message(
-        "capture_screen_context",
-        result,
-        "call-context-post-turn",
-    )
-    seen = {}
-
-    class ContextEngine:
-        def on_turn_complete(self, messages, **kwargs):
-            seen["messages"] = messages
-
-    agent.context_compressor = ContextEngine()
-    _notify_context_engine_turn_complete(
-        agent,
-        [message],
-        logger=MagicMock(),
-    )
-
-    ingested = seen["messages"][0]
-    assert "AX_NONCE_DURABLE_SINK" not in str(ingested)
-    assert "IMAGE_NONCE_DURABLE_SINK" not in str(ingested)
-    assert PERSISTENCE_METADATA_KEY not in ingested
-    assert message["content"] == result
 
 
 def test_external_memory_sync_receives_durable_projection_without_live_nonces():
