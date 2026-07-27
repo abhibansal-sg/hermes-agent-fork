@@ -1,5 +1,20 @@
 # Hermes Mobile — Release Notes
 
+## Build 134 — Lean Stock Data Wiring — 2026-07-27
+
+### Improved
+
+- Active transcript opening and “load earlier” now share one bounded stock-gateway read.
+- Removed broad session prefetch and the remaining plugin-era transcript hydration paths.
+- Project and cache results are fenced to the current gateway, profile, and request so stale responses cannot paint a newer connection.
+- An empty cached project is now treated as loaded instead of spinning indefinitely.
+
+### Worth testing
+
+- Open a long session, switch away and back, then load earlier messages; confirm the same transcript remains stable.
+- Switch gateways or profiles while projects are loading; confirm results from the former connection never appear.
+- Open a project with no sessions; confirm it settles on an empty state rather than continuing to load.
+
 ## Build 133 — Notification Privacy — 2026-07-26
 
 ### Fixed
