@@ -24,6 +24,7 @@ working unchanged.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -259,6 +260,75 @@ def _is_multimodal_tool_result(value: Any) -> bool:
     )
 
 
+TOOL_RESULT_PERSISTENCE_CONTENT_KEY = "_tool_result_persistence_content"
+_MULTIMODAL_PERSISTENCE_CONTENT_FIELD = "persistence_content"
+_TRUSTED_PERSISTENCE_TOOL_NAME = "capture_screen_context"
+
+
+def _validate_tool_result_persistence_content(
+    tool_name: str,
+    value: Any,
+) -> str | list | None:
+    """Return a safe persistence override, or ``None`` when malformed.
+
+    Only the trusted screen-capture tool can opt into this durable-content
+    seam.  List values are deliberately limited to strict OpenAI-style text
+    and JPEG data-URL image parts.  In particular, ``default=str`` is not used
+    here: an unserializable object must fall back to the normal safe
+    persistence path rather than becoming a repr in the transcript.
+    """
+    if tool_name != _TRUSTED_PERSISTENCE_TOOL_NAME:
+        return None
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list) or not value:
+        return None
+    for part in value:
+        if not isinstance(part, dict):
+            return None
+        part_type = part.get("type")
+        if part_type == "text":
+            if set(part) != {"type", "text"} or not isinstance(part["text"], str):
+                return None
+            continue
+        if part_type != "image_url" or set(part) != {"type", "image_url"}:
+            return None
+        image_url = part["image_url"]
+        if not isinstance(image_url, dict) or set(image_url) - {"url", "detail"}:
+            return None
+        url = image_url.get("url")
+        if not isinstance(url, str) or not url.startswith("data:image/jpeg;base64,"):
+            return None
+        encoded = url[len("data:image/jpeg;base64,"):]
+        if not encoded:
+            return None
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            return None
+        if base64.b64encode(decoded).decode("ascii") != encoded:
+            return None
+        if not decoded.startswith(b"\xff\xd8\xff") or not decoded.endswith(b"\xff\xd9"):
+            return None
+        if "detail" in image_url and image_url["detail"] not in {"auto", "low", "high"}:
+            return None
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
+def _multimodal_persistence_content(tool_name: str, value: Any) -> str | list | None:
+    """Extract a validated durable-content override from a multimodal envelope."""
+    if not _is_multimodal_tool_result(value):
+        return None
+    return _validate_tool_result_persistence_content(
+        tool_name,
+        value.get(_MULTIMODAL_PERSISTENCE_CONTENT_FIELD)
+    )
+
+
 def _multimodal_text_summary(value: Any) -> str:
     """Extract a plain text view of a multimodal tool result.
 
@@ -414,9 +484,14 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(msg, dict):
         return msg
-    content = msg.get("content")
+    normalized = {
+        key: value
+        for key, value in msg.items()
+        if key != TOOL_RESULT_PERSISTENCE_CONTENT_KEY
+    }
+    content = normalized.get("content")
     if _is_multimodal_tool_result(content):
-        return {**msg, "content": _multimodal_text_summary(content)}
+        return {**normalized, "content": _multimodal_text_summary(content)}
     if isinstance(content, list):
         cleaned = []
         for p in content:
@@ -424,8 +499,8 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
                 cleaned.append({"type": "text", "text": "[screenshot]"})
             else:
                 cleaned.append(p)
-        return {**msg, "content": cleaned}
-    return msg
+        return {**normalized, "content": cleaned}
+    return normalized
 
 
 def make_tool_result_message(
@@ -434,6 +509,7 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
+    persistence_content: Any = None,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -471,6 +547,12 @@ def make_tool_result_message(
             message["_tool_output_risk"] = risk_metadata
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
+    _validated_persistence_content = _validate_tool_result_persistence_content(
+        name,
+        persistence_content
+    )
+    if _validated_persistence_content is not None:
+        message[TOOL_RESULT_PERSISTENCE_CONTENT_KEY] = _validated_persistence_content
     return message
 
 
@@ -616,6 +698,9 @@ __all__ = [
     "_extract_parallel_scope_path",
     "_paths_overlap",
     "_is_multimodal_tool_result",
+    "TOOL_RESULT_PERSISTENCE_CONTENT_KEY",
+    "_validate_tool_result_persistence_content",
+    "_multimodal_persistence_content",
     "_multimodal_text_summary",
     "_append_subdir_hint_to_multimodal",
     "_extract_file_mutation_targets",

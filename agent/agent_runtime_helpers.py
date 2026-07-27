@@ -33,7 +33,11 @@ from typing import Any, Dict, List, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
-from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+from agent.tool_dispatch_helpers import (
+    TOOL_RESULT_PERSISTENCE_CONTENT_KEY,
+    _trajectory_normalize_msg,
+    make_tool_result_message,
+)
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
@@ -2502,6 +2506,14 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 role,
             )
             continue
+        if isinstance(msg, dict) and TOOL_RESULT_PERSISTENCE_CONTENT_KEY in msg:
+            # Durable-policy metadata belongs only to the local message/DB
+            # seam. Never mutate the live message that carries rich content.
+            msg = {
+                key: value
+                for key, value in msg.items()
+                if key != TOOL_RESULT_PERSISTENCE_CONTENT_KEY
+            }
         filtered.append(msg)
     messages = filtered
 

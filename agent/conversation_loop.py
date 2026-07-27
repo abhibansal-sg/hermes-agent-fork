@@ -35,6 +35,7 @@ from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
+from agent.tool_dispatch_helpers import TOOL_RESULT_PERSISTENCE_CONTENT_KEY
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -806,6 +807,7 @@ def run_conversation(
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
+            api_msg.pop(TOOL_RESULT_PERSISTENCE_CONTENT_KEY, None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
