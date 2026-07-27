@@ -2763,11 +2763,18 @@ final class ChatStore {
         // do not install an outbox retain the legacy direct path below.
         if let queueStore {
             let assetInputs = hasAttachments ? (attachments?.draftAssetInputs() ?? []) : []
+            let draftSelectionJSON = connection?.draftSelection.flatMap {
+                try? JSONEncoder().encode($0)
+            }.flatMap {
+                String(data: $0, encoding: .utf8)
+            }
             guard let queued = await queueStore.enqueue(
                 trimmed,
                 storedSessionId: sessions?.activeStoredId,
                 assets: assetInputs,
                 newSession: sessions?.isDraft == true,
+                cwd: sessions?.isDraft == true ? sessions?.draftCwd : nil,
+                modelSelectionJSON: sessions?.isDraft == true ? draftSelectionJSON : nil,
                 wake: false
             ) else {
                 lastError = "Couldn’t save this prompt to the outbox."
@@ -2907,12 +2914,19 @@ final class ChatStore {
         remotePaths: [String]
     ) async throws -> OutboxSubmitResult {
         guard let client else { throw GatewayError.notConnected }
-        prepareOutboxSubmission(job: job, remotePaths: remotePaths)
-        pendingReconnectReconcileID = nil
-        beginLocalTurn()
-        setStreaming(true, reason: "outbox.submit")
-        lastError = nil
-        let priorBindingMode = sessions?.beginPromptSubmission(runtimeID: runtimeSessionID)
+        let presentsInActiveChat =
+            (job.destinationSessionID ?? job.storedSessionID) == sessions?.activeStoredId
+        let priorBindingMode: SessionBindingMode?
+        if presentsInActiveChat {
+            prepareOutboxSubmission(job: job, remotePaths: remotePaths)
+            pendingReconnectReconcileID = nil
+            beginLocalTurn()
+            setStreaming(true, reason: "outbox.submit")
+            lastError = nil
+            priorBindingMode = sessions?.beginPromptSubmission(runtimeID: runtimeSessionID)
+        } else {
+            priorBindingMode = nil
+        }
         do {
             let result = try await client.requestRaw(
                 "prompt.submit",
@@ -2923,6 +2937,7 @@ final class ChatStore {
                 ])
             )
             let receipt = OutboxSubmitResult(json: result)
+            guard presentsInActiveChat else { return receipt }
             if !(receipt.accepted && OutboxProcessor.acceptedDispositions.contains(receipt.status)) {
                 sessions?.restoreWatchAfterRejectedSubmission(
                     runtimeID: runtimeSessionID,
@@ -2933,6 +2948,7 @@ final class ChatStore {
             }
             return receipt
         } catch {
+            guard presentsInActiveChat else { throw error }
             sessions?.restoreWatchAfterRejectedSubmission(
                 runtimeID: runtimeSessionID,
                 priorMode: priorBindingMode

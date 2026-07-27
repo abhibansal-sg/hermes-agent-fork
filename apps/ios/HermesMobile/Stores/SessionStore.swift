@@ -3244,7 +3244,10 @@ final class SessionStore {
     /// before the outbox submit continues. This keeps force-close/reopen honest
     /// while the network catches up.
     private func persistDraftBornCacheSeed(
-        storedID: String, echo: ChatMessage?
+        storedID: String,
+        echo: ChatMessage?,
+        profile: String?,
+        cwd: String?
     ) async {
         sessionLog.notice(
             "[ABH-519] persistDraftBornCacheSeed entry session=\(storedID, privacy: .public)"
@@ -3270,8 +3273,8 @@ final class SessionStore {
             messageCount: 1,
             source: nil,
             lastActive: now,
-            cwd: draftCwd,
-            profile: activeStoredProfile
+            cwd: cwd,
+            profile: profile
         )
         let listIdentity = sessionListIdentity(summary)
         if !sessions.contains(where: { sessionListIdentity($0) == listIdentity }) {
@@ -3283,7 +3286,7 @@ final class SessionStore {
             )
             return
         }
-        guard let identity = cacheIdentity(storedID) else {
+        guard let identity = cacheIdentity(storedID, profile: profile) else {
             sessionLog.error(
                 "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheIdentity-nil"
             )
@@ -3337,34 +3340,85 @@ final class SessionStore {
     /// Materialize the destination for one durable new-session prompt. The
     /// processor persists `storedSessionID` immediately after this returns and
     /// therefore retries/resumes that destination instead of creating another.
-    func createOutboxDestination(job: WorkJob? = nil) async throws -> OutboxDestination {
-        if !isDraft { startDraft() }
-        try await createDraftSession()
-        guard let runtimeSessionID = activeRuntimeId,
-              let storedSessionID = activeStoredId else {
-            throw OutboxProcessorError.destinationUnavailable
-        }
-        if let job {
-            let echo = ChatMessage(
-                role: .user,
-                clientMessageID: job.clientMessageID,
-                text: job.submissionText
+    func createOutboxDestination(job: WorkJob) async throws -> OutboxDestination {
+        guard let client else { throw GatewayError.notConnected }
+        var params: [String: JSONValue] = ["cols": .number(96)]
+        applyProfileScope(to: &params, selectedProfile: job.profileID)
+        if let cwd = job.cwd, !cwd.isEmpty { params["cwd"] = .string(cwd) }
+        let selection = job.modelSelectionJSON?
+            .data(using: .utf8)
+            .flatMap { try? JSONDecoder().decode(DraftModelSelection.self, from: $0) }
+        selection?.apply(toCreateParams: &params)
+
+        let result: SessionOpenResult = try await client.request(
+            "session.create",
+            params: .object(params),
+            timeout: .seconds(120)
+        )
+        let storedSessionID = result.storedSessionId ?? result.sessionId
+        let echo = ChatMessage(
+            role: .user,
+            clientMessageID: job.clientMessageID,
+            text: job.submissionText
+        )
+        let isStillVisibleDraft =
+            job.kind == .prompt
+            && job.intentKind == .newSession
+            && isDraft
+            && chat?.messages.contains(where: {
+                $0.clientMessageID == job.clientMessageID
+            }) == true
+        if isStillVisibleDraft {
+            bindSession(
+                storedID: storedSessionID,
+                runtimeID: result.sessionId,
+                mode: .drive,
+                generation: connection?.transportEpoch
             )
-            persistDurableEcho(storedId: storedSessionID, echo: echo)
+            activeStoredProfile = Self.normalizedProfileID(job.profileID)
+            isDraft = false
             transcriptPaintedStoredId = storedSessionID
-            await persistDraftBornCacheSeed(storedID: storedSessionID, echo: echo)
+            if let info = result.info { connection?.applyRuntimeInfo(info) }
+            await connection?.finishDraftCreation(
+                selection: selection,
+                sessionId: result.sessionId
+            )
+        } else if selection?.fast == false {
+            try? await connection?.sessionSetFast(false, sessionId: result.sessionId)
         }
+        await persistDraftBornCacheSeed(
+            storedID: storedSessionID,
+            echo: echo,
+            profile: job.profileID,
+            cwd: job.cwd
+        )
         return OutboxDestination(
-            runtimeSessionID: runtimeSessionID,
+            runtimeSessionID: result.sessionId,
             storedSessionID: storedSessionID
         )
     }
 
-    /// Resolve only the active affinity. A background queue item for session A
-    /// must never resume or submit into session B merely because B is visible.
+    /// Resolve the job's own destination without moving the visible selection.
     func runtimeForOutboxDestination(_ storedSessionID: String) async -> String? {
-        guard activeStoredId == storedSessionID else { return nil }
-        return await ensureActiveRuntime()
+        if activeStoredId == storedSessionID {
+            return await ensureActiveRuntime()
+        }
+        guard let client else { return nil }
+        do {
+            if case .found(let live) = try await inspectLiveSession(storedID: storedSessionID) {
+                return live.id
+            }
+            var params: [String: JSONValue] = ["session_id": .string(storedSessionID)]
+            applyProfileScope(to: &params)
+            let result: SessionOpenResult = try await client.request(
+                "session.resume",
+                params: .object(params),
+                timeout: .seconds(120)
+            )
+            return result.sessionId
+        } catch {
+            return nil
+        }
     }
 
     /// `prompt.submit` is the deliberate watch -> drive ownership edge. Claim
