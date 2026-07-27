@@ -13,6 +13,20 @@ struct DraftModelSelection: Codable, Equatable, Sendable {
     var provider: String
     var reasoningEffort: String?
     var fast: Bool?
+
+    func apply(toCreateParams params: inout [String: JSONValue]) {
+        if !model.isEmpty {
+            params["model"] = .string(model)
+            if !provider.isEmpty { params["provider"] = .string(provider) }
+        }
+        if let reasoningEffort {
+            params["reasoning_effort"] = .string(
+                reasoningEffort.isEmpty ? "none" : reasoningEffort)
+        }
+        // Stock session.create distinguishes true from omitted, but not an
+        // explicit false. False is normalized once after creation below.
+        if fast == true { params["fast"] = .bool(true) }
+    }
 }
 
 /// Observable owner of the gateway connection lifecycle.
@@ -235,22 +249,16 @@ final class ConnectionStore {
         draftSelection = nil
     }
 
-    /// Apply a pended draft pick to the just-created session. Best-effort BY
-    /// DESIGN: a failure must not block (or lose) the user's first message —
-    /// the session then simply runs on the global default and the pill follows
-    /// the server truth from `session.info`.
-    func applyDraftSelection(sessionId: String) async {
-        guard let d = draftSelection else { return }
+    /// Consume the selection already carried by stock `session.create`.
+    /// The only follow-up stock cannot express is explicit normal mode.
+    func finishDraftCreation(
+        selection: DraftModelSelection?,
+        sessionId: String
+    ) async {
+        guard draftSelection == selection else { return }
         draftSelection = nil
-        if !d.model.isEmpty {
-            let value = d.provider.isEmpty ? d.model : "\(d.model) --provider \(d.provider)"
-            try? await sessionSetModel(value, sessionId: sessionId)
-        }
-        if let effort = d.reasoningEffort {
-            try? await sessionSetReasoning(effort.isEmpty ? "none" : effort, sessionId: sessionId)
-        }
-        if let fast = d.fast {
-            try? await sessionSetFast(fast, sessionId: sessionId)
+        if selection?.fast == false {
+            try? await sessionSetFast(false, sessionId: sessionId)
         }
     }
 

@@ -3193,6 +3193,8 @@ final class SessionStore {
             // every dormant case) — byte-for-byte the shipped create.
             var createParams: [String: JSONValue] = ["cols": .number(96)]
             applyProfileScope(to: &createParams)
+            let draftSelection = connection?.draftSelection
+            draftSelection?.apply(toCreateParams: &createParams)
             // ABH-351: new-session-in-project — pass the captured draft cwd so
             // the session starts rooted at the project's repo (the gateway's
             // session.create honors an optional `cwd` that, when it resolves to
@@ -3221,16 +3223,13 @@ final class SessionStore {
             )
             isDraft = false
             confirmActiveProfile(from: result.info)
-            // Seed the pill from the create echo (the fresh session's actual
-            // defaults) — the draft pick below then overrides via config.set
-            // + the session.info event.
+            // The create echo is already authoritative for the selection sent
+            // in the same request.
             if let info = result.info { connection?.applyRuntimeInfo(info) }
-            // Apply any model pick made while drafting BEFORE the caller
-            // (`ChatStore.send`) submits the first prompt — `config.set
-            // key=model` builds the session agent, so even the FIRST turn runs
-            // on the chosen model (ABH-84 draft-mode pick). Best-effort: a
-            // failure must not block the message.
-            await connection?.applyDraftSelection(sessionId: result.sessionId)
+            await connection?.finishDraftCreation(
+                selection: draftSelection,
+                sessionId: result.sessionId
+            )
             lastError = nil
             // Refresh the list in the background so the new row appears in the
             // drawer; don't block the prompt submission on it.
