@@ -3481,6 +3481,9 @@ final class SessionStore {
             "cols": .number(96),
             "messages": .array(seed),
         ]
+        if let parent = activeStoredId, !parent.isEmpty {
+            params["parent_session_id"] = .string(parent)
+        }
         if let cwd, !cwd.isEmpty { params["cwd"] = .string(cwd) }
         // Branch into the active profile scope (same conditional spot as `cwd`).
         applyProfileScope(to: &params, selectedProfile: activeStoredProfile)
@@ -4024,10 +4027,7 @@ final class SessionStore {
         }
     }
 
-    /// Execute the search against the best available endpoint: plugin first (richer
-    /// results + role-scoped + offset pagination), stock on 404 (older gateways).
-    /// Only falls back on a true 404/not-found — real 500/transport errors are
-    /// re-thrown so they surface as `lastError` and are not silently masked.
+    /// Execute search through the stock gateway endpoint.
     ///
     /// `offset` is forwarded to both the plugin and stock endpoints.
     ///
@@ -4041,25 +4041,13 @@ final class SessionStore {
     func fetchSearch(
         query: String, offset: Int = 0, api: RestClient
     ) async throws -> (results: [SessionSearchResult], rawPageFull: Bool) {
-        let roles = Self.roles(for: searchScope)
-        let sort = searchSort.rawValue
-        do {
-            // Plugin path: forward offset so load-more fetches subsequent
-            // message pages. rawPageFull keys on the raw (pre-collapse) count.
-            let (results, rawPageFull) = try await api.searchSessionsPlugin(
-                query: query, limit: Self.searchPageLimit, offset: offset, sort: sort, roles: roles
-            )
-            return (results, rawPageFull)
-        } catch RestError.badStatus(404, _) {
-            // Plugin endpoint not available on this gateway — fall back to stock.
-            let results = try await api.searchSessions(
-                query: query, limit: Self.searchPageLimit, offset: offset,
-                scope: searchScope.rawValue
-            )
-            // Stock path: rawPageFull = full session page (no pre-collapse step).
-            return (results, results.count == Self.searchPageLimit)
-        }
-        // Any other error (500, transport, decode) propagates to the caller.
+        let results = try await api.searchSessions(
+            query: query,
+            limit: Self.searchPageLimit,
+            offset: offset,
+            scope: searchScope.rawValue
+        )
+        return (results, results.count == Self.searchPageLimit)
     }
 
     /// Map the UI search scope to a list of `role` values for the plugin endpoint.
