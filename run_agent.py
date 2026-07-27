@@ -206,6 +206,7 @@ from agent.tool_dispatch_helpers import (
     _multimodal_text_summary,
     _validate_tool_result_persistence_content,
     TOOL_RESULT_PERSISTENCE_CONTENT_KEY,
+    project_messages_for_durable_use,
     _append_subdir_hint_to_multimodal,  # noqa: F401  # re-exported for tests that `from run_agent import _append_subdir_hint_to_multimodal`
     _extract_file_mutation_targets,
     _extract_landed_file_mutation_paths,
@@ -644,7 +645,10 @@ class AIAgent:
 
         if old_session_id and previous_messages is not None and hasattr(engine, "on_session_end"):
             try:
-                engine.on_session_end(old_session_id, previous_messages)
+                engine.on_session_end(
+                    old_session_id,
+                    project_messages_for_durable_use(previous_messages),
+                )
             except Exception as exc:
                 logger.debug("context engine on_session_end during transition: %s", exc)
 
@@ -3410,7 +3414,7 @@ class AIAgent:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
-                    messages or [],
+                    project_messages_for_durable_use(messages or []),
                 )
             except Exception:
                 pass
@@ -3435,7 +3439,7 @@ class AIAgent:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
-                    messages or [],
+                    project_messages_for_durable_use(messages or []),
                 )
             except Exception:
                 pass
@@ -3488,7 +3492,7 @@ class AIAgent:
         try:
             sync_kwargs = {"session_id": self.session_id or ""}
             if messages is not None:
-                sync_kwargs["messages"] = messages
+                sync_kwargs["messages"] = project_messages_for_durable_use(messages)
             self._memory_manager.sync_all(
                 user_text,
                 response_text,

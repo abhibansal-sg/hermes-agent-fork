@@ -35,7 +35,10 @@ from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
-from agent.tool_dispatch_helpers import TOOL_RESULT_PERSISTENCE_CONTENT_KEY
+from agent.tool_dispatch_helpers import (
+    TOOL_RESULT_PERSISTENCE_CONTENT_KEY,
+    project_messages_for_durable_use,
+)
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -1271,16 +1274,18 @@ def run_conversation(
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
                             user_message=original_user_message,
-                            conversation_history=list(messages),
+                            conversation_history=project_messages_for_durable_use(messages),
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
                             base_url=agent.base_url,
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
+                            request_messages=(
+                                project_messages_for_durable_use(request_messages)
+                                if isinstance(request_messages, list)
+                                else []
+                            ),
                             message_count=len(api_messages),
                             tool_count=len(agent.tools or []),
                             approx_input_tokens=approx_tokens,
