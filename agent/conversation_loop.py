@@ -48,6 +48,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.tool_dispatch_helpers import TOOL_RESULT_PERSISTENCE_CONTENT_KEY
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -785,6 +786,19 @@ def _apply_context_engine_selection(
         pass
 
     session_label = getattr(agent, "session_id", None) or "-"
+    # Durable-policy metadata is local bookkeeping. Remove it from the
+    # request copy before the context engine can inspect or index anything;
+    # never mutate the canonical live messages.
+    api_messages = [
+        {
+            key: value
+            for key, value in message.items()
+            if key != TOOL_RESULT_PERSISTENCE_CONTENT_KEY
+        }
+        if isinstance(message, dict) and TOOL_RESULT_PERSISTENCE_CONTENT_KEY in message
+        else message
+        for message in api_messages
+    ]
     # Pass shallow copies of the reference-only inputs so an engine that
     # mutates them in place cannot alter persisted transcript state. Only
     # ``request_messages`` (the per-call request list) is meant to be acted on,
@@ -792,9 +806,26 @@ def _apply_context_engine_selection(
     # place either. ``conversation_messages`` / ``incoming_message`` are
     # read-only context; copying enforces the request-only contract rather than
     # merely documenting it.
-    _conv_copy = [dict(m) if isinstance(m, dict) else m for m in conversation_messages] \
+    _conv_copy = [
+        {
+            key: value
+            for key, value in m.items()
+            if key != TOOL_RESULT_PERSISTENCE_CONTENT_KEY
+        }
+        if isinstance(m, dict) and TOOL_RESULT_PERSISTENCE_CONTENT_KEY in m
+        else (dict(m) if isinstance(m, dict) else m)
+        for m in conversation_messages
+    ] \
         if conversation_messages is not None else None
-    _incoming_copy = dict(incoming_message) if isinstance(incoming_message, dict) else incoming_message
+    _incoming_copy = (
+        {
+            key: value
+            for key, value in incoming_message.items()
+            if key != TOOL_RESULT_PERSISTENCE_CONTENT_KEY
+        }
+        if isinstance(incoming_message, dict)
+        else incoming_message
+    )
     try:
         selected = engine.select_context(
             api_messages,
@@ -1213,6 +1244,7 @@ def run_conversation(
             # event row enters the live history.
             api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+            api_msg.pop(TOOL_RESULT_PERSISTENCE_CONTENT_KEY, None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
