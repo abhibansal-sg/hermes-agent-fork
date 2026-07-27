@@ -3032,11 +3032,13 @@ final class ConnectionStore {
         // treating the old A failure as B's failure.
         var selectedIdentity = sessionStore.activeScopedIdentity
         while let expectedIdentity = selectedIdentity {
+            let requiresRuntime = sessionStore.activeSessionRequiresRuntimeRecovery
             let resumedRuntime = await sessionStore.resumeActiveAfterReconnect()
             guard isActiveGeneration(generation) else { return false }
             if resumedRuntime != nil { break }
 
             let latestIdentity = sessionStore.activeScopedIdentity
+            if latestIdentity == expectedIdentity, !requiresRuntime { break }
             guard latestIdentity != expectedIdentity else { return false }
             selectedIdentity = latestIdentity
         }

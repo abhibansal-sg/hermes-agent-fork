@@ -2568,7 +2568,7 @@ final class SessionStore {
 
     private func bindSession(
         storedID: String,
-        runtimeID: String,
+        runtimeID: String?,
         mode: SessionBindingMode,
         generation: UInt64?
     ) {
@@ -2582,6 +2582,13 @@ final class SessionStore {
         if previous != storedID {
             chat?.pendingGateOwnerMoved(toStoredSession: storedID)
         }
+    }
+
+    /// Reconnects only need to restore ownership for work the phone was
+    /// actively driving. A watched or idle selection remains useful from its
+    /// cached/REST transcript without creating a gateway runtime.
+    var activeSessionRequiresRuntimeRecovery: Bool {
+        sessionBinding?.mode == .drive
     }
     /// The drawer's pending DISMISSAL INTENT (QA-1 B3). A drawer row tap hands
     /// its close here (`open(_:revealOnFirstPaint:)`); it fires on first paint
@@ -2940,12 +2947,17 @@ final class SessionStore {
             recordDrawerUserGesture()
         }
         let drawerIntentPending = pendingDrawerReveal != nil
-        if !reusableDrive {
-            activeRuntimeId = nil      // gates the composer until inspect/resume lands
-            activeRuntimeEpoch = nil
-        }
         activeStoredProfile = selectedProfileID(for: summary)
-        activeStoredId = summary.id
+        if reusableDrive {
+            activeStoredId = summary.id
+        } else {
+            bindSession(
+                storedID: summary.id,
+                runtimeID: nil,
+                mode: .watch,
+                generation: nil
+            )
+        }
         connection?.updatePhoneForeground(summary.id)
         if let cacheStore, let scope = currentCacheScope,
            let identity = cacheIdentity(summary.id, profile: summary.profile) {
@@ -3050,8 +3062,8 @@ final class SessionStore {
         // correct live target. Reopening the same row must not inspect or resume.
         if reusableDrive { return }
 
-        // Slow path: gateway resume — spins up the agent server-side; only
-        // prompt submission depends on it.
+        // Read-only inspection. Opening an idle row must never create or steal
+        // a gateway runtime; prompt submission owns that transition.
         let resumeTask = Task { [weak self] in
             guard let self, self.client != nil || self.resumeRPC != nil else { return }
             let usingResumeTestSeam = self.resumeRPC != nil
@@ -3089,121 +3101,10 @@ final class SessionStore {
                     self.sessionActionError = nil
                     return
                 case .absent, .unsupported:
-                    break
-                }
-                // Thread the row's profile scope so an All-profiles tap resumes in
-                // the row's owning profile home. Omitted for default/all/dormant
-                // cases — byte-for-byte the shipped resume.
-                var resumeParams: [String: JSONValue] = ["session_id": .string(summary.id)]
-                if let networkProfile {
-                    resumeParams["profile"] = .string(networkProfile)
-                }
-                let result = try await self.coalescedSessionResume(
-                    storedId: summary.id,
-                    profileId: cacheProfile,
-                    params: resumeParams,
-                    token: token,
-                    transportEpoch: bindingEpoch
-                )
-                guard self.isCurrentRuntimeBinding(
-                    token: token,
-                    storedId: summary.id,
-                    profileId: cacheProfile,
-                    connectionWorkGeneration: connectionWorkGeneration,
-                    transportEpoch: bindingEpoch,
-                    usingResumeTestSeam: usingResumeTestSeam
-                ) else {
-                    if !usingResumeTestSeam,
-                       self.connection?.transportEpoch != bindingEpoch {
-                        ReliabilityDiagnostics.shared.epochRejected(
-                            expected: bindingEpoch,
-                            received: self.connection?.transportEpoch
-                        )
-                    }
-                    if self.activeStoredId != summary.id || self.openToken != token {
-                        ReliabilityDiagnostics.shared.sessionSuperseded(identifier: summary.id)
-                    }
+                    self.lastError = nil
+                    self.sessionActionError = nil
                     return
-                }  // superseded or an older transport
-                self.bindSession(
-                    storedID: result.storedSessionId ?? summary.id,
-                    runtimeID: result.sessionId,
-                    mode: .drive,
-                    generation: bindingEpoch
-                )
-                ReliabilityDiagnostics.shared.sessionBound(
-                    identifier: summary.scopedIdentity, epoch: bindingEpoch
-                )
-                // Confirm/seed the active-profile pref from the server's echo: the
-                // WS path silently falls back to the launch profile on an unknown
-                // name, so trust the echo over the requested scope.
-                self.confirmActiveProfile(from: result.info)
-                // Seed the composer pill (model/provider/reasoning/fast) from
-                // the resume echo — the session's ACTUAL state (build-27 QA:
-                // the pill showed the previous session's model until the
-                // picker was opened).
-                if let info = result.info { self.connection?.applyRuntimeInfo(info) }
-                // Compression-chain projection: the gateway may resume a
-                // newer continuation of this conversation — follow it.
-                let boundStoredId = result.storedSessionId ?? summary.id
-                if boundStoredId != summary.id {
-                    // Re-stamp prompts queued under the parent id to the
-                    // continuation BEFORE the swap, so drain's affinity guard
-                    // doesn't skip them forever once activeStoredId moves.
-                    self.onStoredIdMigrated?(summary.id, boundStoredId)
-                    self.activeStoredId = boundStoredId
-                    // Same token: the chain-tip seed's REST await is just as
-                    // outrunnable by a newer open() as the fast path (R1 #43).
-                    await self.seedTranscript(
-                        storedId: boundStoredId,
-                        networkProfile: networkProfile,
-                        cacheProfile: cacheProfile,
-                        token: token,
-                        workGeneration: transcriptWorkGeneration,
-                        transportEpoch: transcriptTransportEpoch
-                    )
-                    // Surface the chain-tip row in the drawer immediately.
-                    Task { [weak self] in await self?.refresh() }
                 }
-                self.lastError = nil
-                self.sessionActionError = nil
-                // Runtime bound: clear the self-heal budget and flush anything the
-                // composer queued during this resume window (an idle desktop-driven
-                // session emits no turn-completion to trigger a drain otherwise).
-                // The drain no-ops while a foreign turn streams and is re-entrancy
-                self.ensureRuntimeAttempts = 0
-                // ABH-371 live re-entry: the transcript seed is persisted history,
-                // not proof the just-resumed runtime is idle. Wait for the open seed
-                // so a stale REST/cache snapshot cannot erase the placeholder, then
-                // reconcile against the stock resume snapshot. If it reports a
-                // turn in flight, ChatStore restores the streaming placeholder + Stop
-                // state immediately instead of showing a completed-turn action row.
-                // Run this BEFORE the runtime-bound queue drain; otherwise an idle
-                // queued prompt could slip into an already-running server turn during
-                // the resume/reconcile gap.
-                await seedTask.value
-                guard self.isCurrentRuntimeBinding(
-                    token: token,
-                    storedId: boundStoredId,
-                    profileId: self.activeStoredProfile,
-                    connectionWorkGeneration: connectionWorkGeneration,
-                    transportEpoch: bindingEpoch,
-                    usingResumeTestSeam: usingResumeTestSeam
-                ), self.activeRuntimeId == result.sessionId else { return }
-                await self.chat?.reconcileLiveTurnStatus(
-                    runtimeId: result.sessionId,
-                    snapshotRunning: result.snapshotRunning,
-                    inflight: result.inflight
-                )
-                // Runtime bound: flush anything the composer queued during this
-                // resume window. If live re-entry just restored a running turn, the
-                // queue's busy guards now see that state and leave prompts queued.
-                self.onActiveRuntimeBound?()
-                // Seed the context-window meter from session.usage so a resumed
-                // session shows occupancy before its first new turn (H1). Runs
-                // after the resume lands the runtime id; guarded against a newer
-                // open inside ChatStore via the runtime-id check.
-                await self.chat?.seedContextUsage(runtimeId: result.sessionId)
             } catch {
                 // A stale token/generation or a replaced epoch is a superseded
                 // binding, not an actionable open failure.
@@ -3708,6 +3609,7 @@ final class SessionStore {
         let token = openToken
         guard let storedId = activeStoredId,
               client != nil || resumeRPC != nil else { return nil }
+        let recoveryMode = sessionBinding?.mode ?? .watch
         let bindingProfile = activeStoredProfile
         let usingResumeTestSeam = resumeRPC != nil
         guard let bindingEpoch = await currentBindingEpoch(
@@ -3727,14 +3629,18 @@ final class SessionStore {
                 bindSession(
                     storedID: storedId,
                     runtimeID: live.id,
-                    mode: .watch,
-                    generation: nil
+                    mode: recoveryMode,
+                    generation: recoveryMode == .drive ? bindingEpoch : nil
                 )
                 lastError = nil
                 sessionActionError = nil
                 return live.id
             case .absent, .unsupported:
-                break
+                guard recoveryMode == .drive else {
+                    lastError = nil
+                    sessionActionError = nil
+                    return nil
+                }
             }
             // Re-resume into the same profile scope so a reconnect keeps the
             // session in its per-profile home. Omitted for the default/all scope.
@@ -3808,6 +3714,9 @@ final class SessionStore {
             sessionActionError = nil
             return result.sessionId
         } catch {
+            // Watching is observational. A failed active-list probe must not
+            // turn a readable cached session into a reconnect failure.
+            guard recoveryMode == .drive else { return nil }
             // The error belongs to an obsolete token/generation/epoch when the
             // transport changed while the RPC was suspended. Never surface it
             // into the current session's error channel.
@@ -3863,6 +3772,9 @@ final class SessionStore {
         }
         guard ensureRuntimeAttempts < Self.maxEnsureRuntimeAttempts else { return nil }
         ensureRuntimeAttempts += 1
+        // Reaching this method from send/edit/retry is the explicit ownership
+        // edge. Only now may reconnect support call session.resume.
+        sessionBinding?.mode = .drive
         let task = Task { [weak self] () -> String? in
             // resumeActiveAfterReconnect re-resumes `activeStoredId`, binds the
             // runtime, follows the chain tip (re-stamping the queue), and seeds the

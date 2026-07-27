@@ -1045,7 +1045,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertNil(sessions.activeRuntimeId)
     }
 
-    func testOpenDuringReconnectAndRecoveryIssueOneResumeForLatestSelection() async {
+    func testPassiveOpenDuringReconnectDoesNotResumeLatestSelection() async {
         let (connection, sessions, _) = makeStore()
         let reconnectGate = SuspensionGate()
         let calls = ResumeCallLog()
@@ -1070,10 +1070,11 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let aCalls = await calls.calls(for: "A")
         let bCalls = await calls.calls(for: "B")
         XCTAssertEqual(aCalls, 0)
-        XCTAssertEqual(bCalls, 1,
-                       "readiness-released open(B) and recovery must share one resume")
+        XCTAssertEqual(bCalls, 0,
+                       "selecting B while reconnecting must remain read-only")
         XCTAssertEqual(sessions.activeStoredId, "B")
-        XCTAssertEqual(sessions.activeRuntimeId, "runtime-B")
+        XCTAssertNil(sessions.activeRuntimeId)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
     }
 
     // MARK: - ABH-448 connection-generation fencing
