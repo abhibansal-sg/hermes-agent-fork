@@ -12,8 +12,12 @@ from agent.tool_dispatch_helpers import (
     _trajectory_normalize_msg,
     _validate_tool_result_persistence_content,
     make_tool_result_message,
+    project_messages_for_durable_use,
 )
-from agent.conversation_loop import _apply_context_engine_selection
+from agent.conversation_loop import (
+    _apply_context_engine_selection,
+    _notify_context_engine_turn_complete,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -70,6 +74,27 @@ def _rich_result(*, persistence_content=None, include_override=False):
             },
         ],
         "text_summary": "AX: Save button is visible",
+    }
+    if include_override:
+        result["persistence_content"] = persistence_content
+    return result
+
+
+def _nonce_rich_result(*, persistence_content=None, include_override=False):
+    """Rich capture payload whose AX/image bytes are easy to trace in sinks."""
+    image_nonce = "IMAGE_NONCE_DURABLE_SINK"
+    result = {
+        "_multimodal": True,
+        "content": [
+            {"type": "text", "text": "AX_NONCE_DURABLE_SINK"},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{_TINY_JPEG_B64}{image_nonce}"
+                },
+            },
+        ],
+        "text_summary": "safe screen summary",
     }
     if include_override:
         result["persistence_content"] = persistence_content
@@ -182,9 +207,10 @@ def test_malformed_override_falls_back_without_repr_persistence():
 
 def test_internal_metadata_is_removed_before_provider_messages():
     agent = _make_agent()
+    live_content = _rich_result()["content"]
     message = make_tool_result_message(
         "capture_screen_context",
-        "safe",
+        live_content,
         "call-5",
         persistence_content="not provider content",
     )
@@ -204,6 +230,8 @@ def test_internal_metadata_is_removed_before_provider_messages():
 
     provider_tool = next(item for item in api_messages if item.get("role") == "tool")
     assert PERSISTENCE_METADATA_KEY not in provider_tool
+    assert provider_tool["content"] == live_content
+    assert any(part.get("type") == "image_url" for part in provider_tool["content"])
     assert PERSISTENCE_METADATA_KEY in message
 
 
@@ -374,6 +402,127 @@ def test_context_engine_cannot_see_internal_persistence_metadata():
     assert all(PERSISTENCE_METADATA_KEY not in item for item in seen["conversation"])
     assert PERSISTENCE_METADATA_KEY not in seen["incoming"]
     assert PERSISTENCE_METADATA_KEY in message
+
+
+def test_durable_projection_drops_live_nonces_by_default_and_honors_explicit_ax_only():
+    result = _nonce_rich_result()
+    message = make_tool_result_message(
+        "capture_screen_context",
+        result,
+        "call-projection-default",
+    )
+
+    projected = project_messages_for_durable_use([message])[0]
+
+    assert "AX_NONCE_DURABLE_SINK" not in str(projected)
+    assert "IMAGE_NONCE_DURABLE_SINK" not in str(projected)
+    assert PERSISTENCE_METADATA_KEY not in projected
+    assert message["content"] == result
+
+    explicit = make_tool_result_message(
+        "capture_screen_context",
+        result["content"],
+        "call-projection-explicit",
+        persistence_content="AX_NONCE_DURABLE_SINK",
+    )
+    explicit_projected = project_messages_for_durable_use([explicit])[0]
+
+    assert explicit_projected["content"] == "AX_NONCE_DURABLE_SINK"
+    assert PERSISTENCE_METADATA_KEY not in explicit_projected
+    assert explicit["content"] == result["content"]
+
+
+def test_durable_projection_rejects_wire_name_spoof_when_tool_name_is_untrusted():
+    result = _nonce_rich_result()
+    message = make_tool_result_message(
+        "capture_screen_context",
+        result["content"],
+        "call-projection-spoof",
+        persistence_content="AX_NONCE_DURABLE_SINK",
+    )
+    message["tool_name"] = "computer_use"
+
+    projected = project_messages_for_durable_use([message])[0]
+
+    assert projected["content"][0] == {"type": "text", "text": "AX_NONCE_DURABLE_SINK"}
+    assert projected["content"][1] == {"type": "text", "text": "[screenshot]"}
+    assert PERSISTENCE_METADATA_KEY not in projected
+    assert message[PERSISTENCE_METADATA_KEY] == "AX_NONCE_DURABLE_SINK"
+
+
+def test_context_engine_post_turn_receives_durable_projection_without_live_nonces():
+    agent = _make_agent()
+    result = _nonce_rich_result()
+    message = make_tool_result_message(
+        "capture_screen_context",
+        result,
+        "call-context-post-turn",
+    )
+    seen = {}
+
+    class ContextEngine:
+        def on_turn_complete(self, messages, **kwargs):
+            seen["messages"] = messages
+
+    agent.context_compressor = ContextEngine()
+    _notify_context_engine_turn_complete(
+        agent,
+        [message],
+        logger=MagicMock(),
+    )
+
+    ingested = seen["messages"][0]
+    assert "AX_NONCE_DURABLE_SINK" not in str(ingested)
+    assert "IMAGE_NONCE_DURABLE_SINK" not in str(ingested)
+    assert PERSISTENCE_METADATA_KEY not in ingested
+    assert message["content"] == result
+
+
+def test_external_memory_sync_receives_durable_projection_without_live_nonces():
+    agent = _make_agent()
+    agent._memory_manager = MagicMock()
+    agent.session_id = "external-memory-projection"
+    result = _nonce_rich_result()
+    message = make_tool_result_message(
+        "capture_screen_context",
+        result,
+        "call-memory-projection",
+    )
+
+    agent._sync_external_memory_for_turn(
+        original_user_message="what is on screen?",
+        final_response="The screen is visible.",
+        interrupted=False,
+        messages=[message],
+    )
+
+    synced_messages = agent._memory_manager.sync_all.call_args.kwargs["messages"]
+    assert "AX_NONCE_DURABLE_SINK" not in str(synced_messages)
+    assert "IMAGE_NONCE_DURABLE_SINK" not in str(synced_messages)
+    assert PERSISTENCE_METADATA_KEY not in synced_messages[0]
+    assert message["content"] == result
+
+
+def test_explicit_persisted_ax_is_available_to_durable_sinks_but_not_trajectory_images():
+    result = _nonce_rich_result(
+        persistence_content="AX_NONCE_DURABLE_SINK",
+        include_override=True,
+    )
+    message = make_tool_result_message(
+        "capture_screen_context",
+        result["content"],
+        "call-explicit-sinks",
+        persistence_content=result["persistence_content"],
+    )
+
+    durable = project_messages_for_durable_use([message])[0]
+    trajectory = _trajectory_normalize_msg(message)
+
+    assert durable["content"] == "AX_NONCE_DURABLE_SINK"
+    assert "IMAGE_NONCE_DURABLE_SINK" not in str(trajectory)
+    assert trajectory["content"][0] == {"type": "text", "text": "AX_NONCE_DURABLE_SINK"}
+    assert PERSISTENCE_METADATA_KEY not in trajectory
+    assert message["content"] == result["content"]
 
 
 def test_trajectory_normalize_removes_internal_persistence_metadata():

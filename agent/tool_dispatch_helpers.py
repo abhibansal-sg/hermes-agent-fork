@@ -14,8 +14,9 @@ Pure module-level utilities extracted from ``run_agent.py``:
 * ``_extract_file_mutation_targets`` / ``_extract_landed_file_mutation_paths`` /
   ``_extract_error_preview`` —
   per-turn file-mutation verifier inputs.
-* ``_trajectory_normalize_msg`` — strip image blobs from a message for
-  trajectory saving.
+* ``project_messages_for_durable_use`` — make trusted tool-message
+  projections for durable/ingestion sinks without touching live messages.
+* ``_trajectory_normalize_msg`` — preserve the text-only trajectory contract.
 
 All helpers are stateless.  ``run_agent`` re-exports each name so existing
 ``from run_agent import ...`` imports in tests and other modules keep
@@ -380,6 +381,75 @@ def _multimodal_text_summary(value: Any) -> str:
         return str(value)
 
 
+def project_messages_for_durable_use(
+    messages: List[Dict[str, Any]] | None,
+    *,
+    allow_persisted_images: bool = True,
+) -> List[Dict[str, Any]]:
+    """Return an ingestion-safe copy of canonical conversation messages.
+
+    Tool messages may carry a strictly validated, internal persistence
+    projection for ``capture_screen_context``.  Only the actual ``tool_name``
+    field can authorize that projection; the provider-facing ``name`` field is
+    never used as an authority.  Invalid, absent, or untrusted metadata falls
+    back to the historical safe normalization (text summary / screenshot
+    placeholder).
+
+    The returned messages and any replacement content are independent of the
+    canonical live messages.  ``allow_persisted_images=False`` is used by the
+    historical text-only trajectory contract, which must continue to emit
+    screenshot placeholders even when durable screenshot persistence is opted
+    into elsewhere.
+    """
+    if messages is None:
+        return []
+
+    projected_messages: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            projected_messages.append(message)
+            continue
+
+        projected = dict(message)
+        projected.pop(TOOL_RESULT_PERSISTENCE_CONTENT_KEY, None)
+
+        content = message.get("content")
+        override = None
+        if message.get("role") == "tool":
+            # ``tool_name`` is the runtime identity written by the tool
+            # executor.  Do not fall back to ``name``: that is a wire field
+            # and is not an authority for durable policy.
+            actual_tool_name = message.get("tool_name")
+            override = _validate_tool_result_persistence_content(
+                actual_tool_name,
+                message.get(TOOL_RESULT_PERSISTENCE_CONTENT_KEY),
+            )
+        if override is not None and allow_persisted_images:
+            # Validated override lists can still be mutated by an ingestion
+            # backend; keep that mutation away from the live message and its
+            # internal metadata.
+            projected["content"] = json.loads(json.dumps(override))
+        elif _is_multimodal_tool_result(content):
+            projected["content"] = _multimodal_text_summary(content)
+        elif isinstance(content, list):
+            cleaned = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in {
+                    "image",
+                    "image_url",
+                    "input_image",
+                }:
+                    cleaned.append({"type": "text", "text": "[screenshot]"})
+                elif isinstance(part, dict):
+                    cleaned.append(dict(part))
+                else:
+                    cleaned.append(part)
+            projected["content"] = cleaned
+
+        projected_messages.append(projected)
+    return projected_messages
+
+
 def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
     """Mutate a multimodal tool-result envelope to append a subdir hint.
 
@@ -510,23 +580,9 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(msg, dict):
         return msg
-    normalized = {
-        key: value
-        for key, value in msg.items()
-        if key != TOOL_RESULT_PERSISTENCE_CONTENT_KEY
-    }
-    content = normalized.get("content")
-    if _is_multimodal_tool_result(content):
-        return {**normalized, "content": _multimodal_text_summary(content)}
-    if isinstance(content, list):
-        cleaned = []
-        for p in content:
-            if isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                cleaned.append({"type": "text", "text": "[screenshot]"})
-            else:
-                cleaned.append(p)
-        return {**normalized, "content": cleaned}
-    return normalized
+    return project_messages_for_durable_use(
+        [msg], allow_persisted_images=False
+    )[0]
 
 
 def make_tool_result_message(
@@ -728,6 +784,7 @@ __all__ = [
     "TOOL_RESULT_PERSISTENCE_CONTENT_KEY",
     "_validate_tool_result_persistence_content",
     "_multimodal_persistence_content",
+    "project_messages_for_durable_use",
     "_multimodal_text_summary",
     "_append_subdir_hint_to_multimodal",
     "_extract_file_mutation_targets",

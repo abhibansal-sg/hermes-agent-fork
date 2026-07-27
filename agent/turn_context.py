@@ -45,6 +45,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.tool_dispatch_helpers import project_messages_for_durable_use
 
 logger = logging.getLogger(__name__)
 
@@ -1037,7 +1038,7 @@ def build_turn_context(
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,
-            conversation_history=list(messages),
+            conversation_history=project_messages_for_durable_use(messages),
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",

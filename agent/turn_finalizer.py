@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.tool_dispatch_helpers import project_messages_for_durable_use
 from agent.message_content import flatten_message_text
 
 
@@ -518,7 +519,7 @@ def finalize_turn(
                 turn_id=turn_id,
                 user_message=original_user_message,
                 assistant_response=final_response,
-                conversation_history=list(messages),
+                conversation_history=project_messages_for_durable_use(messages),
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
             )
