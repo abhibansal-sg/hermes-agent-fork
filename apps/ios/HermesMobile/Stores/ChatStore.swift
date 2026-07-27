@@ -2671,6 +2671,10 @@ final class ChatStore {
                 return nil
             }
         }
+        return await runtimeForUserAction()
+    }
+
+    private func runtimeForUserAction() async -> String? {
         if let activeSessionId { return activeSessionId }
         return await sessions?.ensureActiveRuntime()
     }
@@ -3043,7 +3047,11 @@ final class ChatStore {
         truncateBeforeUserOrdinal ordinal: Int,
         truncateFromIndex index: Int
     ) async {
-        guard let client, let sessionId = activeSessionId else {
+        guard let client else {
+            lastError = "No active session"
+            return
+        }
+        guard let sessionId = await runtimeForUserAction() else {
             lastError = "No active session"
             return
         }
@@ -3168,7 +3176,10 @@ final class ChatStore {
     /// or stop local streaming state. The gateway owns the compression lifecycle
     /// and returns before/after token counts for user feedback.
     func compressContext(focus: String? = nil) async -> ContextCompressionOutcome {
-        guard let client, let sessionId = activeSessionId else {
+        guard let client else {
+            return .error("No active session")
+        }
+        guard let sessionId = await runtimeForUserAction() else {
             return .error("No active session")
         }
         var params: [String: JSONValue] = ["session_id": .string(sessionId)]
