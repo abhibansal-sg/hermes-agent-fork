@@ -1,5 +1,9 @@
 # Hermes Mobile native-stock architecture handoff
 
+> Historical architecture/review record. For the factual deployed and released
+> state as of 2026-07-28, including direct-to-gateway chat and build-139 gaps,
+> use [HERMES-MOBILE-CURRENT-STATE-HANDOFF-2026-07-28.md](HERMES-MOBILE-CURRENT-STATE-HANDOFF-2026-07-28.md).
+
 **Prepared:** 2026-07-24
 
 **Review branch:** `codex/native-stock-architecture`

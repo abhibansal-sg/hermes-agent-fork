@@ -1,5 +1,10 @@
 # Hermes Mobile release gaps — 2026-07-26
 
+> Historical release-gap snapshot. It is superseded by
+> [HERMES-MOBILE-CURRENT-STATE-HANDOFF-2026-07-28.md](HERMES-MOBILE-CURRENT-STATE-HANDOFF-2026-07-28.md)
+> for the deployed topology, TestFlight build 139, live stock-gateway
+> limitations, and newly observed duplicate-turn presentation defect.
+
 This note supersedes any older handoff that assumes the private S13
 approval/clarification seam is installed in Hermes core.
 
