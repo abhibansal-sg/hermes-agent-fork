@@ -182,7 +182,8 @@ final class OutboxProcessorTests: XCTestCase {
                 if failOnce { failOnce = false; throw Ambiguous() }
                 return OutboxSubmitResult(status: "streaming", accepted: true,
                                           clientMessageID: submitted.clientMessageID)
-            }
+            },
+            retryDelay: { _ in 0.01 }
         ))
 
         processor.wake(); await processor.waitUntilIdleForTesting()
@@ -190,7 +191,8 @@ final class OutboxProcessorTests: XCTestCase {
         XCTAssertEqual(persisted?.destinationSessionID, "stored-created")
         XCTAssertEqual(submittedRuntimes, ["runtime-created"])
         XCTAssertEqual(resolveCount, 0, "fresh create must use its returned runtime")
-        processor.wake(); await processor.waitUntilIdleForTesting()
+        try? await Task.sleep(for: .milliseconds(30))
+        await processor.waitUntilIdleForTesting()
 
         XCTAssertEqual(createCount, 1)
         XCTAssertEqual(submittedRuntimes, ["runtime-created", "runtime-resumed"])
@@ -277,7 +279,8 @@ final class OutboxProcessorTests: XCTestCase {
                     accepted: true,
                     clientMessageID: submitted.clientMessageID
                 )
-            }
+            },
+            retryDelay: { _ in 0.01 }
         ))
 
         processor.wake(); await processor.waitUntilIdleForTesting()
@@ -285,7 +288,8 @@ final class OutboxProcessorTests: XCTestCase {
         XCTAssertEqual(persisted?.destinationSessionID, "stored-share")
         XCTAssertEqual(persisted?.state, .submitting)
 
-        processor.wake(); await processor.waitUntilIdleForTesting()
+        try? await Task.sleep(for: .milliseconds(30))
+        await processor.waitUntilIdleForTesting()
         persisted = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(persisted?.state, .completed)
         XCTAssertEqual(createCount, 1)
