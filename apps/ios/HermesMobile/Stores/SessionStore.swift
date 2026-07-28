@@ -3798,6 +3798,20 @@ final class SessionStore {
             let newStored = result.storedSessionId ?? storedId
             if newStored != storedId { onStoredIdMigrated?(storedId, newStored) }
             activeStoredId = newStored
+            if newStored != storedId {
+                let networkProfile = Self.profileParam(
+                    scope: bindingProfile ?? Self.defaultProfileName,
+                    multiAvailable: profileThreadingAvailable
+                )
+                await seedTranscript(
+                    storedId: newStored,
+                    networkProfile: networkProfile,
+                    cacheProfile: bindingProfile ?? Self.defaultProfileName,
+                    token: token,
+                    workGeneration: myConnectionWorkGeneration,
+                    transportEpoch: bindingEpoch
+                )
+            }
             if let echoedProfile = result.info?.profileName {
                 activeStoredProfile = Self.normalizedProfileID(echoedProfile)
             }
