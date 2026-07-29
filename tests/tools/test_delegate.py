@@ -35,6 +35,8 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
+    _interrupt_async_children,
+    _configured_child_disabled_toolsets,
 )
 
 
@@ -183,6 +185,21 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertIn("file", result)
         self.assertIn("web", result)
 
+    @patch("tools.delegate_tool._load_config")
+    def test_configured_child_disabled_toolsets_are_generic(self, load_config):
+        load_config.return_value = {
+            "disabled_toolsets": [
+                "private-control",
+                "",
+                "private-control",
+                7,
+            ]
+        }
+        self.assertEqual(
+            _configured_child_disabled_toolsets(),
+            ["private-control"],
+        )
+
     def test_strip_set_derived_from_blocklist(self):
         """The strip set must be derived from DELEGATE_BLOCKED_TOOLS so a
         new blocked tool can't silently leak through as a toolset name
@@ -251,6 +268,34 @@ class TestStripBlockedTools(unittest.TestCase):
         names = {item["function"]["name"] for item in definitions}
         self.assertTrue(names & {"terminal", "read_file", "web_search"})
         self.assertTrue(DELEGATE_BLOCKED_TOOLS.isdisjoint(names))
+
+    @patch("tools.delegate_tool._load_config")
+    def test_configured_toolset_is_removed_from_child_assembly(
+        self, load_config
+    ):
+        load_config.return_value = {
+            "disabled_toolsets": ["private-control"]
+        }
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "private-control"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Inspect safely",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertNotIn("private-control", kwargs["enabled_toolsets"])
+        self.assertIn("private-control", kwargs["disabled_toolsets"])
 
     def test_orchestrator_composite_regains_only_delegate_task(self):
         import model_tools
@@ -1154,7 +1199,13 @@ class TestSubagentCostRollup(unittest.TestCase):
 
 class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):
-        for tool in ["delegate_task", "clarify", "memory", "send_message", "cronjob"]:
+        for tool in [
+            "delegate_task",
+            "clarify",
+            "memory",
+            "send_message",
+            "cronjob",
+        ]:
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
 
     def test_execute_code_not_blocked(self):
@@ -1162,6 +1213,17 @@ class TestBlockedTools(unittest.TestCase):
         can batch mechanical work instead of burning reasoning iterations
         (Teknium, Jul 2026)."""
         self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
+
+    def test_async_child_interrupt_requires_every_signal_to_succeed(self):
+        accepted = MagicMock()
+        rejected = MagicMock()
+        rejected.interrupt.side_effect = RuntimeError("channel closed")
+
+        with self.assertRaisesRegex(RuntimeError, "channel closed"):
+            _interrupt_async_children([accepted, rejected])
+
+        accepted.interrupt.assert_called_once_with("Async delegation cancelled")
+        rejected.interrupt.assert_called_once_with("Async delegation cancelled")
 
     def test_constants(self):
         from tools.delegate_tool import (
