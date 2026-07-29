@@ -48,6 +48,10 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.tool_dispatch_helpers import (
+    TOOL_RESULT_PERSISTENCE_CONTENT_KEY,
+    project_messages_for_durable_use,
+)
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -785,6 +789,27 @@ def _apply_context_engine_selection(
         pass
 
     session_label = getattr(agent, "session_id", None) or "-"
+    # Durable-policy metadata is local bookkeeping. Remove it from the
+    # request copy before the context engine can inspect or index anything;
+    # never mutate the canonical live messages.
+    # Rebuild only when metadata is actually present: the fail-open contract
+    # below returns ``api_messages`` itself, so an unconditional copy would
+    # silently break identity for callers that rely on it.
+    if any(
+        isinstance(message, dict) and TOOL_RESULT_PERSISTENCE_CONTENT_KEY in message
+        for message in api_messages
+    ):
+        api_messages = [
+            {
+                key: value
+                for key, value in message.items()
+                if key != TOOL_RESULT_PERSISTENCE_CONTENT_KEY
+            }
+            if isinstance(message, dict)
+            and TOOL_RESULT_PERSISTENCE_CONTENT_KEY in message
+            else message
+            for message in api_messages
+        ]
     # Pass shallow copies of the reference-only inputs so an engine that
     # mutates them in place cannot alter persisted transcript state. Only
     # ``request_messages`` (the per-call request list) is meant to be acted on,
@@ -792,9 +817,26 @@ def _apply_context_engine_selection(
     # place either. ``conversation_messages`` / ``incoming_message`` are
     # read-only context; copying enforces the request-only contract rather than
     # merely documenting it.
-    _conv_copy = [dict(m) if isinstance(m, dict) else m for m in conversation_messages] \
+    _conv_copy = [
+        {
+            key: value
+            for key, value in m.items()
+            if key != TOOL_RESULT_PERSISTENCE_CONTENT_KEY
+        }
+        if isinstance(m, dict) and TOOL_RESULT_PERSISTENCE_CONTENT_KEY in m
+        else (dict(m) if isinstance(m, dict) else m)
+        for m in conversation_messages
+    ] \
         if conversation_messages is not None else None
-    _incoming_copy = dict(incoming_message) if isinstance(incoming_message, dict) else incoming_message
+    _incoming_copy = (
+        {
+            key: value
+            for key, value in incoming_message.items()
+            if key != TOOL_RESULT_PERSISTENCE_CONTENT_KEY
+        }
+        if isinstance(incoming_message, dict)
+        else incoming_message
+    )
     try:
         selected = engine.select_context(
             api_messages,
@@ -845,8 +887,8 @@ def _notify_context_engine_turn_complete(
     this lets an engine ingest / index / summarize the completed turn.
 
     Fail-open: a missing or no-op hook, or any exception, is swallowed.
-    ``messages`` is passed as a shallow copy so the engine cannot mutate the
-    persisted transcript.
+    A durable projection is passed so the engine cannot ingest live-only tool
+    payloads or mutate the persisted transcript.
     """
     engine = getattr(agent, "context_compressor", None)
     hook = getattr(engine, "on_turn_complete", None)
@@ -865,7 +907,7 @@ def _notify_context_engine_turn_complete(
 
     try:
         hook(
-            [dict(m) if isinstance(m, dict) else m for m in messages],
+            project_messages_for_durable_use(messages),
             usage=usage,
             **meta,
         )
@@ -1213,6 +1255,7 @@ def run_conversation(
             # event row enters the live history.
             api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+            api_msg.pop(TOOL_RESULT_PERSISTENCE_CONTENT_KEY, None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -1892,16 +1935,18 @@ def run_conversation(
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
                             user_message=original_user_message,
-                            conversation_history=list(messages),
+                            conversation_history=project_messages_for_durable_use(messages),
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
                             base_url=agent.base_url,
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
+                            request_messages=(
+                                project_messages_for_durable_use(request_messages)
+                                if isinstance(request_messages, list)
+                                else []
+                            ),
                             message_count=len(api_messages),
                             tool_count=len(agent.tools or []),
                             approx_input_tokens=approx_tokens,
