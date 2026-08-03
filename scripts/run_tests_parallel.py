@@ -59,7 +59,6 @@ _DEFAULT_ROOTS = ["tests"]
 # image, etc.) and are run in their own dedicated CI jobs:
 #
 #   tests/e2e/         — .github/workflows/tests.yml :: e2e job
-#   tests/e2e_daily_driver/ — physical-device gate; run via its run_gate.sh
 #   tests/integration/ — historical; legacy --ignore flags
 #   tests/docker/      — .github/workflows/docker.yml ::
 #                        build-amd64 job (runs against the freshly-loaded
