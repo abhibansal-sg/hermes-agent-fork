@@ -1,15 +1,9 @@
-name: CodeQL Swift
+name: CodeQL
 
 on:
   pull_request:
-    paths:
-      - "apps/ios/**"
-      - ".github/workflows/codeql-swift.yml"
   push:
     branches: [main]
-    paths:
-      - "apps/ios/**"
-      - ".github/workflows/codeql-swift.yml"
   schedule:
     - cron: "23 19 * * 2"
 
@@ -18,10 +12,38 @@ permissions:
   security-events: write
 
 concurrency:
-  group: codeql-swift-${{ github.ref }}
+  group: codeql-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  analyze-source:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - actions
+          - javascript-typescript
+          - python
+          - ruby
+          - rust
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@bce182f857edf1feab116e9795a3393d21977282 # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@bce182f857edf1feab116e9795a3393d21977282 # v4
+        with:
+          category: /language:${{ matrix.language }}
+
   analyze-swift:
     name: Analyze (swift)
     runs-on: macos-26
