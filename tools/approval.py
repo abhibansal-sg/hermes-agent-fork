@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import ast
 import contextlib
 import contextvars
 import fnmatch
@@ -4226,6 +4227,54 @@ def check_all_command_guards(command: str, env_type: str,
             "user_approved": True, "description": combined_desc}
 
 
+def _execute_code_gateway_lifecycle_action(code: str) -> bool:
+    """Return True when Python directly encodes a gateway stop/restart.
+
+    ``execute_code`` can bypass terminal's gateway lifecycle guard by invoking
+    launchctl/hermes through ``subprocess`` or ``os.system``.  Inspect string
+    literals per call so ordinary prose elsewhere in the script does not trip
+    the guard.  This is a hard safety boundary, including in YOLO mode; an
+    intentional restart remains available from a shell outside the gateway.
+    """
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        literals = [
+            node.value.lower()
+            for node in ast.walk(call)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+        if not literals:
+            continue
+        text = " ".join(literals)
+        tokens = set(re.findall(r"[a-z0-9_.-]+", text))
+        gateway_target = (
+            "ai.hermes.gateway" in text
+            or "hermes-gateway" in text
+            or ({"hermes", "gateway"} <= tokens)
+        )
+        if not gateway_target:
+            continue
+        launchctl = "launchctl" in tokens or any(
+            literal == "launchctl" or literal.endswith("/launchctl")
+            for literal in literals
+        )
+        if launchctl and tokens.intersection(
+            {"kickstart", "bootout", "unload", "load", "stop", "restart", "submit", "bootstrap"}
+        ):
+            return True
+        hermes_cli = any(
+            literal == "hermes" or literal.endswith("/hermes")
+            for literal in literals
+        )
+        if hermes_cli and tokens.intersection({"restart", "stop"}):
+            return True
+    return False
+
+
 def check_execute_code_guard(code: str, env_type: str,
                              has_host_access: bool = False) -> dict:
     """Approve an execute_code script before its child process is spawned.
@@ -4260,6 +4309,23 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    # Hard floor before YOLO/off bypass: generated Python must not be able to
+    # kill the gateway hosting its own turn.  Use terminal from an independent
+    # shell for deliberate lifecycle maintenance.
+    if _execute_code_gateway_lifecycle_action(code):
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: execute_code contains a Hermes gateway lifecycle "
+                "action. Run gateway maintenance from a shell outside the "
+                "gateway process."
+            ),
+            "pattern_key": "gateway_lifecycle_execute_code",
+            "description": "gateway lifecycle action hidden in execute_code",
+            "outcome": "blocked",
+            "user_consent": False,
+        }
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()

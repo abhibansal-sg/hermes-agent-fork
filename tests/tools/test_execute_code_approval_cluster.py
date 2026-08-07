@@ -170,6 +170,31 @@ def test_guard_isolated_backend_approved():
     assert A.check_execute_code_guard("import os", "docker")["approved"] is True
 
 
+@pytest.mark.parametrize("code", [
+    "import subprocess; subprocess.run(['/bin/launchctl', 'kickstart', '-k', 'gui/501/ai.hermes.gateway'])",
+    "import os; os.system('launchctl bootout gui/501/ai.hermes.gateway')",
+    "import subprocess; subprocess.run(['hermes', 'gateway', 'restart'])",
+])
+def test_guard_gateway_lifecycle_is_hard_blocked_even_in_yolo(monkeypatch, code):
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
+    res = A.check_execute_code_guard(code, "local")
+    assert res["approved"] is False
+    assert res["outcome"] == "blocked"
+    assert res["pattern_key"] == "gateway_lifecycle_execute_code"
+
+
+def test_guard_gateway_read_only_launchctl_is_not_lifecycle_blocked(monkeypatch):
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
+    code = "import subprocess; subprocess.run(['/bin/launchctl', 'print', 'gui/501/ai.hermes.gateway'])"
+    assert A.check_execute_code_guard(code, "local")["approved"] is True
+
+
+def test_guard_isolated_backend_may_encode_host_gateway_action(monkeypatch):
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
+    code = "import subprocess; subprocess.run(['launchctl', 'kickstart', 'ai.hermes.gateway'])"
+    assert A.check_execute_code_guard(code, "docker")["approved"] is True
+
+
 def test_guard_headless_local_approved(monkeypatch):
     # Documented #30882 limitation: no approval surface → preserve auto-run.
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
