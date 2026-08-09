@@ -2112,8 +2112,14 @@ def _authorize_session_action(rid, method: str, params: dict) -> dict | None:
             session["action_revision"] = revision
         # A new connection for the same authenticated principal may resume
         # driving without a takeover. Read/watch methods never reach this seam.
-        session["transport"] = transport
-        session["action_transport"] = transport
+        # Subagent lifecycle actions are the exception: their authority is bound
+        # to the exact transport + session-record generation captured when the
+        # child was commissioned. Rebinding either transport field here would
+        # manufacture that old capability for the request currently being
+        # checked and defeat the handler's fail-closed generation guard.
+        if method not in {"subagent.interrupt", "subagent.steer"}:
+            session["transport"] = transport
+            session["action_transport"] = transport
     return None
 
 
