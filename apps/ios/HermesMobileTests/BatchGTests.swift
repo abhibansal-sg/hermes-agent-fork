@@ -24,7 +24,8 @@ final class BatchGTests: XCTestCase {
         // PATCHED gateway (fs/upload available) — what a pre-restart probe
         // would have left behind.
         let cached = """
-        {"serverURL":"\(url)","appVersion":"\(ServerCapabilities.currentAppVersion)",
+        {"contractVersion":\(ServerCapabilities.capabilityContractVersion),
+         "serverURL":"\(url)","appVersion":"\(ServerCapabilities.currentAppVersion)",
          "upload":"available","pushRegistry":"unknown","broadcast":"unknown",
          "fs":"available","subagentEvents":"unknown","profiles":"unknown",
          "devices":"unknown"}

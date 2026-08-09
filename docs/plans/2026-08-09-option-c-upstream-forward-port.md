@@ -374,3 +374,30 @@ Client verification evidence:
   clears the pending item only after Hermes returns a path, preserves full-path transcript
   hints, and decodes/queries stock media reads. The full Swift 6 test target builds for
   testing through the safe wrapper with asset compilation excluded.
+
+## H6a stock working-file authority result
+
+- The existing native file browser/viewer remains in place as bounded presentation UI,
+  but all working-file reads now use stock Hermes routes: `/api/fs/list`,
+  `/api/fs/read-text`, `/api/fs/read-data-url`, and `/api/git/file-diff`. The old mobile
+  plugin `/fs/list`, `/fs/read`, and `/fs/diff` calls are gone; no replacement plugin
+  file service or storage layer was introduced.
+- Hermes runtime snapshots and `session.info` are the sole source of the active canonical
+  cwd. `ConnectionStore` holds only the current, non-persisted presentation value and
+  clears it at every session/transport boundary. A successful `session.cwd.set` applies
+  Hermes' returned info immediately, with a post-await active-session fence so a late
+  response cannot overwrite a newly selected session.
+- The iOS REST adapter resolves its relative navigation paths under that canonical cwd,
+  accepts absolute and `file://` tool-result paths only when they remain inside the cwd,
+  and rejects traversal/cross-workspace paths before issuing a request. Hermes still owns
+  authentication, path resolution, file contents, Git state, and every cwd mutation.
+- Filesystem capability is independently probed through stock `/api/fs/default-cwd`.
+  Plugin absence no longer hides native file browsing, and the capability-cache contract
+  was revisioned so historical plugin-derived filesystem verdicts cannot survive the
+  authority change.
+- Focused URLProtocol/model tests cover stock desktop response adaptation, absolute query
+  construction and `+` encoding, stock Git diff routing, missing cwd, traversal/outside
+  rejection, absolute tool paths, `file://` paths, and filesystem capability independent
+  of plugin availability. The complete Swift 6 app and unit-test targets build for testing
+  through `scripts/ios-build.sh` with asset compilation excluded. Runtime execution remains
+  subject to the previously recorded CoreSimulator `ENOMEM` host failure.

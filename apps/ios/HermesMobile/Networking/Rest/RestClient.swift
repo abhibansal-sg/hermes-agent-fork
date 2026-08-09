@@ -24,8 +24,8 @@ enum RestError: Error, LocalizedError, Sendable {
     }
 }
 
-/// Which REST path family the gateway serves for the MOBILE endpoint group
-/// (upload / devices / approvals / fs / push). The ABH-88 de-patch moved these
+/// Which REST path family the gateway serves for the remaining MOBILE endpoint
+/// group (devices / approvals / push). The ABH-88 de-patch moved these
 /// from legacy top-level routes to the hermes-mobile plugin mount; the app
 /// probes which family the server speaks (``ServerCapabilities/pluginMount``)
 /// and pins the result per server. Core endpoints (`/api/sessions`,
@@ -69,7 +69,7 @@ struct RestClient: Sendable {
     let token: String
     let session: URLSession
     private let providerCredentials: NativeCredentialController?
-    /// Path family for the MOBILE endpoint group (see ``APIPathStyle``).
+    /// Path family for the remaining MOBILE endpoint group (see ``APIPathStyle``).
     /// Defaults to `.legacy` so an un-migrated construction site keeps today's
     /// behavior; ``ConnectionStore`` passes the probed style.
     let pathStyle: APIPathStyle

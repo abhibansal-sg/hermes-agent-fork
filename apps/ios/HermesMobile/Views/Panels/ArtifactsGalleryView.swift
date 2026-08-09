@@ -26,6 +26,9 @@ struct ArtifactsGalleryView: View {
     let serverId: String
     /// Profile scope for the blob-cache key; blank → "all" (cache normalises).
     let profileId: String
+    /// Canonical cwd for the active runtime; historical/cross-session artifacts
+    /// still degrade to transcript navigation rather than borrowing this root.
+    let activeSessionCwd: String
     /// `nil` → panel opened without a live session store (unlikely in prod, but
     /// safe: tapping an artifact tile is a no-op when `nil`).
     let sessions: SessionStore?
@@ -79,6 +82,7 @@ struct ArtifactsGalleryView: View {
                     FileViewerView(
                         rest: control,
                         sessionId: sessionId,
+                        cwd: activeSessionCwd,
                         path: artifact.urlOrPath,
                         serverId: serverId,
                         profileId: profileId
@@ -269,9 +273,11 @@ struct ArtifactsGalleryView: View {
     /// the session-cwd read path. Returns `nil` when the source session isn't live
     /// or the read fails — the caller then shows the directional unavailable state.
     private func fetchImageDataURL(for artifact: Artifact) async -> String? {
-        guard let sessionId = liveRuntimeSessionId(for: artifact) else { return nil }
+        guard liveRuntimeSessionId(for: artifact) != nil, !activeSessionCwd.isEmpty else {
+            return nil
+        }
         return try? await control.fsReadAsDataURL(
-            sessionId: sessionId, path: artifact.urlOrPath
+            cwd: activeSessionCwd, path: artifact.urlOrPath
         ).dataURL
     }
 

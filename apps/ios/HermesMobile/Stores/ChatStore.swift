@@ -3415,13 +3415,20 @@ final class ChatStore {
         let cwd = WorkingDirectory.absolutePath(root: root, relative: relativePath)
         lastError = nil
         do {
-            _ = try await client.requestRaw(
+            let info = try await client.requestRaw(
                 "session.cwd.set",
                 params: .object([
                     "session_id": .string(sessionId),
                     "cwd": .string(cwd),
                 ])
             )
+            // A session switch may complete while the RPC is in flight. Never
+            // let the old runtime's returned cwd become the new chat's state.
+            guard activeSessionId == sessionId else { return false }
+            // The RPC result is the same canonical `session.info` payload the
+            // gateway broadcasts. Apply it immediately so stock filesystem
+            // reads never depend on event-delivery timing.
+            connection?.applySessionInfo(info)
             return true
         } catch {
             lastError = WorkingDirectory.mapSetError(error).message

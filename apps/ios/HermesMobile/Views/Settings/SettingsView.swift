@@ -1123,6 +1123,7 @@ struct SettingsView: View {
                         control: control,
                         serverId: connectionStore.serverURLString,
                         profileId: sessionStore.activeProfile,
+                        activeSessionCwd: connectionStore.sessionCwd ?? "",
                         sessions: sessionStore
                     )
                 case .logs:

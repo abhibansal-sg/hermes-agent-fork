@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Native file browser over the patched gateway's `GET /api/fs/list` +
-/// `GET /api/fs/read` (Module F4A-A1). Two modes share one drill-down `List`:
+/// Native file browser over stock Hermes `GET /api/fs/list` +
+/// `GET /api/fs/read-text`. Two modes share one drill-down `List`:
 ///
 ///   - **`.browse`** — tap a directory to drill in, tap a file to open the
 ///     native text viewer (``FileViewerView``). The default chat-surface file
@@ -31,8 +31,11 @@ struct FileBrowserView: View {
 
     /// REST client used for `fsList`/`fsRead` (built from the live connection).
     let rest: RestClient
-    /// The active runtime session id — resolves the sandboxed cwd ROOT.
+    /// Runtime id retained only for bounded blob-cache identity.
     let sessionId: String
+    /// Canonical cwd echoed by the active Hermes runtime. Navigation remains
+    /// relative to this root; the REST adapter resolves stock absolute paths.
+    let cwd: String
     /// What this browser is for.
     var mode: Mode = .browse
     /// Called when the user confirms a directory in `.pickDirectory` mode. The
@@ -80,7 +83,7 @@ struct FileBrowserView: View {
         .toolbar { toolbarContent }
         .background(theme.bg)
         .tint(theme.midground)
-        .task(id: path) { await load() }
+        .task(id: cwd + "\u{1F}" + path) { await load() }
     }
 
     // MARK: - Title
@@ -187,6 +190,7 @@ struct FileBrowserView: View {
                 FileBrowserView(
                     rest: rest,
                     sessionId: sessionId,
+                    cwd: cwd,
                     mode: mode,
                     onPick: onPick,
                     onMentionFile: onMentionFile,
@@ -203,6 +207,7 @@ struct FileBrowserView: View {
                 FileViewerView(
                     rest: rest,
                     sessionId: sessionId,
+                    cwd: cwd,
                     path: join(path, entry.name),
                     onMentionFile: onMentionFile,
                     serverId: serverId,
@@ -262,7 +267,7 @@ struct FileBrowserView: View {
     private func load() async {
         if phase.value == nil { phase = .loading }
         do {
-            let result = try await rest.fsList(sessionId: sessionId, path: path.isEmpty ? nil : path)
+            let result = try await rest.fsList(cwd: cwd, path: path.isEmpty ? nil : path)
             phase = .loaded(result)
         } catch {
             phase = .failed(Self.message(for: error))

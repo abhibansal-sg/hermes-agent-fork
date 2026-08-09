@@ -1,7 +1,6 @@
 import Foundation
 
-/// Observable record of which branch-only server features the connected gateway
-/// supports, so one binary degrades gracefully against a STOCK hermes-agent.
+/// Observable record of gateway capabilities used by the native app.
 ///
 /// The user's patched gateway adds: `POST /api/upload`, `POST/DELETE
 /// /api/push/register`, and `stored_session_id` enrichment on broadcast event
@@ -18,8 +17,9 @@ import Foundation
 /// Capability strategy (cached per server URL + app version in
 /// `UserDefaults` so reconnects don't re-probe; a `configure()` to a NEW URL or
 /// an app-version change re-probes):
-///   - **plugin bundle**: one mount probe proves the bundled upload, fs, and
-///     device routes together. These routes ship from the same plugin router.
+///   - **plugin bundle**: one mount probe proves the remaining legacy upload and
+///     device routes together.
+///   - **filesystem**: an independent stock `/api/fs/default-cwd` probe.
 ///   - **profiles**: one independent stock-route probe.
 ///   - **pushRegistry**: wired off ``PushRegistrar``'s existing 404 soft-fail —
 ///     a soft-fail ⇒ unavailable, a `2xx`/`4xx` validation response ⇒ available.
@@ -55,10 +55,9 @@ final class ServerCapabilities {
     private(set) var pushRegistry: State = .unknown
     /// `stored_session_id` enrichment on broadcast frames. Set passively.
     private(set) var broadcast: State = .unknown
-    /// `GET /api/fs/list` + `/api/fs/read` — the F4A file-browser / @-file
-    /// endpoints. Ships in the same plugin router as the mount probe. Every
-    /// file-browser / working-dir / @-file affordance gates on `fs !=
-    /// .unavailable` so a stock gateway shows none of them and never errors.
+    /// Stock `GET /api/fs/*` + `/api/git/file-diff` file presentation surface.
+    /// Probed independently from the mobile plugin so stock Hermes enables the
+    /// browser even when no plugin is installed.
     private(set) var fs: State = .unknown
     /// `subagent.*` event emission (F4A-A2). PASSIVE — it can't be eagerly probed
     /// (it only fires when the agent delegates). Set via ``noteSubagentObserved()``
@@ -171,19 +170,19 @@ final class ServerCapabilities {
         guard probedServerURL == serverURL else { return }
         pluginMount = mountState
 
-        // Upload, file browsing, and device management are one versioned plugin
-        // bundle, not independently installed features. Do not probe three routes
-        // that the mount already proved.
+        // Only the remaining legacy upload/device concerns follow the plugin.
         upload = mountState
-        fs = mountState
         devices = mountState
 
-        // Multi-profile support belongs to the stock gateway and remains the one
-        // independent route probe.
-        let profilesState = await Self.probeProfiles(rest: rest)
+        // Files and profiles are independent stock capabilities. Probe them
+        // concurrently after path-style resolution.
+        async let fsProbe = Self.probeStockFS(rest: rest)
+        async let profilesProbe = Self.probeProfiles(rest: rest)
+        let (fsState, profilesState) = await (fsProbe, profilesProbe)
         // The connection (and thus serverURL) may have changed while we awaited;
         // only apply if we're still probing the same server.
         guard probedServerURL == serverURL else { return }
+        fs = fsState
         profiles = profilesState
         persist()
     }
@@ -275,6 +274,14 @@ final class ServerCapabilities {
         }
     }
 
+    private nonisolated static func probeStockFS(rest: RestClient) async -> State {
+        switch await rest.probeStockFSEndpoint() {
+        case .available: return .available
+        case .unavailable: return .unavailable
+        case .inconclusive: return .unknown
+        }
+    }
+
     // MARK: - Profiles probe (F4b)
 
     /// `GET /api/profiles/sessions` (the aggregate rail, NEW at the rebase — NOT
@@ -303,6 +310,7 @@ final class ServerCapabilities {
     /// `.unknown` rather than failing the whole decode (which would force a
     /// needless re-probe).
     private struct Cache: Codable {
+        var contractVersion: Int
         var serverURL: String
         var appVersion: String
         var pluginMount: State
@@ -315,7 +323,7 @@ final class ServerCapabilities {
         var devices: State
 
         enum CodingKeys: String, CodingKey {
-            case serverURL, appVersion, pluginMount, upload, pushRegistry, broadcast, fs, subagentEvents, profiles, devices
+            case contractVersion, serverURL, appVersion, pluginMount, upload, pushRegistry, broadcast, fs, subagentEvents, profiles, devices
         }
 
         init(
@@ -330,6 +338,7 @@ final class ServerCapabilities {
             profiles: State,
             devices: State
         ) {
+            self.contractVersion = ServerCapabilities.capabilityContractVersion
             self.serverURL = serverURL
             self.appVersion = appVersion
             self.pluginMount = pluginMount
@@ -344,6 +353,7 @@ final class ServerCapabilities {
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
+            contractVersion = try c.decodeIfPresent(Int.self, forKey: .contractVersion) ?? 1
             serverURL = try c.decode(String.self, forKey: .serverURL)
             appVersion = try c.decode(String.self, forKey: .appVersion)
             // Tolerant so a cache written by a pre-ABH-88 build (no
@@ -411,7 +421,9 @@ final class ServerCapabilities {
         guard let data = UserDefaults.standard.data(forKey: DefaultsKeys.serverCapabilities) else {
             return nil
         }
-        return try? JSONDecoder().decode(Cache.self, from: data)
+        guard let cache = try? JSONDecoder().decode(Cache.self, from: data),
+              cache.contractVersion == capabilityContractVersion else { return nil }
+        return cache
     }
 
     /// The cached path family for `serverURL`, readable WITHOUT an instance —
@@ -435,4 +447,8 @@ final class ServerCapabilities {
         let build = info?["CFBundleVersion"] as? String ?? "?"
         return "\(short) (\(build))"
     }
+
+    /// Bump when a cached field changes authority/meaning. Version 2 separates
+    /// stock filesystem capability from the historical plugin-bundle verdict.
+    nonisolated static let capabilityContractVersion = 2
 }

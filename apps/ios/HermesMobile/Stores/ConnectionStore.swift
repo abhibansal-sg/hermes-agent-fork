@@ -215,6 +215,13 @@ final class ConnectionStore {
     /// session flag and the global `approvals.mode=off` bypass.
     var sessionYolo = false
 
+    /// Canonical gateway-local working directory for the active runtime. Hermes
+    /// supplies this in `session.create`/`resume` snapshots and `session.info`
+    /// updates; iOS uses it only to address stock `/api/fs/*` presentation reads.
+    /// It is cleared on every session/transport boundary and is never persisted
+    /// as file or workflow authority.
+    var sessionCwd: String?
+
     // MARK: Draft-mode model pick (ABH-84 follow-up)
 
     /// The model pick is allowed at ANY point — including a DRAFT chat that has
@@ -275,6 +282,9 @@ final class ConnectionStore {
         if let yolo = info.yolo {
             sessionYolo = yolo
         }
+        if let cwd = info.cwd {
+            applySessionCwd(cwd)
+        }
     }
 
     /// Apply a `session.info` payload from the gateway to the live session state
@@ -295,6 +305,14 @@ final class ConnectionStore {
         if let yolo = payload["yolo"]?.boolValue {
             sessionYolo = yolo
         }
+        if let cwd = payload["cwd"]?.stringValue {
+            applySessionCwd(cwd)
+        }
+    }
+
+    private func applySessionCwd(_ cwd: String) {
+        let trimmed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        sessionCwd = trimmed.isEmpty ? nil : trimmed
     }
 
     func applySessionModel(_ model: String?) {
@@ -312,6 +330,7 @@ final class ConnectionStore {
         sessionReasoningEffort = nil
         sessionFast = nil
         sessionYolo = false
+        sessionCwd = nil
         draftSelection = nil
     }
 

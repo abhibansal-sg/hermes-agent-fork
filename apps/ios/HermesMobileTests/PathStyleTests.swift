@@ -77,9 +77,9 @@ final class PathStyleTests: XCTestCase {
         let entries = Data(#"{"entries":[]}"#.utf8)
         let issued = Data(#"{"device_id":"d1","token":"t","device_name":"n"}"#.utf8)
         let revoked = Data(#"{"revoked":true,"device_id":"d1","sockets_closed":0}"#.utf8)
-        let fsList = Data(#"{"root":"/","path":"","entries":[]}"#.utf8)
-        let fsRead = Data(#"{"path":"a","size":1,"encoding":"utf-8","content":"x","truncated":false}"#.utf8)
-        let fsDiff = Data(#"{"path":"a","diff":"","has_changes":false}"#.utf8)
+        let fsList = Data(#"{"entries":[]}"#.utf8)
+        let fsRead = Data(#"{"binary":false,"byteSize":1,"mimeType":"text/plain","path":"/w/a","text":"x","truncated":false}"#.utf8)
+        let fsDiff = Data(#"{"diff":""}"#.utf8)
 
         for style in [APIPathStyle.legacy, .plugin] {
             let prefix = style.mobileAPIPrefix
@@ -115,16 +115,16 @@ final class PathStyleTests: XCTestCase {
             XCTAssertEqual(recordedPaths, ["\(prefix)/approvals/reply"])
 
             client = makeClient(style: style, script: [(fsList, 200)])
-            _ = try await client.fsList(sessionId: "s", path: "")
-            XCTAssertEqual(recordedPaths, ["\(prefix)/fs/list"])
+            _ = try await client.fsList(cwd: "/w", path: "")
+            XCTAssertEqual(recordedPaths, ["/api/fs/list"])
 
             client = makeClient(style: style, script: [(fsRead, 200)])
-            _ = try await client.fsRead(sessionId: "s", path: "a")
-            XCTAssertEqual(recordedPaths, ["\(prefix)/fs/read"])
+            _ = try await client.fsRead(cwd: "/w", path: "a")
+            XCTAssertEqual(recordedPaths, ["/api/fs/read-text"])
 
             client = makeClient(style: style, script: [(fsDiff, 200)])
-            _ = try await client.fsDiff(sessionId: "s", path: "a")
-            XCTAssertEqual(recordedPaths, ["\(prefix)/fs/diff"])
+            _ = try await client.fsDiff(cwd: "/w", path: "a")
+            XCTAssertEqual(recordedPaths, ["/api/git/file-diff"])
 
             client = makeClient(style: style, script: [(ok, 200)])
             _ = await client.registerLiveActivity(token: "t", sessionId: "s", env: "sandbox")

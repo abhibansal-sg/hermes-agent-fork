@@ -194,10 +194,9 @@ struct ComposerView: View {
         connection.attachMenuAvailable
     }
 
-    /// Whether the gateway supports the F4A file endpoints (`GET /api/fs/list` /
-    /// `/api/fs/read`). The @-file mention picker rides the SAME patched server,
-    /// so when `fs` is known unavailable (stock gateway) the `@`-trigger is fully
-    /// suppressed — typing `@` is just literal text, exactly as on a stock build.
+    /// Whether the gateway supports stock Hermes filesystem endpoints. The
+    /// @-file picker also needs the stock session runtime for `complete.path`;
+    /// when unavailable, typing `@` remains literal text.
     /// `.unknown`/`.available` keep it live (optimistic until proven otherwise).
     private var fileMentionsSupported: Bool {
         connection.capabilities.fs != .unavailable
@@ -351,12 +350,14 @@ struct ComposerView: View {
             NavigationStack {
                 Group {
                     if let control = connection.control,
-                       let sessionId = sessions.activeRuntimeId, !sessionId.isEmpty {
+                       let sessionId = sessions.activeRuntimeId, !sessionId.isEmpty,
+                       let cwd = connection.sessionCwd, !cwd.isEmpty {
                         // P4 cache-on-access: thread the (server, profile) scope so
                         // FileViewerView can serve/store image blobs from disk.
                         FileBrowserView(
                             rest: control,
                             sessionId: sessionId,
+                            cwd: cwd,
                             onMentionFile: { path in
                                 // Wire the "@" button (was a no-op → no visible
                                 // feedback, build-29 QA): append a @file: token to
