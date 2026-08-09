@@ -1,6 +1,6 @@
 # Option C upstream-first forward-port ledger
 
-Status: P-1 through H3 complete; H4 backend and existing-iOS client integration implemented
+Status: P-1 through H5 implemented; existing iOS app remains the release foundation
 
 Upstream baseline: `31cedb4830191da7f8c3ea4b962d40997cd85b21`
 
