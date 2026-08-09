@@ -68,25 +68,6 @@ final class PathStyleTests: XCTestCase {
         RecordingProtocol.requests.compactMap { $0.url?.path }
     }
 
-    func testUploadResultDecodesContentMetadataAndLegacyFallback() throws {
-        let current = try JSONDecoder().decode(
-            UploadResult.self,
-            from: Data(#"{"path":"/uploads/a.png","size":3,"mime":"image/png","content_version":"sha256:abc"}"#.utf8)
-        )
-        XCTAssertEqual(current.path, "/uploads/a.png")
-        XCTAssertEqual(current.size, 3)
-        XCTAssertEqual(current.mimeType, "image/png")
-        XCTAssertEqual(current.contentVersion, "sha256:abc")
-
-        let legacy = try JSONDecoder().decode(
-            UploadResult.self,
-            from: Data(#"{"path":"/uploads/old.png"}"#.utf8)
-        )
-        XCTAssertNil(legacy.size)
-        XCTAssertNil(legacy.mimeType)
-        XCTAssertNil(legacy.contentVersion)
-    }
-
     // MARK: - 1. Path family per call site
 
     func testPrefixSwapCoversEveryMobileCallSite() async throws {
@@ -94,7 +75,6 @@ final class PathStyleTests: XCTestCase {
         let ok = Data("{}".utf8)
         let devices = Data(#"{"devices":[]}"#.utf8)
         let entries = Data(#"{"entries":[]}"#.utf8)
-        let upload = Data(#"{"path":"/tmp/x.png","size":1}"#.utf8)
         let issued = Data(#"{"device_id":"d1","token":"t","device_name":"n"}"#.utf8)
         let revoked = Data(#"{"revoked":true,"device_id":"d1","sockets_closed":0}"#.utf8)
         let fsList = Data(#"{"root":"/","path":"","entries":[]}"#.utf8)
@@ -104,11 +84,7 @@ final class PathStyleTests: XCTestCase {
         for style in [APIPathStyle.legacy, .plugin] {
             let prefix = style.mobileAPIPrefix
 
-            var client = makeClient(style: style, script: [(upload, 200)])
-            _ = try await client.upload(data: Data([1]), filename: "x.png", mimeType: "image/png")
-            XCTAssertEqual(recordedPaths, ["\(prefix)/upload"])
-
-            client = makeClient(style: style, script: [(devices, 200)])
+            var client = makeClient(style: style, script: [(devices, 200)])
             _ = try await client.devicesList()
             XCTAssertEqual(recordedPaths, ["\(prefix)/devices"])
 
@@ -294,5 +270,24 @@ final class PathStyleTests: XCTestCase {
             ServerCapabilities.cachedPathStyle(serverURL: "https://other.example"),
             .legacy
         )
+    }
+}
+
+extension PathStyleTests {
+    func testStockMediaReadDecodesDataURLAndPreservesFullGatewayPath() async throws {
+        let image = Data([0xFF, 0xD8, 0xFF, 0xD9])
+        let body = Data(
+            #"{"data_url":"data:image/jpeg;base64,#(image.base64EncodedString())"}"#.utf8
+        )
+        let client = makeClient(style: .legacy, script: [(body, 200)])
+        let path = "/gateway/.hermes/images/upload 1.jpg"
+
+        let decoded = try await client.mediaData(path: path)
+        XCTAssertEqual(decoded, image)
+        XCTAssertEqual(recordedPaths, ["/api/media"])
+        let request = try XCTUnwrap(RecordingProtocol.requests.first)
+        let sentPath = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "path" })?.value
+        XCTAssertEqual(sentPath, path)
     }
 }

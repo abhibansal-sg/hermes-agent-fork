@@ -69,10 +69,6 @@ struct RestClient: Sendable {
     let token: String
     let session: URLSession
     private let providerCredentials: NativeCredentialController?
-    /// The injected-session initializer is used by tests to keep uploads on the
-    /// same URLProtocol-backed transport as the other REST calls. Production
-    /// clients always use the durable background transfer path below.
-    private let usesInjectedUploadSession: Bool
     /// Path family for the MOBILE endpoint group (see ``APIPathStyle``).
     /// Defaults to `.legacy` so an un-migrated construction site keeps today's
     /// behavior; ``ConnectionStore`` passes the probed style.
@@ -97,8 +93,7 @@ struct RestClient: Sendable {
             session: URLSession(configuration: config),
             pathStyle: pathStyle,
             connectionMode: connectionMode,
-            providerCredentials: nil,
-            usesInjectedUploadSession: false
+            providerCredentials: nil
         )
     }
 
@@ -118,8 +113,7 @@ struct RestClient: Sendable {
             session: URLSession(configuration: config),
             pathStyle: pathStyle,
             connectionMode: connectionMode,
-            providerCredentials: controller,
-            usesInjectedUploadSession: false
+            providerCredentials: controller
         )
     }
 
@@ -139,8 +133,7 @@ struct RestClient: Sendable {
             session: session,
             pathStyle: pathStyle,
             connectionMode: connectionMode,
-            providerCredentials: nil,
-            usesInjectedUploadSession: true
+            providerCredentials: nil
         )
     }
 
@@ -159,8 +152,7 @@ struct RestClient: Sendable {
             session: session,
             pathStyle: pathStyle,
             connectionMode: connectionMode,
-            providerCredentials: controller,
-            usesInjectedUploadSession: true
+            providerCredentials: controller
         )
     }
 
@@ -170,8 +162,7 @@ struct RestClient: Sendable {
         session: URLSession,
         pathStyle: APIPathStyle,
         connectionMode: ConnectionMode,
-        providerCredentials: NativeCredentialController?,
-        usesInjectedUploadSession: Bool
+        providerCredentials: NativeCredentialController?
     ) {
         self.baseURL = baseURL
         self.token = token
@@ -179,7 +170,6 @@ struct RestClient: Sendable {
         self.pathStyle = pathStyle
         self.connectionMode = connectionMode
         self.providerCredentials = providerCredentials
-        self.usesInjectedUploadSession = usesInjectedUploadSession
     }
 
     /// A copy of this client speaking the given path family (same session).
@@ -190,8 +180,7 @@ struct RestClient: Sendable {
             session: session,
             pathStyle: style,
             connectionMode: connectionMode,
-            providerCredentials: providerCredentials,
-            usesInjectedUploadSession: usesInjectedUploadSession
+            providerCredentials: providerCredentials
         )
     }
 
@@ -420,94 +409,6 @@ struct RestClient: Sendable {
         }
     }
 
-    /// `POST /api/upload` — multipart upload of a single file under field `file`.
-    func upload(data: Data, filename: String, mimeType: String) async throws -> UploadResult {
-        try await uploadDurable(
-            data: data,
-            filename: filename,
-            mimeType: mimeType,
-            ownerJobID: nil
-        ).upload
-    }
-
-    struct DurableUploadResult: Sendable {
-        let upload: UploadResult
-        let transferID: String
-    }
-
-    func uploadDurable(
-        data: Data,
-        filename: String,
-        mimeType: String,
-        ownerJobID: String?
-    ) async throws -> DurableUploadResult {
-        let request = try await authorizedRequest(
-            makeRequest(path: "\(mobileAPIPrefix)/upload", method: "POST")
-        )
-        guard let url = request.url else { throw RestError.network("Invalid upload URL") }
-
-        if usesInjectedUploadSession {
-            let boundary = "Boundary-\(UUID().uuidString)"
-            var request = request
-            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            let body = multipartBody(
-                data: data, filename: filename, mimeType: mimeType, boundary: boundary
-            )
-            var (responseData, http) = try await uploadResponse(for: request, body: body)
-            if http.statusCode == 401,
-               let providerCredentials,
-               let rejected = Self.bearerToken(in: request) {
-                let retry = try await providerCredentials.retryAuthorization(
-                    request,
-                    rejectedAccessToken: rejected
-                )
-                (responseData, http) = try await uploadResponse(for: retry, body: body)
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                let responseBody = String(data: responseData, encoding: .utf8) ?? ""
-                throw RestError.badStatus(
-                    http.statusCode, body: String(responseBody.prefix(512))
-                )
-            }
-            return DurableUploadResult(
-                upload: try decode(UploadResult.self, from: responseData, context: "upload"),
-                transferID: "injected-session-upload"
-            )
-        }
-
-        var transfer = try await TransferManager.shared.uploadMultipart(
-            data: data,
-            filename: filename,
-            mimeType: mimeType,
-            to: url,
-            headers: request.allHTTPHeaderFields ?? [:],
-            ownerJobId: ownerJobID
-        )
-        if transfer.httpStatus == 401,
-           let providerCredentials,
-           let rejected = Self.bearerToken(in: request) {
-            let retry = try await providerCredentials.retryAuthorization(
-                request,
-                rejectedAccessToken: rejected
-            )
-            transfer = try await TransferManager.shared.uploadMultipart(
-                data: data,
-                filename: filename,
-                mimeType: mimeType,
-                to: url,
-                headers: retry.allHTTPHeaderFields ?? [:],
-                ownerJobId: ownerJobID
-            )
-        }
-        guard let status = transfer.httpStatus, (200...299).contains(status) else {
-            throw RestError.badStatus(transfer.httpStatus ?? 0, body: "Background upload failed")
-        }
-        return DurableUploadResult(
-            upload: try decode(UploadResult.self, from: transfer.responseBody ?? Data(), context: "upload"),
-            transferID: transfer.id
-        )
-    }
-
     // MARK: - Request plumbing
     //
     // `internal` (not `private`) so the `RestClient+*` extension files reuse this
@@ -629,23 +530,6 @@ struct RestClient: Sendable {
         return (data, http)
     }
 
-    private func uploadResponse(
-        for request: URLRequest,
-        body: Data
-    ) async throws -> (data: Data, response: HTTPURLResponse) {
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.upload(for: request, from: body)
-        } catch {
-            throw RestError.network(error.localizedDescription)
-        }
-        guard let http = response as? HTTPURLResponse else {
-            throw RestError.network("Non-HTTP response")
-        }
-        return (data, http)
-    }
-
     private func validatedData(_ data: Data, response http: HTTPURLResponse) throws -> Data {
         guard (200..<300).contains(http.statusCode) else {
             let body = String(data: data, encoding: .utf8) ?? ""
@@ -698,34 +582,6 @@ struct RestClient: Sendable {
         }
     }
 
-    /// Assemble an RFC 7578 multipart/form-data body for a single `file` part.
-    private func multipartBody(
-        data: Data,
-        filename: String,
-        mimeType: String,
-        boundary: String
-    ) -> Data {
-        var body = Data()
-        let crlf = "\r\n"
-        body.append("--\(boundary)\(crlf)")
-        body.append(
-            "Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\(crlf)"
-        )
-        body.append("Content-Type: \(mimeType)\(crlf)\(crlf)")
-        body.append(data)
-        body.append(crlf)
-        body.append("--\(boundary)--\(crlf)")
-        return body
-    }
-}
-
-private extension Data {
-    /// Append a UTF-8 string fragment to a multipart body.
-    mutating func append(_ string: String) {
-        if let data = string.data(using: .utf8) {
-            append(data)
-        }
-    }
 }
 
 // MARK: - Delta-aware transcript fetch (Phase 3)

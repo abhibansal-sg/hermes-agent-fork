@@ -154,4 +154,95 @@ final class AttachmentStoreFileTests: XCTestCase {
             XCTAssertTrue(error.message.contains("Couldn't read"), "unexpected message: \(error.message)")
         }
     }
+
+    func testPendingImageUsesStockAttachBytesWithoutRESTUpload() async throws {
+        let transport = StockImageAttachTransport()
+        let client = HermesGatewayClient(transportFactory: { _ in transport })
+        try await client.connect(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "legacy-test"
+        )
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(
+            sessionStore: sessions,
+            chatStore: chat,
+            client: client
+        )
+        let store = AttachmentStore()
+        let png = Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        )!
+        let added = await store.add(data: png)
+        XCTAssertTrue(added)
+
+        let paths = try await store.uploadAndAttach(
+            sessionId: "runtime-1",
+            connection: connection
+        )
+
+        XCTAssertEqual(paths, ["/gateway/images/upload-1.jpg"])
+        XCTAssertFalse(store.hasPending)
+        let params = try XCTUnwrap(transport.params())
+        XCTAssertEqual(params["session_id"] as? String, "runtime-1")
+        let encoded = try XCTUnwrap(params["content_base64"] as? String)
+        XCTAssertNil(encoded.range(of: "data:image"))
+        XCTAssertNotNil(Data(base64Encoded: encoded))
+    }
+}
+
+private final class StockImageAttachTransport: GatewayWebSocketTask, @unchecked Sendable {
+    private let lock = NSLock()
+    private var inbox: [URLSessionWebSocketTask.Message] = []
+    private var waiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+    private var attachParams: [String: Any]?
+
+    init() {
+        enqueue(.string(
+            #"{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{}}}"#
+        ))
+    }
+
+    func resume() {}
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {}
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if inbox.isEmpty {
+                waiter = continuation
+                lock.unlock()
+            } else {
+                let next = inbox.removeFirst()
+                lock.unlock()
+                continuation.resume(returning: next)
+            }
+        }
+    }
+
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {
+        guard case .string(let text) = message,
+              let data = text.data(using: .utf8),
+              let request = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              request["method"] as? String == "image.attach_bytes",
+              let id = request["id"] as? String else { return }
+        lock.withLock { attachParams = request["params"] as? [String: Any] }
+        enqueue(.string(
+            #"{"jsonrpc":"2.0","id":"\#(id)","result":{"attached":true,"path":"/gateway/images/upload-1.jpg"}}"#
+        ))
+    }
+
+    func params() -> [String: Any]? { lock.withLock { attachParams } }
+
+    private func enqueue(_ message: URLSessionWebSocketTask.Message) {
+        lock.lock()
+        if let waiter {
+            self.waiter = nil
+            lock.unlock()
+            waiter.resume(returning: message)
+        } else {
+            inbox.append(message)
+            lock.unlock()
+        }
+    }
 }

@@ -1762,10 +1762,11 @@ struct MessageBubble: View {
     // MARK: - Sent-image attachment hints
 
     struct SentImageAttachment: Identifiable, Sendable, Equatable {
+        let path: String
         let name: String
         let filename: String
 
-        var id: String { name }
+        var id: String { path }
     }
 
     struct SentImageAttachmentInput: Sendable, Equatable {
@@ -1828,7 +1829,7 @@ struct MessageBubble: View {
               !name.contains(".."),
               sentImageExtensions.contains(URL(fileURLWithPath: name).pathExtension.lowercased())
         else { return nil }
-        return SentImageAttachment(name: name, filename: name)
+        return SentImageAttachment(path: target, name: name, filename: name)
     }
 
     private nonisolated static let sentImageExtensions: Set<String> = [
@@ -2480,7 +2481,19 @@ private struct SentImageThumbnailView: View {
 
         phase = .loading
         do {
-            let data = try await rest.attachmentData(name: attachment.name)
+            let data: Data
+            do {
+                data = try await rest.mediaData(path: attachment.path)
+            } catch let error as RestError {
+                // Read-only migration fallback for legacy plugin uploads. New
+                // images are always written/read through stock Hermes.
+                if case .badStatus(let status, _) = error,
+                   status == 403 || status == 404 {
+                    data = try await rest.attachmentData(name: attachment.name)
+                } else {
+                    throw error
+                }
+            }
             guard let image = UIImage(data: data) else {
                 phase = .failed("Attachment is not a decodable image")
                 return

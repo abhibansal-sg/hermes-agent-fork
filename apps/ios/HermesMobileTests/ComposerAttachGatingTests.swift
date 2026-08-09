@@ -3,7 +3,7 @@ import XCTest
 
 @MainActor
 final class ComposerAttachGatingTests: XCTestCase {
-    func testAttachMenuFollowsUploadCapability() {
+    func testStockAttachMenuDoesNotDependOnPluginUploadCapability() {
         let connection = ConnectionStore(sessionStore: SessionStore(), chatStore: ChatStore())
 
         connection.capabilities._setUploadForTesting(.unknown)
@@ -13,6 +13,6 @@ final class ComposerAttachGatingTests: XCTestCase {
         XCTAssertTrue(connection.attachMenuAvailable)
 
         connection.capabilities._setUploadForTesting(.unavailable)
-        XCTAssertFalse(connection.attachMenuAvailable)
+        XCTAssertTrue(connection.attachMenuAvailable)
     }
 }

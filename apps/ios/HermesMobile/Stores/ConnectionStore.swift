@@ -494,13 +494,13 @@ final class ConnectionStore {
     static let pushTapReadinessTimeout: Duration = .seconds(10)
 
     /// The single, long-lived gateway client.
-    let client = HermesGatewayClient()
+    let client: HermesGatewayClient
 
-    /// The composer "+" visibility gate (B9 / A5). The stock upload capability
-    /// probe is authoritative: `.unavailable` hides the menu while `.unknown`
-    /// and `.available` keep the optimistic attachment surface visible.
+    /// The composer "+" visibility gate. Image and file attachment writes use
+    /// stock `image.attach_bytes` / `file.attach`; plugin upload capability no
+    /// longer owns or hides the native attachment surface.
     var attachMenuAvailable: Bool {
-        capabilities.upload != .unavailable
+        true
     }
 
     /// Base address for the transparent stock-protocol lane. The existing relay
@@ -1207,9 +1207,14 @@ final class ConnectionStore {
         return !serverURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    init(sessionStore: SessionStore, chatStore: ChatStore) {
+    init(
+        sessionStore: SessionStore,
+        chatStore: ChatStore,
+        client: HermesGatewayClient = HermesGatewayClient()
+    ) {
         self.sessionStore = sessionStore
         self.chatStore = chatStore
+        self.client = client
     }
 
     private static func clearSpotlightSessionIndexForPrivacy() {

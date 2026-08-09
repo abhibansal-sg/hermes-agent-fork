@@ -139,32 +139,35 @@ final class AppEnvironment {
                 },
                 uploadAsset: { [weak connectionStore, weak workRepository] job, snapshot in
                     guard let connectionStore,
-                          let rest = connectionStore.rest,
                           let workRepository else {
                         throw AttachmentError.notConfigured
                     }
                     let client = connectionStore.client
                     let data = try await workRepository.assetData(snapshot.asset)
-                    let upload = try await rest.uploadDurable(
-                        data: data,
-                        filename: "\(snapshot.asset.assetID).jpg",
-                        mimeType: snapshot.asset.mimeType,
-                        ownerJobID: job.jobID
-                    )
                     guard let runtimeID = await sessionStore.runtimeForOutboxDestination(
                         job.destinationSessionID ?? job.storedSessionID ?? ""
                     ) else { throw OutboxProcessorError.destinationUnavailable }
-                    _ = try await client.requestRaw(
-                        "image.attach",
+                    let contentBase64 = await Task.detached(priority: .userInitiated) {
+                        AttachmentStore.imageContentBase64(data)
+                    }.value
+                    let attached = try await client.requestRaw(
+                        "image.attach_bytes",
                         params: .object([
                             "session_id": .string(runtimeID),
-                            "path": .string(upload.upload.path),
+                            "content_base64": .string(contentBase64),
+                            "filename": .string("\(snapshot.asset.assetID).jpg"),
                         ]),
-                        timeout: .seconds(30)
+                        timeout: .seconds(60)
                     )
+                    guard let remotePath = attached["path"]?.stringValue,
+                          !remotePath.isEmpty else {
+                        throw AttachmentError.failed(
+                            "The gateway did not return an attached image path."
+                        )
+                    }
                     return OutboxUploadedAsset(
-                        transferID: upload.transferID,
-                        remotePath: upload.upload.path
+                        transferID: "stock-rpc:\(job.jobID):\(snapshot.asset.assetID)",
+                        remotePath: remotePath
                     )
                 },
                 willSubmit: { [weak chatStore] job, paths in

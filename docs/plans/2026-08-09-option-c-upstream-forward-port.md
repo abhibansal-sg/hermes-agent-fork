@@ -355,3 +355,22 @@ Client verification evidence:
   device set (`ENOMEM`), and the connected physical iPhone test launch reached signed
   device preflight but required the locked phone to be unlocked. No raw `xcodebuild`
   invocation was used.
+
+## H5 stock attachment authority result
+
+- The existing composer and durable outbox now send normalized images directly through
+  stock `image.attach_bytes`. The former plugin multipart `/upload` → `image.attach`
+  write path, its iOS response model, and its REST client methods were removed.
+- Arbitrary working files continue through stock `file.attach`; no plugin file store or
+  second attachment registry is introduced. Base64 construction stays off the main actor,
+  and Hermes returns the canonical gateway-local path used by prompt echo/reconciliation.
+- Sent-image thumbnails preserve the full canonical path and read through authenticated
+  stock `/api/media`. The plugin `/attachments/{name}` endpoint remains only as an
+  explicitly read-only compatibility fallback for legacy transcript hints whose old
+  upload paths are outside stock media roots; no new write can create that shape.
+- The composer attachment affordance no longer depends on the plugin upload capability.
+  Stock Hermes is the authority in both shared-token and provider-authenticated modes.
+- Focused tests prove `image.attach_bytes` carries the expected session/base64 payload,
+  clears the pending item only after Hermes returns a path, preserves full-path transcript
+  hints, and decodes/queries stock media reads. The full Swift 6 test target builds for
+  testing through the safe wrapper with asset compilation excluded.
