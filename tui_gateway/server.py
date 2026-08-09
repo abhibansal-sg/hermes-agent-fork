@@ -8158,6 +8158,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     dispatch_failed = False
+    metadata_kwargs = (
+        {"display_metadata": queued["display_metadata"]}
+        if queued.get("display_metadata")
+        else {}
+    )
     try:
         if use_compute_host:
             if queued.get("image_paths"):
@@ -8167,8 +8172,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     image_paths=queued["image_paths"],
-                    display_metadata=queued.get("display_metadata"),
                     queued_prompt_generation=queue_generation,
+                    **metadata_kwargs,
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
@@ -8176,8 +8181,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     sid,
                     session,
                     queued["text"],
-                    display_metadata=queued.get("display_metadata"),
                     queued_prompt_generation=queue_generation,
+                    **metadata_kwargs,
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -8194,8 +8199,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     image_paths=queued["image_paths"],
-                    display_metadata=queued.get("display_metadata"),
                     queued_prompt_generation=queue_generation,
+                    **metadata_kwargs,
                 )
             else:
                 _run_prompt_submit(
@@ -8203,8 +8208,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     sid,
                     session,
                     queued["text"],
-                    display_metadata=queued.get("display_metadata"),
                     queued_prompt_generation=queue_generation,
+                    **metadata_kwargs,
                 )
     except Exception as exc:
         print(
