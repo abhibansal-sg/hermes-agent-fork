@@ -27,7 +27,6 @@ jobs:
           - actions
           - javascript-typescript
           - python
-          - ruby
           - rust
     steps:
       - name: Checkout code
