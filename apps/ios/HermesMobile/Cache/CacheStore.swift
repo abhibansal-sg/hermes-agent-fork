@@ -166,6 +166,22 @@ actor CacheStore {
         }
     }
 
+    /// A process restart loses the live gateway waiter that made a prompt
+    /// actionable. Stock Hermes has no durable pending-attention snapshot, so
+    /// restored rows must be presentation history only until a fresh WebSocket
+    /// request re-arms them.
+    func expireRestoredAttention(scope: CacheScope) throws -> AttentionSnapshot {
+        try db.write { db in
+            let items = try Self.attentionItems(scope: scope, db: db)
+            for var item in items where item.state.contributesToPendingCount {
+                item.state = .expired
+                item.updatedAt = Date().timeIntervalSince1970
+                try Self.saveAttentionItem(item, scope: scope, db: db)
+            }
+            return try Self.attentionSnapshot(scope: scope, db: db)
+        }
+    }
+
     /// Apply one server snapshot/delta and its opaque cursor indivisibly.
     /// Repeated/older revisions are idempotent; equal-revision server upserts do
     /// not overwrite a responding/failed overlay.

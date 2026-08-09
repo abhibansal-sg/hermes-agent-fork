@@ -141,9 +141,7 @@ final class InboxStore {
     private var connection: ConnectionStore?
     private var cache: CacheStore?
     private var activeScope: CacheScope?
-    private var metadata: AttentionReconciliationMetadata?
     private var persistenceTail: Task<Void, Never>?
-    private var reconciliationTask: Task<Void, Never>?
 
     /// Called only after a database transaction commits, allowing the widget to
     /// publish the exact same pending count as the rows just exposed here.
@@ -186,51 +184,17 @@ final class InboxStore {
         if activeScope?.serverId != scope.serverId {
             try? await cache.clearAttentionForOtherGateways(keepingServerId: scope.serverId)
         }
-        guard let snapshot = try? await cache.loadAttentionSnapshot(scope: scope) else { return }
+        guard let snapshot = try? await cache.expireRestoredAttention(scope: scope) else { return }
         activeScope = scope
         publish(snapshot)
     }
 
-    /// Explicit/launch/foreground reconciliation entry point. A missing legacy
-    /// endpoint is a soft fallback to live events; the committed cache remains.
+    /// Stock Hermes exposes pending prompts through the live WebSocket waiter,
+    /// not a second durable inbox endpoint. Refresh therefore only binds a new
+    /// cache scope; live request/complete events own subsequent presentation.
     func refresh() async {
         guard let scope = currentScope else { return }
         if activeScope != scope { await hydrate(scope: scope) }
-        guard let rest = connection?.rest else { return }
-        await refresh(scope: scope, rest: rest)
-    }
-
-    func refresh(scope: CacheScope, rest: RestClient) async {
-        if let reconciliationTask {
-            await reconciliationTask.value
-            if activeScope != scope { await refresh(scope: scope, rest: rest) }
-            return
-        }
-        let task = Task { [weak self] in
-            guard let self else { return }
-            await self.performRefresh(scope: scope, rest: rest)
-        }
-        reconciliationTask = task
-        await task.value
-        reconciliationTask = nil
-    }
-
-    private func performRefresh(scope: CacheScope, rest: RestClient) async {
-        guard let cache else { return }
-        await persistenceTail?.value
-        let disk = try? await cache.loadAttentionSnapshot(scope: scope)
-        let cursor = (activeScope == scope ? metadata?.cursor : nil) ?? disk?.metadata?.cursor
-        do {
-            let envelope = try await rest.pendingAttention(cursor: cursor)
-            let snapshot = try await cache.applyPendingAttention(envelope, scope: scope)
-            guard activeScope == nil || activeScope == scope else { return }
-            activeScope = scope
-            publish(snapshot)
-        } catch RestError.badStatus(let code, _) where code == 404 || code == 405 {
-            // Old gateway: live broadcasts remain the best available authority.
-        } catch {
-            // Offline/decoding failures retain the last indivisible disk snapshot.
-        }
     }
 
     /// Drain queued WebSocket persistence before lifecycle teardown and in
@@ -240,7 +204,6 @@ final class InboxStore {
     }
 
     private func publish(_ snapshot: AttentionSnapshot) {
-        metadata = snapshot.metadata
         items = snapshot.items.map(Self.item(from:))
         onCommittedSnapshot?(snapshot)
     }
@@ -357,21 +320,25 @@ final class InboxStore {
     func respondApproval(_ item: Item, approve: Bool, all: Bool) async {
         guard case .approval = item.payload else { return }
         await commitState(id: item.id, state: .responding)
-        guard let rest = connection?.rest else {
+        guard let client = connection?.client else {
             await commitState(id: item.id, state: .failedRetryable)
             return
         }
-        switch await rest.respondToApproval(
-            sessionId: item.sessionId, approve: approve, all: all
-        ) {
-        case .resolved, .alreadyHandled:
-            // The RPC response is authoritative server confirmation. Keep a
-            // terminal row on disk so an older broadcast/snapshot cannot re-arm
-            // it; the next delta tombstone advances the durable revision.
+        do {
+            _ = try await client.requestRaw(
+                "approval.respond",
+                params: .object([
+                    "session_id": .string(item.sessionId),
+                    "choice": .string(approve ? "approve" : "deny"),
+                    "all": .bool(all),
+                ])
+            )
             await commitState(id: item.id, state: .resolvedElsewhere)
-            await refresh()
-        case .failed:
-            await commitState(id: item.id, state: .failedRetryable)
+        } catch {
+            await commitState(
+                id: item.id,
+                state: isAlreadyResolvedError(error) ? .resolvedElsewhere : .failedRetryable
+            )
         }
     }
 
@@ -387,20 +354,25 @@ final class InboxStore {
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         await commitState(id: item.id, state: .responding)
-        guard let rest = connection?.rest, let requestId = request.requestId else {
+        guard let client = connection?.client, let requestId = request.requestId else {
             await commitState(id: item.id, state: .failedRetryable)
             return
         }
-        switch await rest.respondToClarification(
-            sessionId: item.sessionId,
-            requestId: requestId,
-            answer: trimmed
-        ) {
-        case .resolved, .alreadyHandled:
+        do {
+            _ = try await client.requestRaw(
+                "clarify.respond",
+                params: .object([
+                    "session_id": .string(item.sessionId),
+                    "request_id": .string(requestId),
+                    "answer": .string(trimmed),
+                ])
+            )
             await commitState(id: item.id, state: .resolvedElsewhere)
-            await refresh()
-        case .failed:
-            await commitState(id: item.id, state: .failedRetryable)
+        } catch {
+            await commitState(
+                id: item.id,
+                state: isAlreadyResolvedError(error) ? .resolvedElsewhere : .failedRetryable
+            )
         }
     }
 

@@ -459,3 +459,24 @@ Client verification evidence:
 - Focused stock transcript request tests now cover latest ordering, path-style independence,
   absolute-offset paging, and search's first-page-only contract. The complete Swift 6 app
   and unit-test targets build for testing through the safe wrapper.
+
+## H6e stock approval and clarification authority result
+
+- Foreground approval and clarification responses now use Hermes' authenticated stock
+  `approval.respond` and `clarify.respond` WebSocket RPCs. Runtime/session and request ids
+  from the live Hermes frame are echoed unchanged, so Hermes' waiter, action ordering, and
+  authorization logic remain the sole decision point; the former plugin REST responders
+  were removed.
+- The cross-session inbox remains a bounded presentation cache of live WebSocket prompt
+  frames. A process restart expires every restored actionable row before publication,
+  because the client cannot prove that Hermes still has a live waiter. Fresh stock request
+  events may re-arm presentation; `message.complete` expires it. There is no plugin pending-
+  attention reconciliation call or durable mobile workflow authority.
+- Remote notification categories are temporarily open-app only. Background approve/deny/
+  reply handlers and their persisted REST endpoint resolver were removed because a killed
+  app cannot assume the stock authenticated WebSocket is live. Optional actionable APNs may
+  return only through the approved thin push provider, never by restoring plugin workflow
+  routes.
+- Existing session-switch and gate-identity fences remain in place after each RPC await.
+  The complete Swift 6 application and unit-test targets build for testing through the safe
+  wrapper.

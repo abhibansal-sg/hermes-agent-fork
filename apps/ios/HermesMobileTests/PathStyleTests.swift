@@ -104,16 +104,6 @@ final class PathStyleTests: XCTestCase {
             _ = try await client.approvalAudit(limit: 5)
             XCTAssertEqual(recordedPaths, ["\(prefix)/approvals/audit"])
 
-            client = makeClient(style: style, script: [(ok, 200)])
-            _ = await client.respondToApproval(sessionId: "s", approve: true, all: false)
-            XCTAssertEqual(recordedPaths, ["\(prefix)/approvals/respond"])
-
-            client = makeClient(style: style, script: [(ok, 200)])
-            _ = await client.respondToClarification(
-                sessionId: "s", requestId: "r", answer: "Left"
-            )
-            XCTAssertEqual(recordedPaths, ["\(prefix)/approvals/reply"])
-
             client = makeClient(style: style, script: [(fsList, 200)])
             _ = try await client.fsList(cwd: "/w", path: "")
             XCTAssertEqual(recordedPaths, ["/api/fs/list"])
@@ -144,55 +134,6 @@ final class PathStyleTests: XCTestCase {
     }
 
     // MARK: - 2. Self-healing alternate-family retries
-
-    func testRespondToApprovalRetriesAlternateFamilyOnRouteMiss() async {
-        // First attempt (plugin) route-404s, second (legacy) resolves — the
-        // stale-cache shape after a server swap under the same URL.
-        let client = makeClient(style: .plugin, script: [
-            (Data(), 404),
-            (Data(#"{"resolved":true}"#.utf8), 200),
-        ])
-        let outcome = await client.respondToApproval(sessionId: "s", approve: true, all: false)
-        XCTAssertEqual(outcome, .resolved)
-        XCTAssertEqual(recordedPaths, [
-            "/api/plugins/hermes-mobile/approvals/respond",
-            "/api/approvals/respond",
-        ])
-    }
-
-    func testRespondToApprovalDoubleRouteMissIsAlreadyHandled() async {
-        let client = makeClient(style: .legacy, script: [(Data(), 404)])
-        let outcome = await client.respondToApproval(sessionId: "s", approve: false, all: false)
-        XCTAssertEqual(outcome, .alreadyHandled)
-        XCTAssertEqual(RecordingProtocol.requests.count, 2)
-    }
-
-    func testRespondToClarificationRetriesAlternateFamilyOnRouteMiss() async {
-        let client = makeClient(style: .plugin, script: [
-            (Data(), 404),
-            (Data(#"{"resolved":true}"#.utf8), 200),
-        ])
-        let outcome = await client.respondToClarification(
-            sessionId: "s", requestId: "r", answer: "Left"
-        )
-        XCTAssertEqual(outcome, .resolved)
-        XCTAssertEqual(recordedPaths, [
-            "/api/plugins/hermes-mobile/approvals/reply",
-            "/api/approvals/reply",
-        ])
-    }
-
-    func testRespondToApprovalDoesNotRetryOnSuccessOrHardFailure() async {
-        // 200 → no second request.
-        var client = makeClient(style: .plugin, script: [(Data(#"{"resolved":false}"#.utf8), 200)])
-        _ = await client.respondToApproval(sessionId: "s", approve: true, all: false)
-        XCTAssertEqual(RecordingProtocol.requests.count, 1)
-        // 401 → no second request (credential problem, not a route miss).
-        client = makeClient(style: .plugin, script: [(Data(), 401)])
-        let outcome = await client.respondToApproval(sessionId: "s", approve: true, all: false)
-        XCTAssertEqual(outcome, .failed)
-        XCTAssertEqual(RecordingProtocol.requests.count, 1)
-    }
 
     func testLiveActivityRetriesAlternateFamilyAndReportsNotDeployedOnDouble404() async {
         var client = makeClient(style: .legacy, script: [

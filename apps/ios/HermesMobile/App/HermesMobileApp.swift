@@ -493,8 +493,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         notificationCoordinator.install()
-        let resolver = PersistedNotificationEndpointResolver()
-        notificationCoordinator.attachActionEndpointProvider { resolver.resolve() }
         // Registration is synchronous and must precede the first submission.
         let coordinator = BackgroundRefreshCoordinator.shared
         if coordinator.registerAtLaunch() { coordinator.scheduleNext() }

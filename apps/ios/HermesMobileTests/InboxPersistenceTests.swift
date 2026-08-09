@@ -6,23 +6,20 @@ import GRDB
 final class InboxPersistenceTests: XCTestCase {
     private let scope = CacheScope(serverId: "https://persist.example", profileId: "all")
 
-    private func record(kind: String = "clarify") -> PendingAttentionRecord {
-        PendingAttentionRecord(
-            id: "attention-1", requestId: "request-1", kind: kind, sessionId: "runtime-1",
-            storedSessionId: "stored-1", safeTitle: kind == "clarify" ? "Which option?" : "Approve?",
-            detail: .init(question: "Which option?", choices: ["A", "B"]), destructive: false,
-            createdAt: 100, expiresAt: nil, status: "pending", revision: 1
+    private func record(kind: String = "clarify") -> PersistedAttentionItem {
+        PersistedAttentionItem(
+            id: "attention-1", requestId: "request-1", sessionId: "runtime-1",
+            storedSessionId: "stored-1", kind: kind,
+            safeTitle: kind == "clarify" ? "Which option?" : "Approve?",
+            detail: .init(question: "Which option?", choices: ["A", "B"]),
+            createdAt: 100
         )
     }
 
-    func testRelaunchHydratesBeforeAnyNetworkAndPublishesCommittedWidgetCount() async throws {
+    func testRelaunchExpiresActionabilityWithoutLiveWaiter() async throws {
         let queue = try DatabaseQueue()
         let firstCache = try CacheStore(testDB: queue)
-        let response = PendingAttentionEnvelope(
-            serverInstanceId: "instance", cursor: "cursor-1", reset: true,
-            resetReason: "initial_snapshot", upserts: [record()], tombstones: []
-        )
-        _ = try await firstCache.applyPendingAttention(response, scope: scope)
+        _ = try await firstCache.upsertLiveAttention(record(), scope: scope)
 
         let relaunched = InboxStore()
         relaunched.attachCache(try CacheStore(testDB: queue))
@@ -30,18 +27,14 @@ final class InboxPersistenceTests: XCTestCase {
         relaunched.onCommittedSnapshot = { widgetCount = $0.pendingCount }
         await relaunched.hydrate(scope: scope)
 
-        XCTAssertEqual(relaunched.pendingItems.map(\.id), ["attention-1"])
+        XCTAssertTrue(relaunched.pendingItems.isEmpty)
         XCTAssertEqual(relaunched.storedSessionId(forRuntime: "runtime-1"), "stored-1")
         XCTAssertEqual(widgetCount, relaunched.pendingCount)
     }
 
     func testLiveReplayCannotResurrectTerminalCommittedItem() async throws {
         let cache = try CacheStore(testDB: DatabaseQueue())
-        let response = PendingAttentionEnvelope(
-            serverInstanceId: "instance", cursor: "cursor-1", reset: true,
-            resetReason: "initial_snapshot", upserts: [record(kind: "approval")], tombstones: []
-        )
-        _ = try await cache.applyPendingAttention(response, scope: scope)
+        _ = try await cache.upsertLiveAttention(record(kind: "approval"), scope: scope)
         _ = try await cache.markAttentionState(id: "attention-1", state: .resolvedElsewhere, scope: scope)
 
         let inbox = InboxStore()

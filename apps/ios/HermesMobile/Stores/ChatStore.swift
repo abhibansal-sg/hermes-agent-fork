@@ -86,10 +86,6 @@ func fetchStockTranscriptPage(
 /// bridge-readable counters) so a future REST-error mirror drop is not invisible.
 private let chatLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "ChatStore")
 
-private struct GateResponseDeliveryError: LocalizedError {
-    var errorDescription: String? { "Couldn't send that response. Try again." }
-}
-
 #if DEBUG
 /// DEBUG-only telemetry for the foreign-mirror adoption gate (F3-H). Counts the
 /// decisions the gate makes so a live DEBUG build can prove, via the UI-G
@@ -3251,8 +3247,7 @@ final class ChatStore {
 
     private func sendGateResponse(
         method: String,
-        params: JSONValue,
-        overREST: (RestClient) async -> RestClient.ApprovalRespondOutcome
+        params: JSONValue
     ) async throws {
         #if DEBUG
         if let gateResponseRPC {
@@ -3260,8 +3255,8 @@ final class ChatStore {
             return
         }
         #endif
-        guard let rest = connection?.rest else { throw GatewayError.notConnected }
-        guard await overREST(rest) != .failed else { throw GateResponseDeliveryError() }
+        guard let client else { throw GatewayError.notConnected }
+        _ = try await client.requestRaw(method, params: params)
     }
 
     /// Answer a pending approval (`approval.respond`) and clear it after ACK.
@@ -3281,12 +3276,7 @@ final class ChatStore {
                     "session_id": .string(sessionId),
                     "choice": .string(choice),
                     "all": .bool(all),
-                ]),
-                overREST: { rest in
-                    await rest.respondToApproval(
-                        sessionId: sessionId, approve: approve, all: all
-                    )
-                }
+                ])
             )
             if pendingApproval == pending {
                 pendingApproval = nil
@@ -3320,14 +3310,7 @@ final class ChatStore {
         do {
             try await sendGateResponse(
                 method: "clarify.respond",
-                params: .object(params),
-                overREST: { rest in
-                    await rest.respondToClarification(
-                        sessionId: sessionId,
-                        requestId: requestId,
-                        answer: answer
-                    )
-                }
+                params: .object(params)
             )
             // Echo only while the same gate is still visible in its owning
             // transcript. If the user switched during the await, consuming the
