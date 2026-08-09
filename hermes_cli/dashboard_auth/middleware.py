@@ -22,7 +22,10 @@ from typing import Awaitable, Callable
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from hermes_cli.dashboard_auth import list_session_providers
+from hermes_cli.dashboard_auth import (
+    list_interactive_providers,
+    list_session_providers,
+)
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
@@ -203,9 +206,10 @@ def _auto_sso_response(request: Request) -> Response | None:
         clear_sso_attempt_cookie(resp, prefix=prefix_from_request(request))
         return resp
 
-    # list_session_providers() already filters on supports_session=True, so
-    # token-only credentials (drain/service providers) are never candidates.
-    providers = list_session_providers()
+    # Only providers that expose a human login belong in auto-SSO. Native
+    # credential providers remain in the verification/refresh stack but must
+    # never redirect a browser into a login flow they do not implement.
+    providers = list_interactive_providers()
     if len(providers) != 1:
         # Zero → nothing to redirect to. Two+ → user must choose at /login.
         return None

@@ -10003,7 +10003,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     No-ops (so the existing fail-closed ``SystemExit`` remains the backstop)
     when:
       * the bind is loopback (gate never engages), or
-      * a provider is already registered, or
+      * a human-login provider is already registered, or
       * stdin/stdout isn't a TTY (Docker/s6, CI, piped ``--no-open`` runs).
     """
     host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
@@ -10016,9 +10016,9 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
         return  # if we can't tell, defer to start_server's own gate
 
     try:
-        from hermes_cli.dashboard_auth import list_providers
-        if list_providers():
-            return  # a provider is already configured/registered
+        from hermes_cli.dashboard_auth import list_interactive_providers
+        if list_interactive_providers():
+            return  # a human-login provider is already configured/registered
     except Exception:
         return
 

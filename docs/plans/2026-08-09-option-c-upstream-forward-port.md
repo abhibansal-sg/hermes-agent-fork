@@ -1,6 +1,6 @@
 # Option C upstream-first forward-port ledger
 
-Status: P-1 through H3 complete; H3 verified and ready for milestone commit
+Status: P-1 through H3 complete; H4 backend provider implemented and under review
 
 Upstream baseline: `31cedb4830191da7f8c3ea4b962d40997cd85b21`
 
@@ -269,3 +269,61 @@ Verification evidence:
   through `scripts/ios-build.sh` with the asset catalog excluded.
 - Runtime simulator execution remains blocked by the previously documented host
   CoreSimulatorService `ENOMEM` failure; no raw `xcodebuild` was used.
+
+## H4 native credential contract
+
+Backend provider result:
+
+- The stock dashboard-auth stack now distinguishes session providers that can
+  verify/refresh credentials from providers that intentionally expose a human browser
+  login. This generic flag keeps native-only providers in Bearer verification and
+  refresh while excluding them from `/login`, auto-SSO, native OAuth broker selection,
+  and login-provider discovery.
+- The removable `hermes-mobile` provider owns only profile-scoped native credentials.
+  It stores SHA-256 hashes of 256-bit random bootstraps/access/refresh tokens in
+  `plugins/hermes-mobile/native_auth.sqlite3`, with private directory/file modes,
+  parameterized SQL, `BEGIN IMMEDIATE`, `synchronous=FULL`, and the stock Hermes
+  WAL/network-filesystem fallback policy. No raw credential is persisted or logged.
+- `hermes mobile-pair --url https://…` mints a five-minute, single-use bootstrap.
+  The QR/deep link contains `kind=provider`, the public gated gateway URL, and only
+  that bootstrap. The command refuses cleartext HTTP and never embeds final access or
+  refresh credentials.
+- The bootstrap is exchanged exactly once at
+  `/api/plugins/hermes-mobile/pair/exchange`. The route is opted into the stock exact-
+  path token-auth seam, validates the provider/scope, consumes the bootstrap atomically,
+  and returns a non-cacheable standard native credential bundle with a stable
+  `client_id`.
+- Access tokens expire after 15 minutes. Refresh tokens expire after 30 days and rotate
+  on every stock `/auth/native/refresh` call; rotation invalidates the prior access and
+  refresh pair. Best-effort provider revocation invalidates both. Store outages use the
+  stock `ProviderError`/503 semantics rather than being misreported as bad credentials.
+- After exchange, no plugin transport is involved: REST uses stock
+  `Authorization: Bearer`, WebSocket connects mint a stock one-use 30-second
+  `/api/auth/ws-ticket`, and `/api/ws?ticket=…` carries the verified user/client
+  principal into H2 action authority. The provider has no transcript, file,
+  attachment, timeline, queue, relay, or workflow tables.
+- Existing shared loopback-token gateways remain a separate compatibility mode. The
+  provider credential mode is for current non-loopback gated Hermes endpoints; iOS will
+  preserve the loopback fallback while preferring the provider bundle for remote
+  gateways.
+
+Backend verification evidence:
+
+- Eight focused provider tests cover protocol compliance, hidden login discovery,
+  hashed/private bootstrap storage, TTL, single use, concurrent exchange, rotating
+  refresh, access invalidation, revocation, expiry, store-outage semantics, HTTPS-only
+  pairing URLs, non-cacheable exchange, stock Bearer auth, and stock WS ticket identity.
+- 161 dashboard-auth/provider regression tests pass across the focused provider file,
+  native OAuth, WS tickets, 401 re-auth, token auth, plugin hook, and all bundled
+  dashboard-auth provider suites.
+- Ruff, Python compilation, and `git diff --check` pass.
+
+Remaining H4 client work:
+
+- Store the provider access/refresh bundle atomically in Keychain with non-secret
+  provider/client metadata scoped to the existing server identity.
+- Use Bearer REST, mint a one-use WS ticket immediately before every socket connect,
+  rotate refresh single-flight on 401, and keep every completion guarded by the current
+  connection generation.
+- Preserve the current shared-token path for old/loopback gateways and remove no device
+  settings or compatibility flow until migration tests prove the replacement.

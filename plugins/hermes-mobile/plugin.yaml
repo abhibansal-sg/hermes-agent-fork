@@ -1,5 +1,5 @@
 name: hermes-mobile
-version: "1.0.0"
-description: "Thin edge providers for native Hermes clients. Stores durable prompt admission receipts only; Hermes retains session, transcript, file, and workflow authority."
+version: "1.1.0"
+description: "Thin edge providers for native Hermes clients. Stores remote-client credentials and durable prompt admission receipts only; Hermes retains session, transcript, file, and workflow authority."
 author: "Hermes Mobile"
 kind: backend

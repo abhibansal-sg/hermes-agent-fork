@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from hermes_cli.dashboard_auth import (
     get_provider,
+    list_interactive_providers,
     list_providers,
     list_session_providers,
 )
@@ -153,7 +154,7 @@ async def login_page(request: Request) -> HTMLResponse:
 async def api_auth_providers() -> Any:
     # Advertise only interactive providers; a token-only credential (e.g. drain)
     # is not a sign-in option.
-    providers = list_session_providers()
+    providers = list_interactive_providers()
     if not providers:
         # Q13: fail-closed when zero providers are registered.
         return JSONResponse(
@@ -187,7 +188,9 @@ async def auth_login(request: Request, provider: str, next: str = ""):
             status_code=404,
             detail=f"Unknown provider: {provider!r}",
         )
-    if not getattr(p, "supports_session", True):
+    if not getattr(p, "supports_session", True) or not getattr(
+        p, "supports_interactive_login", True
+    ):
         raise HTTPException(
             status_code=404,
             detail=f"Provider does not support interactive login: {provider!r}",
@@ -320,15 +323,17 @@ async def auth_native_authorize(
     # the auto-SSO convenience so the desktop needn't hardcode the name.
     p = get_provider(provider) if provider else None
     if p is None and not provider:
-        sess_providers = list_session_providers()
+        sess_providers = list_interactive_providers()
         if len(sess_providers) == 1:
             p = sess_providers[0]
     if p is None:
         raise HTTPException(
             status_code=404, detail=f"Unknown provider: {provider!r}"
         )
-    if not getattr(p, "supports_session", True) or getattr(
-        p, "supports_password", False
+    if (
+        not getattr(p, "supports_session", True)
+        or not getattr(p, "supports_interactive_login", True)
+        or getattr(p, "supports_password", False)
     ):
         # Native PKCE brokering is only meaningful for redirect/OAuth
         # providers; a password provider has no IDP round trip to broker.
@@ -678,7 +683,11 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
         )
 
     p = get_provider(body.provider)
-    if p is None or not getattr(p, "supports_password", False):
+    if (
+        p is None
+        or not getattr(p, "supports_interactive_login", True)
+        or not getattr(p, "supports_password", False)
+    ):
         # Don't leak which providers exist or which support passwords —
         # same 404 whether the provider is unknown or OAuth-only.
         audit_log(

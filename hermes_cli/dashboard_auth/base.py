@@ -187,6 +187,15 @@ class DashboardAuthProvider(ABC):
     # supports_token.
     supports_session: bool = True
 
+    # Some providers mint and verify interactive-user-equivalent sessions for
+    # native clients without offering a browser login of their own.  Keep those
+    # providers in the session verification/refresh stack while omitting them
+    # from /login, provider discovery, auto-SSO, and RFC 8252 broker selection.
+    # This is deliberately separate from supports_session: the latter answers
+    # "can this provider verify/refresh a Session?", while this flag answers
+    # "should a human be invited to start a browser login with it?".
+    supports_interactive_login: bool = True
+
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...
 

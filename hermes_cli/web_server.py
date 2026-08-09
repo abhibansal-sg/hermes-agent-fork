@@ -3198,22 +3198,23 @@ async def get_status(profile: Optional[str] = None):
         # RFC 8252 native-app capability advertisement. The desktop reads this
         # to decide whether it can use the system-browser + loopback + PKCE
         # flow (no embedded webview, no session cookies) or must fall back to
-        # the legacy embedded-webview cookie flow. "cookie" is always available
-        # in gated mode; "native_pkce" is present only when at least one
-        # registered session provider is a brokerable OAuth provider (not a
+        # the legacy embedded-webview cookie flow. "cookie" is available when
+        # at least one human-login provider is registered; "native_pkce" only
+        # when one of those providers is a brokerable OAuth provider (not a
         # password or token-only credential). Absent field / missing
         # "native_pkce" ⇒ older gateway ⇒ desktop falls back automatically.
         auth_flows: list[str] = []
         try:
             from hermes_cli.dashboard_auth import (
                 list_providers as _list_providers,
-                list_session_providers as _list_session_providers,
+                list_interactive_providers as _list_interactive_providers,
             )
             auth_providers = [p.name for p in _list_providers()]
-            if auth_required:
+            interactive_providers = _list_interactive_providers()
+            if auth_required and interactive_providers:
                 auth_flows.append("cookie")
                 brokerable = [
-                    p for p in _list_session_providers()
+                    p for p in interactive_providers
                     if not getattr(p, "supports_password", False)
                 ]
                 if brokerable:
@@ -17751,10 +17752,10 @@ def start_server(
 
     if app.state.auth_required:
         # The gate engages on every non-loopback bind. Require at least one
-        # provider to be registered, else fail closed — there is no longer an
+        # session provider to be registered, else fail closed — there is no longer an
         # escape hatch that serves the dashboard without authentication.
-        from hermes_cli.dashboard_auth import list_providers
-        if not list_providers():
+        from hermes_cli.dashboard_auth import list_session_providers
+        if not list_session_providers():
             # Surface the *specific* reason any bundled provider declined
             # to register (e.g. missing HERMES_DASHBOARD_OAUTH_CLIENT_ID).
             # Each provider plugin that ships with Hermes Agent exposes a
@@ -17828,7 +17829,7 @@ def start_server(
         _log.info(
             "Dashboard binding to %s with auth gate enabled. Providers: %s",
             host,
-            ", ".join(p.name for p in list_providers()),
+            ", ".join(p.name for p in list_session_providers()),
         )
 
     # Record the bound host so host_header_middleware can validate incoming
