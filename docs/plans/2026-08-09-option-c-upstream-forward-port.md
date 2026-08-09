@@ -504,3 +504,51 @@ Client verification evidence:
 - The complete Swift 6 application and unit-test targets build for testing through the safe
   wrapper after project regeneration. Runtime simulator execution remains blocked by the
   host CoreSimulator `ENOMEM` condition recorded above.
+
+## Final coordinated-release gate
+
+The approved Option C sprint is implementation-complete on the existing iOS application.
+The last cleanup removed the inactive plugin-era device-token migration, its device-limit
+advisory UI, and its debug/test seams. Native provider pairing still retains the local
+device-name hint, but credential ownership now has exactly one live path.
+
+Final acceptance evidence:
+
+- `scripts/ios-build.sh build-for-testing -scheme HermesMobile -destination
+  'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
+  'EXCLUDED_SOURCE_FILE_NAMES=Assets.xcassets'` succeeds with Swift 6 complete strict
+  concurrency enabled for the application and test targets.
+- 58 focused Python tests pass across native mobile authentication, durable prompt
+  admission, revisioned action authority/takeover, dashboard WebSocket authentication,
+  and the native provider flow. The dashboard test process was run with
+  `HERMES_DASHBOARD_WS_HOST` explicitly empty so the developer machine's configured
+  sidecar host could not contaminate the no-bound-host fixture.
+- Production Swift contains only two explicit `hermes-mobile` plugin paths:
+  `/api/plugins/hermes-mobile/pair/exchange` and the read-only legacy
+  `/api/plugins/hermes-mobile/attachments/{name}` compatibility fallback.
+- The thin plugin owns only three SQLite tables: `native_pair_bootstraps`,
+  `native_client_sessions`, and `prompt_receipts`. It has no transcript, attachment,
+  file, timeline, queue, action-ordering, or workflow tables.
+- Provider REST credentials remain in authorization headers, provider WebSockets use a
+  fresh stock one-use ticket, and no access/refresh credential is placed in a URL or log.
+- Restored prompt-cache rows are presentation-only and non-actionable until a fresh live
+  Hermes request arrives. Foreground responses preserve Hermes' original session,
+  runtime, and request identities.
+- Runtime simulator execution remains unavailable because the host CoreSimulator service
+  cannot initialize its device set (`ENOMEM`). This is an environment limitation rather
+  than a compile or link failure; the generic-device test build is the recorded release
+  gate for this sprint.
+
+Acceptance criteria are therefore satisfied: Hermes is the sole canonical authority for
+live state, transcripts, attachments/files, action ordering, authorization orchestration,
+takeover, and workflows; iOS retains only bounded presentation/cache/outbox state; and the
+remaining plugin surface is limited to the approved thin providers.
+
+Rollback is commit-local and does not require a data rewrite. Revert the logical milestones
+in reverse dependency order: final device-migration cleanup, `c5ff3220a0`, `7f89831dee`,
+`9e9a92a894`, `c4932f0f6b`, `ae9b8f0545`, `d80db9a164`, `bd248c72c8`, `ea07c3618e`,
+`c8e357668a`, `1e421e73c4`, `271104a763`, `67fd84f0e6`, and `4b082aadf7`.
+Existing bounded iOS cache data may be discarded at any rollback point; Hermes canonical
+state and files are not migrated or deleted by this sequence. Native provider SQLite rows
+may remain inert if their provider commits are reverted, or be removed only after a
+separately authorized credential revocation/export decision.

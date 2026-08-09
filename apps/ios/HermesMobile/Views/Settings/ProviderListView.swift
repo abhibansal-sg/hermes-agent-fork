@@ -12,11 +12,9 @@ import SwiftUI
 //   • ``CustomProviderView``     — Tier B: name + base_url + api_mode + key for a
 //                                  custom OpenAI/Anthropic-compatible provider.
 //
-// All three are FULL NATIVE `List`/`Form` screens (system primitives only;
-// identity via tint — `theme.midground` for the authenticated chip,
-// `theme.destructive` for Disconnect, matching DevicesView). They reuse the
-// device-token REST client (`connectionStore.rest`) and the transient
-// ``KeychainService`` provider-key storage — no reinvention.
+// All three are FULL NATIVE `List`/`Form` screens (system primitives only).
+// They reuse the stock authenticated REST client (`connectionStore.rest`) and
+// transient ``KeychainService`` provider-key handoff — no reinvention.
 //
 // SECRETS HYGIENE (binding): the entered key lives in a `@State` String ONLY
 // until the Save tap, which writes it to the Keychain transiently, POSTs it
@@ -68,8 +66,7 @@ enum ProviderKeySaveDecision: Equatable {
 /// running model + repopulate the Model picker (the gateway's
 /// stock `model.options` reflects the new provider's models).
 struct ProviderListView: View {
-    /// The REST client for the active connection (device or shared token — both
-    /// accepted by the plugin routes, same as DevicesView).
+    /// The stock REST client for the active authenticated connection.
     let rest: RestClient
     /// Stock JSON-RPC credential authority. Nil only in isolated UI-test seeds.
     let gateway: HermesGatewayClient?

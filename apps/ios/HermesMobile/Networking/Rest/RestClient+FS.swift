@@ -352,7 +352,7 @@ extension RestClient {
             search: search,
             lineCount: lineCount
         )
-        // /api/logs is a STOCK gateway route (not a plugin-mount route), so it
+        // /api/logs is a stock gateway route, so it
         // hangs off /api directly regardless of pathStyle. The existing
         // makeRequest joins the path under baseURL, and the Host override +
         // bearer auth headers are applied uniformly.

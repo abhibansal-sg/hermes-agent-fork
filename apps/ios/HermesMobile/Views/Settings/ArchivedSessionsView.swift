@@ -78,7 +78,7 @@ struct ArchivedSessionsView: View {
                 ProgressView()
             }
         }
-        // PSF-10: pull-to-refresh mirrors DevicesView / ApprovalAuditView pattern.
+        // PSF-10: standard pull-to-refresh for a remotely authoritative list.
         .refreshable { await reload() }
         .task {
             // Re-fetch on every appear so the list is fresh each time the

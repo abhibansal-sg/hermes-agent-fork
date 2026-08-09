@@ -146,8 +146,8 @@ final class ConnectionStoreReconnectTests: XCTestCase {
     /// Fails every request instantly (`cannotConnectToHost`) — no real DNS
     /// lookup or socket attempt. Backs the stub `_restOverrideForTesting`
     /// client seeded in `makeStore()` (STR-1481): without it, every hermetic
-    /// test's fire-and-forget REST probe (`configure()`'s capability probe /
-    /// auto-upgrade, `recoverActiveSession()`'s reattach probe) tries to reach
+    /// test's fire-and-forget REST probe (`configure()`'s capability probe or
+    /// `recoverActiveSession()`'s reattach probe) tries to reach
     /// a fake host and floods CI logs with hundreds of "HTTP load failed" /
     /// `-1004` lines — which is what pushed the real failing assertion out of
     /// the CI log's `tail -100` window. It is NOT the cause of the two
@@ -240,7 +240,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertNil(failure)
         XCTAssertNil(
             DefaultsKeys.deviceId(server: serverURL),
-            "nil-id configure with a different token must clear stale device_id so auto-upgrade can issue a fresh device token"
+            "nil-id configure with a different token must clear stale legacy device identity"
         )
         XCTAssertEqual(KeychainService.loadToken(server: serverURL), "manual-shared-token")
     }

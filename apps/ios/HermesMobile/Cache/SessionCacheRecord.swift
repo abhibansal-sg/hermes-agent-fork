@@ -9,7 +9,7 @@ import GRDB
 //
 //   - serverId  = the trimmed `ConnectionStore.serverURLString` (the saved
 //                 gateway base URL — the SAME identity already used for the
-//                 Keychain token and `DefaultsKeys.deviceIdsByServer`).
+//                 server-scoped Keychain credential).
 //   - profileId = the NORMALIZED `SessionStore.activeProfile`: blank → "all"
 //                 (the canonical aggregate key); "default" and named profiles
 //                 keep their literal value.

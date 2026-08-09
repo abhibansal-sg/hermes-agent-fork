@@ -207,7 +207,7 @@ struct SettingsView: View {
             .scrollContentBackground(.hidden)
             .background(theme.bg)
             // PSF-04: use the standard navigationTitle so this root matches all
-            // pushed-stack panels (DevicesView, AboutPanel, etc.) — the system
+            // pushed-stack panels (AboutPanel, provider settings, etc.) — the system
             // renders the inline title consistently; the custom `.principal`
             // ToolbarItem it replaced was a bespoke re-implementation that differed
             // from the pushed views and produced mismatched title sizes on iOS 26.
@@ -664,13 +664,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Connection (server, devices, disconnect / forget)
-
-    /// The W3a Devices row pushes ``DevicesView`` (the native device list +
-    /// revoke + approval audit). Rendered ONLY when the connected gateway
-    /// advertises the `devices` capability AND a live REST client exists; on a
-    /// stock hermes-agent (`devices != .available`) it is absent and the
-    /// legacy shared token is untouched (W3a stock degradation).
+    // MARK: - Connection (server, offline, disconnect / forget)
     @ViewBuilder
     private var connectionSection: some View {
         Section {
@@ -1776,7 +1770,7 @@ private final class SystemLogsStore: ObservableObject {
 
 // MARK: - ABH-262 toolset credential settings UI
 //
-// A plugin-mount Settings panel for non-model tool credentials (web and
+// A stock Hermes Settings panel for non-model tool credentials (web and
 // image_gen to start). The server is the source of truth and deliberately returns
 // only redacted `is_set` booleans, never secret values. This view preserves that
 // contract: configured credentials render as status chips only, and the edit form

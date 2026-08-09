@@ -183,7 +183,7 @@ extension RestClient {
     /// caller (``WebhooksPanelView``) surfaces that as an inline error, same
     /// posture as `ProvidersView` on a pre-ABH-183 gateway.
     func listWebhooks() async throws -> WebhooksListResult {
-        // /api/webhooks is a STOCK gateway route (not a plugin-mount route),
+        // /api/webhooks is a stock gateway route,
         // so it hangs off /api directly regardless of pathStyle — mirrors
         // `systemLogs`.
         let data = try await get(path: "/api/webhooks")

@@ -117,31 +117,21 @@ enum DefaultsKeys {
     /// ``PushRegistrar``.
     static let pushEnabled = "hermes.pushEnabled"
 
-    /// `String` — the last APNs device token registered with the gateway, so a
-    /// no-op re-register can be skipped. Owned by ``PushRegistrar``.
+    /// Legacy remote-registration state removed by ``PushRegistrar`` during the
+    /// Option C migration. No current code writes a token here.
     static let pushLastDeviceToken = "hermes.push.lastDeviceToken"
 
-    /// `[String]` — the per-event subset last successfully registered with the
-    /// gateway, so a prefs change (A4) can force a re-POST even when the device
-    /// token is unchanged. Owned by ``PushRegistrar``.
+    /// Legacy remote-registration event state, retained only as a cleanup key.
     static let pushLastEvents = "hermes.push.lastEvents"
 
-    /// `String` — the APNs environment (`"sandbox"` / `"production"`) under which
-    /// the last successful registration was issued. Added to the dedupe key so that
-    /// a sandbox→production transition (Xcode → TestFlight on the same token) forces
-    /// a re-POST and the gateway routes the token to the correct APNs host. Owned by
-    /// ``PushRegistrar``.
+    /// Legacy APNs environment state, retained only as a cleanup key.
     static let pushLastEnv = "hermes.push.lastEnv"
 
-    /// `String` — non-secret hash of gateway URL + credential/device identity
-    /// used for the last successful alert-token registration. Prevents a token
-    /// registered against one pairing from becoming APNs authority after a
-    /// gateway switch or re-pair. Owned by ``PushRegistrar``.
+    /// Legacy remote-registration scope, retained only as a cleanup key.
     static let pushLastRegistrationScope = "hermes.push.lastRegistrationScope"
 
-    /// `Bool` — whether the most recent APNs/gateway registration attempt is
-    /// known healthy. Missing is deliberately false (local fallback) until a
-    /// successful registration proves remote delivery is authoritative.
+    /// Legacy remote-registration health flag. It remains false until an
+    /// optional thin APNs provider is implemented.
     static let pushRegistrationHealthy = "hermes.push.registrationHealthy"
 
     /// `Bool` — whether notification authorization has already been requested once,
@@ -199,27 +189,23 @@ enum DefaultsKeys {
     /// re-probing. Owned by ``ServerCapabilities``; written/read only there.
     static let serverCapabilities = "hermes.serverCapabilities"
 
-    // MARK: Per-device token identity (W3A-A)
+    // MARK: Legacy device-pairing identity
     //
     // The NON-SECRET, stable `device_id` the server minted for THIS device,
     // scoped per server URL (mirroring the one-token-per-gateway Keychain model).
     // The device TOKEN itself lives ONLY in the Keychain (the existing
     // `KeychainService`, keyed by server URL) — never here, never in any
     // `@Snapshotable` accessor, never in the DEBUG ring buffer (secrets hygiene,
-    // binding). `device_id` is safe to persist: it is not secret and the panel
-    // reads it to mark "This device". Owned by ``ConnectionStore`` (the
-    // auto-upgrade / QR-v2 paths write it; the Devices panel reads it).
+    // binding). Current native-provider pairing does not use this value. It is
+    // retained so legacy v2 QR pairings and older cleanup tombstones reconcile
+    // without erasing a newly repaired gateway's cache.
 
     /// The `UserDefaults` dictionary mapping a server URL → its recorded
     /// `device_id`. A dictionary (not one flat key) so multiple paired gateways
     /// each keep their own id, matching the per-server Keychain token model.
     static let deviceIdsByServer = "hermes.deviceIdsByServer"
 
-    /// The recorded (non-secret) `device_id` for `server`, or `nil` if this
-    /// device has not yet auto-upgraded / been issued a device token for it.
-    /// Its presence is the signal the auto-upgrade path uses to decide it has
-    /// already swapped to a device token (so it does NOT re-issue on every
-    /// connect).
+    /// The recorded non-secret legacy `device_id` for `server`, or `nil`.
     static func deviceId(server: String, _ defaults: UserDefaults = .standard) -> String? {
         let map = defaults.dictionary(forKey: deviceIdsByServer) as? [String: String]
         let value = map?[server]?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -227,10 +213,7 @@ enum DefaultsKeys {
         return value
     }
 
-    /// Record (or clear, with `nil`) the `device_id` for `server`. Writing a new
-    /// id is the second half of the auto-upgrade / QR-v2 swap (the token went to
-    /// the Keychain; the id goes here). Clearing is used when a device is revoked
-    /// from THIS device so the next connect re-issues a fresh device token.
+    /// Record (or clear, with `nil`) legacy QR/tombstone reconciliation identity.
     static func setDeviceId(_ deviceId: String?, server: String, _ defaults: UserDefaults = .standard) {
         var map = (defaults.dictionary(forKey: deviceIdsByServer) as? [String: String]) ?? [:]
         if let deviceId, !deviceId.isEmpty {
@@ -245,25 +228,12 @@ enum DefaultsKeys {
         }
     }
 
-    // MARK: - Push registration device id fallback (QA-3 S13)
-    //
-    // The relay push registry dedups by `device_id` (one row per device). Build
-    // 116's relay registration plumbed `device_id` only when a v2 pairing had
-    // issued one (`DefaultsKeys.deviceId(server:)`) — but a relay-only phone on
-    // a pre-v2 shared-token pairing never completes the auto-upgrade, so the
-    // field was `nil`, the registry row carried no id, and QA-2's device-keyed
-    // eviction could never converge (fan-out kept hitting stale null-id rows
-    // Apple 200s into the void). The per-install fallback below mints ONE
-    // stable id per install the FIRST time a registration needs it, so every
-    // registration from day one is keyed. The v2 issued id still wins when it
-    // exists (it is the server's authoritative per-device identity).
+    // MARK: - Local notification deduplication identity
 
     /// The single per-install push device id (a minted UUID, persisted the first
-    /// time a registration needs a device id and no v2 id is on record). NOT
-    /// secret — it identifies the install for dedup, nothing more. Stable across
-    /// launches; rotates on app delete+reinstall (acceptable: APNs rotates the
-    /// token on reinstall too, and the registry's device-keyed replace handles
-    /// that rotation in place).
+    /// time a local notification scope needs one. NOT secret — it identifies the
+    /// install for dedup, nothing more. Stable across launches and rotates on
+    /// app delete/reinstall.
     static let pushDeviceInstallId = "hermes.pushDeviceInstallId"
 
     /// Read (or lazily mint) the per-install fallback device id. Idempotent:
@@ -280,10 +250,8 @@ enum DefaultsKeys {
         return minted
     }
 
-    /// The `device_id` to stamp on a push registration for `server`: the v2
-    /// issued id when one exists, else the per-install fallback (always
-    /// non-empty). Callers MUST use this — not the bare `deviceId(server:)` —
-    /// so the relay registry converges to one row per device.
+    /// Stable non-secret identity for local alert deduplication. A legacy v2 id
+    /// wins when available; otherwise the per-install fallback is used.
     static func pushRegistrationDeviceId(server: String, _ defaults: UserDefaults = .standard) -> String {
         if let v2 = deviceId(server: server, defaults) {
             return v2

@@ -97,16 +97,14 @@ enum HermesURLRouter {
 
     // MARK: - QR pairing payload (v1 + v2)
 
-    /// A parsed `hermesapp://pair?…` payload. v1 carries only `url`+`token` (a
-    /// SHARED token); v2 (W3a) additionally carries `kind=device` + `device_id`
-    /// so the app records the device identity it was handed instead of
-    /// auto-upgrading from a shared token.
+    /// A parsed `hermesapp://pair?…` payload. v1 carries only `url`+`token`;
+    /// legacy v2 additionally carries `kind=device` + `device_id` so upgrades
+    /// can safely preserve cleanup identity for an already-issued credential.
     ///
     /// BACKWARD COMPAT (binding): `token` remains the credential key in BOTH
     /// versions, so an old parser never breaks. A v2 payload missing/absent
-    /// `kind` (or `kind` != `"device"`) is treated as a SHARED pairing exactly
-    /// as v1 — the app pairs with `token` and then (on a W3a server) auto-upgrades
-    /// to a device token. `kind`/`device_id` are purely additive.
+    /// `kind` (or `kind` != `"device"`) is treated exactly as v1.
+    /// `kind`/`device_id` remain purely additive compatibility metadata.
     struct PairPayload: Equatable, Identifiable, Sendable {
         /// Stable identity for `Identifiable` conformance (needed by `.sheet(item:)`
         /// in `RootView`). Keyed on the URL so re-tapping the same link produces
@@ -115,9 +113,8 @@ enum HermesURLRouter {
         let url: String
         let token: String
         /// `true` iff the payload explicitly carried `kind=device` AND a non-empty
-        /// `device_id`. When true, `token` IS already a device token and
-        /// `deviceId` is its server-minted id — record it; do NOT auto-upgrade.
-        /// When false, this is a v1 (shared) pairing — auto-upgrade handles it.
+        /// `device_id`. When true, `token` is an already-issued legacy device
+        /// credential and `deviceId` is retained for cleanup reconciliation.
         let isDeviceToken: Bool
         /// The server-minted `device_id`, present iff `isDeviceToken`.
         let deviceId: String?
@@ -168,7 +165,7 @@ enum HermesURLRouter {
     /// keys are read additively — a v1 payload (no `kind`) yields `isDeviceToken ==
     /// false`; a v2 `kind=device` payload WITH a non-empty `device_id` yields
     /// `isDeviceToken == true`. Any other `kind` value, or a `kind=device` missing
-    /// `device_id`, falls back to a shared pairing (defensive). Single parser
+    /// `device_id`, falls back to a v1 pairing (defensive). Single parser
     /// shared by the in-app QR scanner and the deep-link route so a scan and a
     /// tapped link behave identically.
     static func parsePairPayload(_ payload: String) -> PairPayload? {

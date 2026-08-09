@@ -1526,11 +1526,10 @@ final class SessionStore {
     /// ABH-194: this previously re-read ``KeychainService/loadToken(server:)``
     /// directly, creating a second token source that could diverge from
     /// ``ConnectionStore/currentToken`` (the authoritative in-memory token).
-    /// Divergence scenarios: a re-pair that wrote `currentToken` before the
-    /// Keychain item was updated, a device-token upgrade whose Keychain write
-    /// failed (the `try?` path in ``ConnectionStore/configure(_:token:…)``), or
-    /// a simulator reinstall that cleared UserDefaults but left a stale Keychain
-    /// item. In all cases `SessionStore.restAPI` sent the stale/wrong token on
+    /// Divergence scenarios include a re-pair that updates in-memory state before
+    /// Keychain persistence, or a simulator reinstall that clears UserDefaults
+    /// but leaves a stale Keychain item. In both cases `SessionStore.restAPI` sent
+    /// the stale/wrong token on
     /// REST calls and received HTTP 401, while everything routed through
     /// `connection.rest` / `currentToken` worked (including the WS auth and the
     /// transcript-fetch paths that correctly used `connection?.rest`).

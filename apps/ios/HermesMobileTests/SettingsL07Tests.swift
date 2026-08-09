@@ -1,13 +1,11 @@
 import XCTest
 @testable import HermesMobile
 
-/// Level-07 targeted tests for the Settings/Security/Devices changes.
+/// Level-07 targeted tests for retained Settings/Security behavior.
 ///
 /// Covered:
 /// - ``DefaultsKeys/requiresBiometricForSecrets`` default-ON semantics (P0 / A2)
 /// - ``AppLock/biometricLabel`` / ``AppLock/biometricSystemImage`` non-empty
-/// - ``ApprovalAuditView`` load-more page boundary detection (hasMore iff count == limit)
-/// - ``DevicesView/isCurrentDevice`` unchanged (regression pin)
 /// - ``DefaultsKeys`` no longer has captureEnabled/capturePrefix (QuickCapture removal)
 @MainActor
 final class SettingsL07Tests: XCTestCase {

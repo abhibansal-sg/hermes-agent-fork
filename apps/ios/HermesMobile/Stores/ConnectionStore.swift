@@ -2,7 +2,7 @@ import SwiftUI
 import OSLog
 import Network  // NWPathMonitor — S3 self-reconnect when the network returns
 #if canImport(UIKit)
-import UIKit  // UIDevice.current.name — the auto-upgrade device-name hint (W3A-A)
+import UIKit  // UIDevice.current.name — native-provider pairing display hint
 #endif
 /// A model pick made on a DRAFT chat (no gateway session yet) — pends until
 /// the draft materializes, then applies session-scoped (ABH-84 follow-up).
@@ -146,26 +146,6 @@ final class ConnectionStore {
     var isAwaitingRePair: Bool {
         if case .needsSetup = phase, reauthRequired { return true }
         return false
-    }
-
-    /// Non-blocking advisory for a device-token auto-upgrade that hit the server's
-    /// device registry cap. Unlike `.offline`, this DOES NOT describe transport
-    /// health and must never gate the composer: the shared token remains live, so
-    /// the chat stays usable while the user revokes an unused device and retries.
-    var deviceLimitAdvisory: String?
-
-    func dismissDeviceLimitAdvisory() {
-        deviceLimitAdvisory = nil
-    }
-
-    func retryDeviceUpgrade(serverURL: String) async {
-        deviceIssueLimitReachedServers.remove(serverURL)
-
-        await autoUpgradeToDeviceTokenIfNeeded(serverURL: serverURL)
-
-        if DefaultsKeys.deviceId(server: serverURL) != nil {
-            deviceLimitAdvisory = nil
-        }
     }
 
     /// Short display name of the gateway's currently-configured main model
@@ -597,14 +577,14 @@ final class ConnectionStore {
         )
     }
 
-    /// A REST client built from the saved URL + token, or `nil` if unconfigured.
-    /// Speaks the path family the capability probe resolved (ABH-88) — `.legacy`
-    /// until/unless the plugin-mount probe concludes `.available`.
+    /// A stock Hermes REST client built from the active credential, or `nil` if
+    /// unconfigured. Provider sessions share one rotating credential controller;
+    /// legacy local pairings retain the saved gateway token.
     var rest: RestClient? {
         #if DEBUG
         // Test-only: a seeded override short-circuits the URL+token build so a
         // stub `URLSession` can observe/no-op the calls made through `rest`
-        // (e.g. reconnect probes and the device auto-upgrade round-trip). See
+        // (for example, reconnect capability probes). See
         // `_restOverrideForTesting`.
         if let _restOverrideForTesting { return _restOverrideForTesting }
         #endif
@@ -723,9 +703,8 @@ final class ConnectionStore {
     /// of building one from the saved URL + token, so a stub `URLSession`
     /// (`URLProtocol`-injected) can observe/no-op the requests they issue —
     /// in particular the reconnect-path probes inside `recoverActiveSession()`
-    /// (`capabilities.probe`, `autoUpgradeToDeviceTokenIfNeeded`) and the
-    /// auto-upgrade `issueDevice` round-trip, which are
-    /// otherwise routed through an internal `.ephemeral` session that no
+    /// (`capabilities.probe`), which are otherwise routed through an internal
+    /// `.ephemeral` session that no
     /// `URLProtocol` can intercept, and which leak real network calls to a
     /// dead loopback gateway on a CI runner with no server (STR-1481). Mirrors
     /// the existing `_seed…ForTesting` conventions; compiled out of Release,
@@ -934,15 +913,8 @@ final class ConnectionStore {
         }
     }
 
-    /// Servers where `POST /devices/issue` hit the device registry cap during
-    /// this app run. A 409 is permanent until a device is revoked, so automatic
-    /// reconnect/recover probes should not hammer it repeatedly in silence. The
-    /// existing banner retry path calls `configure()` again, which clears the
-    /// marker for an explicit user re-attempt after cleanup.
-    private var deviceIssueLimitReachedServers = Set<String>()
-
     /// WS-RECONNECT-SOFTEN (a) — delay before `recoverActiveSession`'s
-    /// background capability/profile/auto-upgrade burst fires after a
+    /// background capability/profile refresh fires after a
     /// (re)connect, so it lands slightly AFTER the user-visible hydration
     /// calls (model refresh, session resume, transcript backfill, session-list
     /// refresh) rather than in the exact same instant. Nothing on the
@@ -951,9 +923,9 @@ final class ConnectionStore {
     private static let backgroundCapabilityBurstStagger: Duration = .milliseconds(300)
 
     /// WS-RECONNECT-SOFTEN (a) — minimum spacing between FORCED capability
-    /// re-probes across reconnects. A forced re-probe checks the plugin bundle
-    /// and stock profile route once per genuine drop, but not on every attempt
-    /// of a rapid reconnect loop.
+    /// re-probes across reconnects. A forced re-probe checks the stock feature
+    /// routes once per genuine drop, but not on every attempt of a rapid
+    /// reconnect loop.
     private static let capabilitiesReprobeMinInterval: Duration = .seconds(20)
 
     /// The `ContinuousClock` instant of the last FORCED capabilities re-probe
@@ -1417,12 +1389,9 @@ final class ConnectionStore {
     /// persisted (UserDefaults + Keychain), the socket is connected, and the
     /// event/state tasks are started.
     ///
-    /// - Parameter issuedDeviceId: the server-minted `device_id` when this pairing
-    ///   came from a W3a v2 QR (`kind=device`) — `token` is then ALREADY a device
-    ///   token, so we record the id and SKIP auto-upgrade. `nil` for a v1 (shared)
-    ///   pairing, a manual token entry, or a saved-config bootstrap, where the
-    ///   post-connect auto-upgrade transparently swaps the shared token for a
-    ///   device token if the server advertises the `devices` capability.
+    /// - Parameter issuedDeviceId: legacy v2 QR metadata (`kind=device`) retained
+    ///   only to reconcile cleanup tombstones written by older app versions.
+    ///   Current native-provider pairing does not use this field.
     func configure(urlString: String, token: String, issuedDeviceId: String? = nil) async -> String? {
         let generation = advanceConnectionGeneration()
         return await configure(
@@ -1540,8 +1509,6 @@ final class ConnectionStore {
         // Until this generation is verified, queued state from the prior socket
         // must not qualify as active (especially a late `.open`).
         hasConnected = false
-        deviceIssueLimitReachedServers.remove(trimmedURL)
-        deviceLimitAdvisory = nil
 
         if let activeController = nativeCredentialController,
            activeController !== providerController {
@@ -1687,15 +1654,11 @@ final class ConnectionStore {
             )
         }
 
-        // W3A-A QR v2: a `kind=device` pairing handed us a device token + its
-        // server-minted `device_id`. Record the (non-secret) id so the panel can
-        // mark "This device" and the auto-upgrade path sees this device already
-        // holds a device token (so it does NOT re-issue). A nil id is ambiguous:
-        // saved-token bootstrap/retry paths also call configure without an
-        // issued id while reusing the already-stored device-token credential, so
-        // preserve only when the presented token matches the stored one.
-        // Explicit self-revoke continues to clear via DevicesView, and nil-id
-        // manual/shared-token pairing clears any stale id so auto-upgrade can run.
+        // Preserve legacy v2 QR identity only for safe reconciliation of cleanup
+        // tombstones written by older versions. Saved-token bootstrap/retry paths
+        // call configure without an issued id while reusing the same credential,
+        // so preserve only when the presented token matches the stored one. A
+        // genuinely new manual/shared pairing clears stale legacy identity.
         if let issuedDeviceId, !issuedDeviceId.isEmpty {
             DefaultsKeys.setDeviceId(issuedDeviceId, server: trimmedURL)
         } else if !isSavedTokenReuse {
@@ -1753,15 +1716,6 @@ final class ConnectionStore {
             // list backing the switcher (a no-op clearing the cache on a stock
             // gateway). Gated inside `loadProfiles()` on `profiles == .available`.
             await self.sessionStore.loadProfiles()
-            guard self.isActiveGeneration(generation) else { return }
-            // W3A-A: once the `devices` capability has settled, transparently
-            // auto-upgrade a legacy shared token to a per-device token (a no-op on
-            // a stock gateway, where `devices` is `.unavailable`, and on a device
-            // that already holds a device token for this server). Runs AFTER the
-            // probe so it sees the settled capability.
-            if !usesProviderCredentials {
-                await self.autoUpgradeToDeviceTokenIfNeeded(serverURL: trimmedURL)
-            }
             guard self.isActiveGeneration(generation) else { return }
         }
 
@@ -2872,73 +2826,7 @@ final class ConnectionStore {
         phase = .needsSetup
     }
 
-    /// User-visible, actionable copy for the non-retryable device registry cap.
-    /// Shown as a non-blocking advisory because the shared token remains live; the
-    /// user can keep chatting while they revoke an unused device and retry.
-    static func deviceLimitReachedMessage(maxDevices: Int?) -> String {
-        if let maxDevices {
-            return "Device limit reached (\(maxDevices) devices). Revoke an unused device in Settings → Devices, then retry."
-        }
-        return "Device limit reached. Revoke an unused device in Settings → Devices, then retry."
-    }
-
-    private func handleDeviceLimitReached(serverURL: String, maxDevices: Int?) {
-        deviceIssueLimitReachedServers.insert(serverURL)
-        deviceLimitAdvisory = Self.deviceLimitReachedMessage(maxDevices: maxDevices)
-    }
-
-    // MARK: - Device-token auto-upgrade (W3A-A — silent rotation)
-
-    /// Transparently swap a legacy SHARED token for a per-device token when the
-    /// connected gateway advertises the W3a `devices` capability and this device
-    /// does not yet hold a device token for `serverURL`.
-    ///
-    /// This is the migration bridge: the user's live phone is paired with the
-    /// shared token today; after the server gains device routes, the FIRST
-    /// connect silently issues a device token, persists it to the Keychain
-    /// (overwriting the shared token IN THE KEYCHAIN ITEM for this server) and the
-    /// non-secret `device_id` to UserDefaults, and re-points `currentToken`. The
-    /// existing reconnect loop then reopens the live socket with that device token
-    /// so the gateway can bind foreground/watch state to this phone. No second
-    /// connection path or capability reset is introduced.
-    ///
-    /// Gating (ALL must hold, else this is a no-op):
-    ///   - `devices == .available` (stock server / flaky probe ⇒ keep shared token,
-    ///     never issue);
-    ///   - no `device_id` already recorded for this server (already upgraded, or a
-    ///     v2 QR handed us a device token — don't re-issue);
-    ///   - we are still configured against `serverURL` with a live token;
-    /// Device-token support is established by the capability probe itself. The
-    /// stock loopback and gated auth paths now both consult the plugin token-auth
-    /// seam, so `auth_required == false` is not a reason to keep the phone on the
-    /// anonymous shared credential.
-    ///
-    /// FAILURE IS SILENT (binding) for transient/status failures: if `issueDevice`
-    /// throws (500 persist failure, 401, transport), the app KEEPS the shared
-    /// token (no regression) and the next connect retries (this method is
-    /// re-invoked from `recoverActiveSession` after a reconnect). A device-limit
-    /// 409 is the exception: it is user-visible and suppresses further automatic
-    /// re-issues for this server until the user explicitly retries. The shared
-    /// token never stops working.
-    ///
-    /// SECRETS HYGIENE (binding): the issued token goes straight to the Keychain
-    /// + `currentToken` (in-memory, non-observable) and is NEVER logged,
-    /// telemetered, written to UserDefaults, or held in a `@Snapshotable`
-    /// accessor. Only the non-secret `device_id` is persisted to UserDefaults.
-    func autoUpgradeToDeviceTokenIfNeeded(serverURL: String) async {
-        _ = serverURL
-    }
-
     #if DEBUG
-    /// DEBUG-only, NON-SECRET observability for the W3a integration gate: the
-    /// recorded `device_id` for the current server (the proof the app
-    /// auto-upgraded to a per-device token), or `nil` if it still holds the shared
-    /// token. NEVER the token value — `device_id` is the opaque, non-secret handle
-    /// (safe to list/log per the contract). Surfaced via the hand-maintained
-    /// StateAccessor, mirroring the `fsCapability` pattern. Absent in Release.
-    var recordedDeviceIdForCurrentServer: String? {
-        DefaultsKeys.deviceId(server: serverURLString)
-    }
     /// DEBUG-only test seam: seed the in-memory connection state as if a prior
     /// `configure()` succeeded (stable URL + token stored, `hasConnected` true)
     /// then arm and fire the reconnect loop. Exercises the restart-survival path
@@ -2989,14 +2877,6 @@ final class ConnectionStore {
         handle(state: state, generation: generation)
     }
 
-    func _handleDeviceLimitReachedForTesting(serverURL: String, maxDevices: Int?) {
-        handleDeviceLimitReached(serverURL: serverURL, maxDevices: maxDevices)
-    }
-
-    func _isDeviceIssueLimitReachedSuppressedForTesting(serverURL: String) -> Bool {
-        deviceIssueLimitReachedServers.contains(serverURL)
-    }
-
     #endif
 
     /// The best client-side device-name hint available without a new entitlement.
@@ -3021,15 +2901,13 @@ final class ConnectionStore {
         updatePhoneForeground(sessionStore.activeStoredId)
         // Re-probe capabilities after a reconnect — FORCED (R1 #57): this path
         // only runs after the socket genuinely dropped, and a restart on the
-        // same URL may have swapped a stock↔patched gateway; the same-URL
-        // cache short-circuit would pin stale feature gates for the whole app
-        // version (features hidden, or shown against 404ing routes, device
-        // auto-upgrade never firing).
+        // same URL may have restarted with different stock capabilities; the
+        // same-URL cache short-circuit would otherwise pin stale feature gates
+        // for the whole app version (features hidden or shown against 404s).
         //
         // FIRE-AND-FORGET (build-30 freeze fix): spawned, NOT awaited inline.
-        // probe() performs ~8 @Observable mutations on `capabilities` through
-        // `resolvedPathStyle`, which `rest`/`control` read — so awaiting it
-        // here serialized that invalidation thrash onto the reconnect-critical
+        // probe() performs several @Observable mutations on `capabilities`, so
+        // awaiting it here serialized that invalidation work onto the reconnect-critical
         // path and saturated the main actor while the always-mounted drawer was
         // interactive (the W3 regression that froze the UI on reconnect →
         // drawer-open, and starved the transcript seed → empty render).
@@ -3082,11 +2960,6 @@ final class ConnectionStore {
                 guard self.isActiveGeneration(generation) else { return }
                 // Capability-dependent settles run BEHIND the probe but OFF the
                 // reconnect-critical path (same ordering as configure()).
-                // W3A-A: retry the device-token auto-upgrade — covers a server
-                // that gained device routes while offline, or a prior failed
-                // issue. No-op once a device token is held.
-                await self.autoUpgradeToDeviceTokenIfNeeded(serverURL: self.serverURLString)
-                guard self.isActiveGeneration(generation) else { return }
                 // F4b: re-load the switcher profile list now the capability is
                 // re-affirmed (clears the cache on a stock gateway).
                 await self.sessionStore.loadProfiles()

@@ -199,10 +199,8 @@ struct QRScannerView: View {
     private func handleScan(_ payload: String) {
         guard !isConnecting else { return }
 
-        // Shared v1/v2 parse (HermesURLRouter): a v1 payload yields a shared
-        // pairing (auto-upgrade swaps to a device token after connect on a W3a
-        // server); a v2 `kind=device` payload carries the device token + its
-        // `device_id`, which we record so no auto-upgrade fires.
+        // Shared compatibility parser: v1 supplies URL + token; legacy v2 may
+        // also carry `kind=device` + `device_id` cleanup identity.
         guard let parsed = HermesURLRouter.parsePairPayload(payload) else {
             errorText = "That QR code isn't a Hermes pairing code."
             // Re-arm the scanner so the user can try a different code.
