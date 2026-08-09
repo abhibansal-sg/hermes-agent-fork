@@ -24,7 +24,7 @@ struct OutboxSubmitResult: Equatable, Sendable {
         // the submit. Respect an explicit receipt verdict when present; without
         // one, the completed RPC plus an accepted legacy status is authoritative.
         accepted = json["accepted"]?.boolValue
-            ?? ["streaming", "queued", "steered"].contains(responseStatus)
+            ?? ["streaming", "queued", "steered", "redirected"].contains(responseStatus)
         clientMessageID = json["client_message_id"]?.stringValue
         deduplicated = json["deduplicated"]?.boolValue ?? false
     }
@@ -68,7 +68,7 @@ final class OutboxProcessor {
     }
 
     static let leaseDuration: TimeInterval = 120
-    static let acceptedDispositions: Set<String> = ["streaming", "queued", "steered"]
+    static let acceptedDispositions: Set<String> = ["streaming", "queued", "steered", "redirected"]
 
     private let repository: WorkRepository
     private let owner = "ios-outbox-\(UUID().uuidString.lowercased())"

@@ -1675,6 +1675,7 @@ def _compute_host_turn_frame(
     session: dict,
     text: Any,
     image_paths: list[str] | None = None,
+    display_metadata: dict | None = None,
     queued_prompt_generation: int | None = None,
 ) -> dict:
     with session["history_lock"]:
@@ -1701,6 +1702,7 @@ def _compute_host_turn_frame(
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
         "attached_images": attached_images,
+        "display_metadata": display_metadata,
         "queued_prompt_generation": queued_prompt_generation,
     }
 
@@ -1778,6 +1780,7 @@ def _submit_prompt_to_compute_host(
     session: dict,
     text: Any,
     image_paths: list[str] | None = None,
+    display_metadata: dict | None = None,
     queued_prompt_generation: int | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
@@ -1787,6 +1790,7 @@ def _submit_prompt_to_compute_host(
         session,
         text,
         image_paths=image_paths,
+        display_metadata=display_metadata,
         queued_prompt_generation=queued_prompt_generation,
     )
 
@@ -1916,6 +1920,10 @@ def method(name: str):
 # instead of retrying a mutation blindly.
 ACTION_OWNER_CONFLICT = 4091
 ACTION_REVISION_STALE = 4092
+PROMPT_ID_CONFLICT = 4093
+_PROMPT_ACCEPTED_DISPOSITIONS = frozenset(
+    {"queued", "redirected", "steered", "streaming"}
+)
 
 # Central admission list for RPCs that mutate live session state, ordering, or
 # an in-flight authorization prompt. Stored-only operations are admitted here
@@ -2143,6 +2151,165 @@ def _complete_session_action(
     return response
 
 
+def _begin_prompt_admission(rid, params: dict):
+    """Reserve an ID-enabled prompt before its handler can mutate live state."""
+    if "client_message_id" not in params:
+        return None, None
+    from tui_gateway.prompt_admission import (
+        PromptAdmission,
+        ensure_prompt_receipt_provider,
+        request_fingerprint,
+    )
+
+    provider = ensure_prompt_receipt_provider()
+    if provider is None:
+        # Provider absence is stock compatibility: old clients and installations
+        # without the thin durability edge retain the legacy response exactly.
+        return None, None
+    raw_id = params.get("client_message_id")
+    if not isinstance(raw_id, str):
+        return None, _err(rid, 4004, "client_message_id must be a canonical UUID")
+    try:
+        canonical_id = str(uuid.UUID(raw_id))
+    except (ValueError, AttributeError):
+        canonical_id = ""
+    if canonical_id != raw_id:
+        return None, _err(rid, 4004, "client_message_id must be a canonical UUID")
+
+    with _sessions_lock:
+        found = _find_action_session_locked(params)
+        if found is None:
+            # Preserve the prompt handler's established session-not-found error.
+            return None, None
+        _sid, session = found
+        session_key = _session_lookup_key(session, fallback=_sid)
+        profile_home = (
+            Path(str(session["profile_home"]))
+            if session.get("profile_home")
+            else get_hermes_home()
+        )
+    # Compression rotates the physical SessionDB row while preserving one
+    # logical conversation. Fingerprint the lineage root so a retry after an
+    # auto-compression (or after reconnecting to its continuation row) still
+    # identifies the same destination instead of falsely conflicting.
+    try:
+        with _session_db(session) as db:
+            if db is not None:
+                session_key = str(db.get_conversation_root(session_key) or session_key)
+    except Exception:
+        logger.debug("prompt receipt lineage lookup failed", exc_info=True)
+
+    raw_text = params.get("text", "")
+    if isinstance(raw_text, str):
+        try:
+            from hermes_cli.input_sanitize import sanitize_user_prompt_text
+
+            raw_text = sanitize_user_prompt_text(raw_text)
+        except Exception:
+            pass
+    truncate = params.get("truncate_before_user_ordinal")
+    if truncate is not None:
+        try:
+            truncate = int(truncate)
+        except (TypeError, ValueError):
+            return None, _err(
+                rid, 4004, "truncate_before_user_ordinal must be an integer"
+            )
+    fingerprint = request_fingerprint(
+        session_key=session_key,
+        text=raw_text,
+        truncate_before_user_ordinal=truncate,
+        confirm_truncate=is_truthy_value(params.get("confirm_truncate")),
+        confirm_empty_truncate=is_truthy_value(
+            params.get("confirm_empty_truncate")
+        ),
+        queued=params.get("queued", False),
+        interrupted=params.get("interrupted", False),
+    )
+    try:
+        outcome = provider.reserve(
+            profile_home=profile_home,
+            client_message_id=canonical_id,
+            request_fingerprint=fingerprint,
+        )
+    except Exception as exc:
+        logger.warning("prompt receipt reservation failed: %s", exc)
+        return None, _err(rid, 5037, "prompt receipt store unavailable")
+    state = outcome.get("state") if isinstance(outcome, dict) else None
+    if state == "claimed":
+        # Internal-only correlation passed through the stock prompt handler.
+        # It is never model input; _run_prompt_submit stores it as display
+        # metadata on Hermes' canonical user row.
+        params["_admitted_client_message_id"] = canonical_id
+        return PromptAdmission(
+            provider=provider,
+            reservation=outcome.get("reservation"),
+            client_message_id=canonical_id,
+        ), None
+    if state == "replay" and isinstance(outcome.get("disposition"), dict):
+        disposition = dict(outcome["disposition"])
+        disposition["accepted"] = True
+        disposition["client_message_id"] = canonical_id
+        disposition["deduplicated"] = True
+        return None, _ok(rid, disposition)
+    if state == "conflict":
+        return None, _err(
+            rid,
+            PROMPT_ID_CONFLICT,
+            "client_message_id was already used for a different prompt",
+        )
+    if state in {"in_progress", "indeterminate"}:
+        return None, _ok(
+            rid,
+            {
+                "accepted": False,
+                "client_message_id": canonical_id,
+                "deduplicated": True,
+                "status": state,
+            },
+        )
+    logger.warning("prompt receipt provider returned invalid outcome: %r", outcome)
+    return None, _err(rid, 5037, "prompt receipt store unavailable")
+
+
+def _release_prompt_admission(admission) -> None:
+    if admission is None:
+        return
+    try:
+        admission.provider.release(admission.reservation)
+    except Exception:
+        logger.warning("prompt receipt release failed", exc_info=True)
+
+
+def _complete_prompt_admission(rid, admission, response: dict | None):
+    """Bind a successful handler disposition to its durable reservation."""
+    if admission is None or not isinstance(response, dict):
+        return response
+    result = response.get("result")
+    if not isinstance(result, dict):
+        _release_prompt_admission(admission)
+        return response
+    if result.get("status") not in _PROMPT_ACCEPTED_DISPOSITIONS:
+        # prompt.submit also owns a typed voice-stop shortcut. It is a valid
+        # RPC result but did not admit a model turn, so it must not consume a
+        # durable prompt identity or masquerade as an accepted prompt receipt.
+        _release_prompt_admission(admission)
+        return response
+    disposition = dict(result)
+    disposition["accepted"] = True
+    disposition["client_message_id"] = admission.client_message_id
+    disposition["deduplicated"] = False
+    try:
+        admission.provider.complete(admission.reservation, disposition)
+    except Exception as exc:
+        # The reservation remains owned by this process. A retry receives
+        # in_progress rather than executing twice; a restarted process marks it
+        # indeterminate. Never claim a durable receipt was written when it was not.
+        logger.warning("prompt receipt completion failed: %s", exc)
+        return _err(rid, 5037, "prompt receipt store unavailable")
+    return _ok(rid, disposition)
+
+
 @method("session.takeover")
 def _session_takeover(rid, params: dict) -> dict:
     """Atomically transfer live action authority and the driver transport."""
@@ -2215,7 +2382,18 @@ def handle_request(req: dict) -> dict | None:
     authority_error = _authorize_session_action(rid, method, params)
     if authority_error is not None:
         return authority_error
-    return _complete_session_action(method, params, fn(rid, params))
+    admission = None
+    if method == "prompt.submit":
+        admission, immediate = _begin_prompt_admission(rid, params)
+        if immediate is not None:
+            return immediate
+    try:
+        response = fn(rid, params)
+    except Exception:
+        _release_prompt_admission(admission)
+        raise
+    response = _complete_prompt_admission(rid, admission, response)
+    return _complete_session_action(method, params, response)
 
 
 def _current_session_steer_authority(
@@ -5379,10 +5557,18 @@ GATEWAY_CAPABILITIES = ("session_action_authority_v1", "session_watch_v1")
 
 def gateway_ready_payload(skin: dict) -> dict:
     """Build the transport-neutral gateway.ready capability envelope."""
+    capabilities = list(GATEWAY_CAPABILITIES)
+    try:
+        from tui_gateway.prompt_admission import ensure_prompt_receipt_provider
+
+        if ensure_prompt_receipt_provider() is not None:
+            capabilities.append("prompt_receipt_admission_v1")
+    except Exception:
+        logger.debug("prompt receipt capability discovery failed", exc_info=True)
     return {
         "skin": skin,
         "change_events": True,
-        "capabilities": list(GATEWAY_CAPABILITIES),
+        "capabilities": capabilities,
     }
 
 
@@ -7450,6 +7636,10 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             msg["display_kind"] = display_kind
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
+            if role == "user" and isinstance(m["display_metadata"], dict):
+                client_message_id = m["display_metadata"].get("client_message_id")
+                if isinstance(client_message_id, str) and client_message_id:
+                    msg["client_message_id"] = client_message_id
         messages.append(msg)
 
     return messages
@@ -7752,6 +7942,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    display_metadata: dict | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7766,6 +7957,8 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if display_metadata:
+        queued["display_metadata"] = dict(display_metadata)
     existing = session.get("queued_prompt")
     if (
         existing
@@ -7773,6 +7966,8 @@ def _enqueue_prompt(
         and isinstance(text, str)
         and not existing.get("image_paths")
         and not image_paths
+        and not existing.get("display_metadata")
+        and not display_metadata
         and not session.get("queued_prompts")
     ):
         prev = existing["text"]
@@ -7820,7 +8015,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    display_metadata: dict | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7893,7 +8094,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            display_metadata=display_metadata,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -7937,11 +8144,17 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     image_paths=queued["image_paths"],
+                    display_metadata=queued.get("display_metadata"),
                     queued_prompt_generation=queue_generation,
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    display_metadata=queued.get("display_metadata"),
+                    queued_prompt_generation=queue_generation,
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -7958,6 +8171,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     image_paths=queued["image_paths"],
+                    display_metadata=queued.get("display_metadata"),
                     queued_prompt_generation=queue_generation,
                 )
             else:
@@ -7966,6 +8180,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     sid,
                     session,
                     queued["text"],
+                    display_metadata=queued.get("display_metadata"),
                     queued_prompt_generation=queue_generation,
                 )
     except Exception as exc:
@@ -10119,6 +10334,7 @@ def _run_prompt_submit(
                 run_kwargs["task_id"] = session["session_key"]
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
+            if display_metadata and "persist_user_display_metadata" in _run_params:
                 run_kwargs["persist_user_display_metadata"] = display_metadata
             result = agent.run_conversation(run_message, **run_kwargs)
             if display_kind and isinstance(text, str):

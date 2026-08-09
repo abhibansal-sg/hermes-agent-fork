@@ -1,6 +1,6 @@
 # Option C upstream-first forward-port ledger
 
-Status: P-1 and H1 complete; H2 implemented and awaiting review gate
+Status: P-1 through H3 complete; H3 verified and ready for milestone commit
 
 Upstream baseline: `31cedb4830191da7f8c3ea4b962d40997cd85b21`
 
@@ -222,3 +222,50 @@ Verification evidence:
   through `scripts/ios-build.sh` with the asset catalog excluded.
 - Runtime simulator execution and asset compilation remain blocked by the same
   host CoreSimulatorService `ENOMEM` failure recorded for H1.
+
+## H3 implementation result
+
+- Stock `tui_gateway` now owns one central `prompt.submit` admission contract.
+  Requests without `client_message_id`, and installations without a receipt
+  provider, preserve the legacy handler and response shape exactly.
+- With a provider active, Hermes validates a canonical lowercase UUID, sanitizes
+  and fingerprints the behavior-changing request fields against the stable
+  compression-lineage root, and reserves the identity before truncation, queue,
+  interrupt, or prompt mutation can run.
+- Accepted dispositions are limited to the stock prompt outcomes `streaming`,
+  `queued`, `steered`, and `redirected`. Replays return the original disposition
+  with `deduplicated=true`; changed payloads return `4093`; live reservations
+  return `in_progress`; a reservation abandoned across a process boundary becomes
+  `indeterminate`. Handler rejection releases the reservation for a safe retry.
+- Hermes carries the admitted ID as display-only user-message metadata through
+  inline turns, busy queues, and isolated compute-host turns. The canonical
+  transcript projects it as `client_message_id` for iOS outbox reconciliation;
+  prompt text and the model-facing cached prefix remain unchanged.
+- The removable `hermes-mobile` backend plugin implements only the
+  reserve/complete/release store in a profile-scoped SQLite database. It uses
+  parameterized SQL, `BEGIN IMMEDIATE`, 30-day retention, private permissions,
+  the stock Hermes journal-mode safety policy (WAL when safe, guarded DELETE
+  fallback otherwise), and `synchronous=FULL`; it cannot execute, queue,
+  rewrite, attach, or replay a prompt.
+- `gateway.ready` advertises `prompt_receipt_admission_v1` only when stock plugin
+  discovery successfully registers a provider. The existing iOS app keeps its
+  durable outbox and now recognizes every stock accepted prompt disposition,
+  including `redirected`.
+- A durable receipt records Hermes' accepted admission disposition, not proof
+  that the model turn completed. A crash after reservation but before admission
+  completion remains explicitly `indeterminate`; no duplicate durable execution
+  queue or second transcript/workflow authority is introduced.
+
+Verification evidence:
+
+- 941 tests across `tests/test_tui_gateway_server.py` and `tests/tui_gateway/`
+  pass.
+- 55 stock plugin and dashboard-auth contract/ticket tests pass.
+- The 19 focused H3 tests cover replay, conflicting fingerprints, concurrent
+  reservation, rejection release, completion failure, restart ambiguity,
+  profile isolation, retention, permissions, provider absence/discovery,
+  compression lineage, queue separation, and canonical metadata projection.
+- The focused `OutboxProcessorTests` Swift 6 test target builds for testing
+  through `scripts/ios-build.sh` with the asset catalog excluded.
+- Runtime simulator execution remains blocked by the previously documented host
+  CoreSimulatorService `ENOMEM` failure; no raw `xcodebuild` was used.

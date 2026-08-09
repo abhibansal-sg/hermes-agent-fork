@@ -306,7 +306,7 @@ final class OutboxProcessorTests: XCTestCase {
     }
 
     func testAllAcceptedDispositionsCompleteWithoutWaitingForAssistant() async throws {
-        for disposition in ["streaming", "queued", "steered"] {
+        for disposition in ["streaming", "queued", "steered", "redirected"] {
             let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
             let job = try await harness.repository.enqueue(WorkJobInput(
                 kind: .prompt, scope: harness.scope, text: disposition, storedSessionID: "stored-A"

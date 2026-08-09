@@ -71,6 +71,12 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    admitted_client_message_id = params.get("_admitted_client_message_id")
+    display_metadata = (
+        {"client_message_id": admitted_client_message_id}
+        if isinstance(admitted_client_message_id, str) and admitted_client_message_id
+        else None
+    )
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -139,9 +145,11 @@ def _(rid, params: dict) -> dict:
                 busy_transport = t or session.get("transport")
             else:
                 break
+        busy_kwargs = {"queued": bool(params.get("queued"))}
+        if display_metadata:
+            busy_kwargs["display_metadata"] = display_metadata
         busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport,
-            queued=bool(params.get("queued")),
+            rid, sid, session, text, busy_transport, **busy_kwargs
         )
         if busy_response is not None:
             return busy_response
@@ -278,7 +286,12 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_kwargs = (
+            {"display_metadata": display_metadata} if display_metadata else {}
+        )
+        isolated_response = _submit_prompt_to_compute_host(
+            rid, sid, session, text, **isolated_kwargs
+        )
         if not isolated_response.get("error"):
             return isolated_response
         logger.warning(
@@ -357,7 +370,8 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        run_kwargs = {"display_metadata": display_metadata} if display_metadata else {}
+        _run_prompt_submit(rid, sid, session, text, **run_kwargs)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
