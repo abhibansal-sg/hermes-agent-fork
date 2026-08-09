@@ -365,7 +365,19 @@ export const en: Translations = {
       disable: 'Disable',
       failed: 'failed',
       empty: 'No desktop plugins installed yet.',
-      kinds: { bundled: 'bundled', disk: 'on disk', runtime: 'runtime' }
+      kinds: { bundled: 'bundled', disk: 'on disk', runtime: 'runtime' },
+      agent: {
+        title: 'Agent plugins',
+        blurb:
+          'Run in the Hermes backend — tools, skills, MCP servers, hooks, and slash commands. Portable ones are Agent Plugins packages (skills + MCP bundles that work in other agents too). Toggles apply to new sessions.',
+        empty: 'No agent plugins installed yet.',
+        loadFailed: 'Could not load agent plugins',
+        portable: 'portable',
+        search: 'Search plugins…',
+        noMatches: 'No plugins match your search.',
+        toggleFailed: (name: string) => `Could not toggle ${name}`,
+        sources: { bundled: 'bundled', user: 'user', git: 'git', project: 'project', entrypoint: 'pip' }
+      }
     },
     notifications: {
       title: 'Notifications',
@@ -1857,6 +1869,7 @@ export const en: Translations = {
     noWorkspace: 'No workspace',
     projectEmpty: 'No sessions yet',
     noSessions: 'No sessions yet',
+    noFilterMatches: 'No sessions match these filters',
     projects: {
       sectionLabel: 'Projects',
       home: 'Home',
@@ -1954,6 +1967,7 @@ export const en: Translations = {
       waitingForAnswer: 'Waiting for your answer',
       finishedUnread: 'Finished — unread',
       backgroundRunning: 'Background task running',
+      draftSession: 'Draft — nothing sent yet',
       handoffOrigin: platform => `Handed off from ${platform}`,
       ownedByProfile: profile => `Profile: ${profile}`,
       renamed: 'Renamed',
@@ -1973,6 +1987,10 @@ export const en: Translations = {
       thisWeek: 'Earlier this week',
       lastWeek: 'Last week',
       thisMonth: 'Earlier this month'
+    },
+    statusDivider: {
+      working: 'Working',
+      done: 'Done'
     }
   },
 
