@@ -31,11 +31,7 @@ import SwiftUI
 /// `session_id` for all mutations.
 struct SessionModelPickerContent: View {
     let connection: ConnectionStore
-    /// The live runtime session — nil on a DRAFT chat (no session yet). In
-    /// draft mode selections PEND on `ConnectionStore.draftSelection` and are
-    /// applied when the draft materializes (before the first prompt), so the
-    /// model can be picked at any point — not just on existing sessions.
-    let sessionId: String?
+    let sessions: SessionStore
     /// Needed to re-install the theme on the nested Edit Models sheet —
     /// SwiftUI sheets do not inherit custom environment values (see
     /// ``HermesThemedModifier``).
@@ -43,7 +39,7 @@ struct SessionModelPickerContent: View {
     @Binding var isPresented: Bool
 
     /// Draft mode: no gateway session to hot-swap; picks pend locally.
-    private var isDraftMode: Bool { sessionId == nil || sessionId?.isEmpty == true }
+    private var isDraftMode: Bool { sessions.isDraft }
 
     @Environment(\.hermesTheme) private var theme
 
@@ -129,11 +125,18 @@ struct SessionModelPickerContent: View {
                 localProvider = draft.provider
                 localReasoningEffort = draft.reasoningEffort ?? ""
                 localFast = draft.fast ?? false
-            } else {
+            } else if sessions.activeRuntimeId != nil {
                 localModel = connection.sessionModelRaw ?? connection.activeModelName ?? ""
                 localProvider = connection.sessionProvider ?? ""
                 localReasoningEffort = connection.sessionReasoningEffort ?? ""
                 localFast = connection.sessionFast ?? false
+            } else {
+                // Stock session rows carry their durable model identity even
+                // before a runtime exists.
+                localModel = connection.sessionModelRaw ?? ""
+                localProvider = connection.sessionProvider ?? ""
+                localReasoningEffort = ""
+                localFast = false
             }
             await loadOptions()
         }
@@ -413,7 +416,7 @@ struct SessionModelPickerContent: View {
     private func providerHeader(_ provider: ModelProvider) -> some View {
         HStack {
             Text(provider.name)
-            if provider.isCurrent {
+            if provider.slug == localProvider {
                 Text("CURRENT")
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(theme.midground)
@@ -432,10 +435,10 @@ struct SessionModelPickerContent: View {
     private func loadOptions() async {
         // Session-scoped WS load first: its `model`/`provider` reflect the
         // LIVE session agent (post hot-swap), which is what "current" means
-        // here. Draft mode requests the same stock method without a session id,
-        // so "current" is the global default a new chat would start on.
+        // here. Without a runtime the stored session row remains authoritative
+        // while the global call supplies only the available inventory.
         var options: ModelOptions?
-        if let sessionId, !sessionId.isEmpty {
+        if let sessionId = sessions.activeRuntimeId, !sessionId.isEmpty {
             options = try? await connection.sessionModelOptions(sessionId: sessionId)
         }
         if options == nil {
@@ -452,7 +455,8 @@ struct SessionModelPickerContent: View {
         // flight locally, or a draft pick is pending (the pend wins until the
         // session exists).
         let draftPickPending = isDraftMode && connection.draftSelection?.model.isEmpty == false
-        if pendingKey == nil && !draftPickPending {
+        let optionsCurrentIsRelevant = isDraftMode || sessions.activeRuntimeId != nil
+        if pendingKey == nil && !draftPickPending && optionsCurrentIsRelevant {
             if !options.currentModel.isEmpty { localModel = options.currentModel }
             if !options.currentProvider.isEmpty {
                 localProvider = options.currentProvider
@@ -491,7 +495,10 @@ struct SessionModelPickerContent: View {
             localFast = preset.fast ?? false
             return
         }
-        guard let sessionId else { return }
+        guard let sessionId = await sessions.ensureActiveRuntime() else {
+            actionError = sessions.lastError ?? "Couldn’t activate this chat"
+            return
+        }
         pendingKey = ModelVisibility.key(provider: provider, model: model)
         defer { pendingKey = nil }
         let prev = localModel
@@ -558,7 +565,11 @@ struct SessionModelPickerContent: View {
             persistEffort(effort)
             return
         }
-        guard let sessionId else { return }
+        guard let sessionId = await sessions.ensureActiveRuntime() else {
+            localReasoningEffort = connection.sessionReasoningEffort ?? ""
+            actionError = sessions.lastError ?? "Couldn’t activate this chat"
+            return
+        }
         let prev = connection.sessionReasoningEffort ?? ""
         do {
             try await connection.sessionSetReasoning(effort.isEmpty ? "none" : effort, sessionId: sessionId)
@@ -588,7 +599,11 @@ struct SessionModelPickerContent: View {
             persistFast(enabled)
             return
         }
-        guard let sessionId else { return }
+        guard let sessionId = await sessions.ensureActiveRuntime() else {
+            localFast = connection.sessionFast ?? false
+            actionError = sessions.lastError ?? "Couldn’t activate this chat"
+            return
+        }
         let prev = connection.sessionFast ?? false
         do {
             try await connection.sessionSetFast(enabled, sessionId: sessionId)

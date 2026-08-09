@@ -21,16 +21,9 @@ enum DefaultsKeys {
     /// reconnect work while preserving the pairing and every local cache.
     static let connectionOffline = "hermes.connectionOffline"
 
-    /// `String` — optional address of the transparent gateway proxy. Empty or
-    /// absent uses the paired gateway address directly.
-    static let relayURLOverride = "hermes.relayURLOverride"
-
-    static func relayURLOverrideValue(_ defaults: UserDefaults = .standard) -> String? {
-        let raw = defaults.string(forKey: relayURLOverride)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let raw, !raw.isEmpty else { return nil }
-        return raw
-    }
+    /// `String` — how the saved gateway authenticates (`token` or `session`).
+    /// Missing means `token`, preserving every existing pairing.
+    static let gatewayAuthMode = "hermes.gatewayAuthMode"
 
     /// `Data` — protected, non-content cleanup retry metadata. This contains
     /// only the gateway URL and device id; never a credential or user content.
@@ -375,8 +368,7 @@ enum DefaultsKeys {
     /// Read + decode the persisted ``ConnectionMode``. Returns `.remoteURL` when
     /// unset (existing installs keep the existing behaviour unchanged).
     static func connectionModeValue(_ defaults: UserDefaults = .standard) -> ConnectionMode {
-        let raw = defaults.string(forKey: connectionMode) ?? ""
-        return ConnectionMode(rawValue: raw) ?? .remoteURL
+        ConnectionMode.saved(rawValue: defaults.string(forKey: connectionMode))
     }
 
 }

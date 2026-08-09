@@ -4,8 +4,7 @@ import XCTest
 /// Inc-4 lane 4b — deterministic proof of gateway-restart survival + auth-revoke
 /// threshold (Task #5 follow-up).
 ///
-/// SPEC (SPEC-INC4-RESTART-SURVIVAL.md §Lane 4b): a gateway restart at a
-/// STABLE address+token must drive the reconnect loop to `.connected` with
+/// A gateway restart at a stable address+token must drive the reconnect loop to `.connected` with
 /// `reauthRequired == false` and `hasConnected` still true — no re-pair prompt.
 ///
 /// All tests use the injectable `connectRPC` seam so no live socket is required
@@ -171,7 +170,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         issuedDeviceId: String? = nil
     ) async -> String? {
         connection.statusRPC = { _, _ in }
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         return await connection.configure(
             urlString: serverURL,
             token: token,
@@ -276,38 +275,6 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         )
     }
 
-    func testOutOfOrderForeignOwnershipMarkerDegradesWithoutCrashing() async {
-        let (_, sessions, chat) = makeStore()
-        sessions.activeStoredId = "stored-foreign-guard"
-        sessions.activeRuntimeId = "rt-local"
-
-        chat.simulateOutOfOrderForeignOwnershipMarkerForTesting()
-
-        XCTAssertTrue(chat.isStreaming, "the out-of-order foreign marker should still render as a conservative stream")
-        XCTAssertFalse(chat.localTurnInFlight, "coercing a foreign marker must not claim local ownership")
-
-        chat.handleConnectionDrop()
-
-        XCTAssertFalse(chat.isStreaming, "the coerced foreign stream must be tear-downable after a transport drop")
-        XCTAssertFalse(chat.localTurnInFlight, "the foreign guard path must not leak a local ownership token")
-    }
-
-    func testForeignTeardownWithLocalTokenDegradesThenConnectionDropFinalizesLocalTurn() async {
-        let (_, sessions, chat) = makeStore()
-        sessions.activeStoredId = "stored-foreign-teardown"
-        sessions.activeRuntimeId = "rt-local"
-
-        chat.simulateForeignTeardownWithLocalTurnTokenForTesting()
-
-        XCTAssertTrue(chat.isStreaming, "the local turn must survive the refused foreign teardown")
-        XCTAssertTrue(chat.localTurnInFlight, "foreign teardown must preserve local ownership instead of crashing")
-
-        chat.handleConnectionDrop()
-
-        XCTAssertFalse(chat.isStreaming, "a later real transport drop should finalize the still-local turn")
-        XCTAssertFalse(chat.localTurnInFlight, "the transport-drop finalizer releases local ownership")
-        XCTAssertEqual(chat.messages.last?.warning, "Connection lost")
-    }
     #endif
 
     func testGatewayDiesMidTurnFinalizesReconnectingThenReattachesAndBackfills() async {
@@ -319,7 +286,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         var resumeCount = 0
         var backfillCount = 0
 
-        connection.connectRPC = { _, _, _ in connectCount += 1 }
+        connection.connectRPC = { _, _ in connectCount += 1 }
         sessions.resumeRPC = { stored, _ in
             resumeCount += 1
             XCTAssertEqual(stored, storedId)
@@ -373,7 +340,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let (connection, _, _) = makeStore()
 
         // Inject an always-succeeding fake transport so no socket is opened.
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             // Simulates the gateway answering on the same stable address+token
             // (the restart-survival case: same URL, valid token, new process).
         }
@@ -408,7 +375,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
     func testReconnectSuccessEntersDraftWhenNoActiveSession() async {
         let (connection, sessions, _) = makeStore()
 
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         XCTAssertNil(sessions.activeStoredId)
         XCTAssertFalse(sessions.isDraft)
 
@@ -428,7 +395,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
     func testReconnectSuccessDoesNotClobberActiveSession() async {
         let (connection, sessions, _) = makeStore()
 
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         sessions.activeStoredId = "already-active-session"
         sessions.resumeRPC = { stored, _ in
             self.stagedResumeResult(sessionId: "runtime-after-reconnect", resumed: stored)
@@ -458,7 +425,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         var resumeCount = 0
 
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in connectCount += 1 }
+        connection.connectRPC = { _, _ in connectCount += 1 }
         sessions.activeStoredId = storedID
         sessions.resumeRPC = { stored, _ in
             resumeCount += 1
@@ -494,7 +461,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         connection.reconnectBackoffOverride = 0
 
         var callCount = 0
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             callCount += 1
             if callCount == 1 {
                 // Simulate the gateway being momentarily unreachable.
@@ -532,7 +499,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let (connection, _, _) = makeStore()
 
         // connectRPC always fails with a non-auth transport error.
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             throw URLError(.timedOut)
         }
 
@@ -577,7 +544,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // Zero-delay backoff so multiple attempts complete inside the settle window.
         connection.reconnectBackoffOverride = 0
         // Always-failing WS; probe returns false — gateway unreachable, not revoked.
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection.probeIsAuthRevokedRPC = { false }
 
         connection._seedAndStartReconnect(
@@ -612,7 +579,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // Zero-delay backoff: threshold (3) consecutive failures fire quickly.
         connection.reconnectBackoffOverride = 0
         // Always failing — simulates a permanently revoked token at the WS gate.
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         // REST probe confirms revocation.
         connection.probeIsAuthRevokedRPC = { true }
 
@@ -652,7 +619,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         connection.probeIsAuthRevokedRPC = { false }
 
         var callCount = 0
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             callCount += 1
             if callCount <= 2 {
                 // Two sub-threshold failures (threshold = 3).
@@ -695,7 +662,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // on the host value — any valid URL proves the property.
         let stableURL = "http://localhost:9123"
 
-        connection.connectRPC = { url, _, _ in
+        connection.connectRPC = { url, _ in
             // Assert the URL the loop resolved matches what was seeded.
             XCTAssertEqual(url.absoluteString, stableURL,
                            "reconnect loop must use the saved stable URL verbatim")
@@ -722,7 +689,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // A long grace window: attempt 0 must heal well inside it, proving the
         // heal — not the timer — is what ends grace.
         connection.graceWindowOverride = .seconds(30)
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
 
         // Deliberately no `activeStoredId`: `recoverActiveSession()` then skips
         // `backfill()` entirely, so the transcript below is left exactly as the
@@ -787,7 +754,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // resolves, so the timer fires while the loop is still suspended
         // inside `recoverActiveSession()`.
         connection.graceWindowOverride = .milliseconds(50)
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
 
         // `activeStoredId` routes `recoverActiveSession()` through
         // `resumeActiveAfterReconnect()` — the genuine network await this
@@ -842,7 +809,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // keeps retrying (and failing) fast underneath it.
         connection.graceWindowOverride = .milliseconds(50)
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection.probeIsAuthRevokedRPC = { false }
 
         connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "test-stable-token")
@@ -884,7 +851,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         // grace entirely rather than waiting for the timer.
         connection.graceWindowOverride = .seconds(30)
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection.probeIsAuthRevokedRPC = { true }
 
         connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "revoked-token")
@@ -919,7 +886,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertTrue(connection.isTransportReady)
         XCTAssertEqual(connection.transportReadiness, .ready(epoch: priorEpoch))
 
-        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection.connectRPC = { _, _ in await gate.suspend() }
         connection._handleGatewayStateForTesting(.failed("background socket dropped"))
         await gate.waitUntilEntered()
 
@@ -954,7 +921,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         connection._seedConnectedForTesting(
             serverURL: "http://127.0.0.1:9123", token: "test-token"
         )
-        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection.connectRPC = { _, _ in await gate.suspend() }
         connection._handleGatewayStateForTesting(.failed("background socket dropped"))
         await gate.waitUntilEntered()
 
@@ -998,7 +965,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertEqual(resumed, "runtime-A")
         XCTAssertEqual(sessions.activeRuntimeId, "runtime-A")
 
-        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection.connectRPC = { _, _ in await gate.suspend() }
         connection._handleGatewayStateForTesting(.failed("background socket dropped"))
         await gate.waitUntilEntered()
 
@@ -1044,7 +1011,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertNil(sessions.activeRuntimeId)
     }
 
-    func testOpenDuringReconnectAndRecoveryIssueOneResumeForLatestSelection() async {
+    func testPassiveOpenDuringReconnectDoesNotResumeLatestSelection() async {
         let (connection, sessions, _) = makeStore()
         let reconnectGate = SuspensionGate()
         let calls = ResumeCallLog()
@@ -1056,7 +1023,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
             await calls.append(stored)
             return self.stagedResumeResult(sessionId: "runtime-\(stored)", resumed: stored)
         }
-        connection.connectRPC = { _, _, _ in await reconnectGate.suspend() }
+        connection.connectRPC = { _, _ in await reconnectGate.suspend() }
 
         connection._handleGatewayStateForTesting(.failed("background socket dropped"))
         await reconnectGate.waitUntilEntered()
@@ -1069,10 +1036,99 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let aCalls = await calls.calls(for: "A")
         let bCalls = await calls.calls(for: "B")
         XCTAssertEqual(aCalls, 0)
-        XCTAssertEqual(bCalls, 1,
-                       "readiness-released open(B) and recovery must share one resume")
+        XCTAssertEqual(bCalls, 0,
+                       "selecting B while reconnecting must remain read-only")
         XCTAssertEqual(sessions.activeStoredId, "B")
-        XCTAssertEqual(sessions.activeRuntimeId, "runtime-B")
+        XCTAssertNil(sessions.activeRuntimeId)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+    }
+
+    func testReconnectDrainsOfflinePromptForPassiveSelectionWithoutResume() async throws {
+        let (connection, sessions, chat) = makeStore()
+        let reconnectGate = SuspensionGate()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PassiveReconnectOutbox-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(
+            configuration: WorkRepositoryConfiguration(containerURL: directory),
+            observation: observation
+        )
+        let scope = try WorkScope(serverID: "https://gateway.test", profileID: "default")
+        let queue = QueueStore(
+            repository: repository,
+            observation: observation,
+            scopeProvider: { scope },
+            activeSessionProvider: { sessions.activeStoredId },
+            connectedProvider: { connection.phase == .connected }
+        )
+        var resumeCalls = 0
+        var submittedRuntime: String?
+        var transportReady = true
+        let processor = OutboxProcessor(repository: repository, dependencies: .init(
+            currentScope: { scope },
+            activeStoredSessionID: { sessions.activeStoredId },
+            isTransportReady: { transportReady },
+            createDestination: { _ in
+                XCTFail("existing-session prompt must not create a destination")
+                throw URLError(.badServerResponse)
+            },
+            resolveRuntime: { storedID in
+                XCTAssertEqual(storedID, "B")
+                return "runtime-B"
+            },
+            uploadAsset: { _, _ in
+                XCTFail("plain prompt must not upload")
+                throw URLError(.badServerResponse)
+            },
+            willSubmit: { _, _ in },
+            submit: { job, runtimeID, _ in
+                submittedRuntime = runtimeID
+                return OutboxSubmitResult(
+                    status: "streaming",
+                    accepted: true,
+                    clientMessageID: job.clientMessageID
+                )
+            }
+        ))
+        queue.installProcessor(processor)
+        connection.queueStore = queue
+
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        sessions.transcriptFetch = { _ in [] }
+        sessions.activeListRPC = { SessionActiveListResult(sessions: []) }
+        sessions.resumeRPC = { _, _ in
+            resumeCalls += 1
+            return self.stagedResumeResult(sessionId: "must-not-resume", resumed: "B")
+        }
+        sessions.open(sessionSummary("B"))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertNil(sessions.activeRuntimeId)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+
+        connection.connectRPC = { _, _ in
+            await reconnectGate.suspend()
+            transportReady = true
+        }
+        transportReady = false
+        connection._handleGatewayStateForTesting(.failed("offline"))
+        await reconnectGate.waitUntilEntered()
+        let queued = await queue.enqueue("send after reconnect", storedSessionId: "B", wake: true)
+        XCTAssertNotNil(queued)
+        await processor.waitUntilIdleForTesting()
+        XCTAssertNil(submittedRuntime, "the prompt must remain durable while transport is unavailable")
+
+        await reconnectGate.release()
+        await connection.waitForReconnectForTesting()
+        await processor.waitUntilIdleForTesting()
+
+        XCTAssertEqual(resumeCalls, 0, "reconnect must not drive a passive selection")
+        XCTAssertNil(sessions.activeRuntimeId)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertEqual(submittedRuntime, "runtime-B",
+                       "reconnect must wake the outbox even without a visible runtime")
     }
 
     // MARK: - ABH-448 connection-generation fencing
@@ -1102,7 +1158,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         try? KeychainService.saveToken("token", server: server)
         connection._skipEnvironmentBootstrapForTesting = true
         connection.statusRPC = { _, _ in await gate.suspend() }
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         defer { KeychainService.deleteToken(server: server) }
 
         let bootstrap = Task { await connection.bootstrap() }
@@ -1146,7 +1202,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let gate = SuspensionGate()
         let server = "https://generation-connect.example"
         UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
-        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection.connectRPC = { _, _ in await gate.suspend() }
 
         connection._seedAndStartReconnect(serverURL: server, token: "token")
         await gate.waitUntilEntered()
@@ -1164,7 +1220,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let gate = SuspensionGate()
         let server = "https://generation-recover.example"
         UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
-        connection.connectRPC = { _, _, _ in }
+        connection.connectRPC = { _, _ in }
         sessions.activeStoredId = "stored-stale"
         sessions.resumeRPC = { stored, _ in
             await gate.suspend()
@@ -1213,7 +1269,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let server = "https://generation-auth-probe.example"
         UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
         connection.reconnectBackoffOverride = 0
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection.probeIsAuthRevokedRPC = {
             await gate.suspend()
             return true
@@ -1285,7 +1341,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
             // terminal `.offline` with `hasConnected == false`, but the monitor
             // was armed before the probe.
             connection.statusRPC = { _, _ in throw URLError(.notConnectedToInternet) }
-            connection.connectRPC = { _, _, _ in }
+            connection.connectRPC = { _, _ in }
             _ = await connection.configure(urlString: server, token: "tok")
 
             guard case .offline = connection.phase else {
@@ -1320,7 +1376,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
 
             let connectCalls = ResumeCallLog()
             connection.statusRPC = { _, _ in throw URLError(.notConnectedToInternet) }
-            connection.connectRPC = { _, _, _ in await connectCalls.append(server) }
+            connection.connectRPC = { _, _ in await connectCalls.append(server) }
             _ = await connection.configure(urlString: server, token: "tok")
             guard case .offline = connection.phase else {
                 return XCTFail("cold configure failure must land in .offline, got \(connection.phase)")
@@ -1351,7 +1407,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let server = "https://s3-connected.example:9119"
         let connectCalls = ResumeCallLog()
         connection.networkReconnectDebounceOverride = .milliseconds(5)
-        connection.connectRPC = { _, _, _ in await connectCalls.append(server) }
+        connection.connectRPC = { _, _ in await connectCalls.append(server) }
         let fake = FakePathMonitor()
         connection._pathMonitorForTesting = fake
         connection._startPathMonitorForTesting()
@@ -1383,7 +1439,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let gate = SuspensionGate()
         let connectCalls = ResumeCallLog()
         connection.networkReconnectDebounceOverride = .milliseconds(5)
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             await connectCalls.append(server)
             // Suspend forever (until released) to represent a handshake that is
             // genuinely still in flight when the network trigger fires.
@@ -1432,7 +1488,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         connection.reconnectBackoffOverride = 30
         connection.networkReconnectDebounceOverride = .milliseconds(5)
         let connectCalls = ResumeCallLog()
-        connection.connectRPC = { _, _, _ in
+        connection.connectRPC = { _, _ in
             await connectCalls.append(server)
             if await connectCalls.calls(for: server) == 1 {
                 throw URLError(.cannotConnectToHost)

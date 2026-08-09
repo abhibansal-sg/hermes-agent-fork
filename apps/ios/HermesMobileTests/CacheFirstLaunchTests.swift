@@ -526,14 +526,18 @@ final class CacheFirstLaunchTests: XCTestCase {
         }
 
         sessions.open(makeSummary(id: "A"))
+        await sessions.waitForPendingOpenForTesting()
+        let lateA = Task { await sessions.ensureActiveRuntime() }
         await gate.waitUntilEntered()
         sessions.open(makeSummary(id: "B"))
         await sessions.waitForPendingOpenForTesting()
+        let runtimeB = await sessions.ensureActiveRuntime()
         XCTAssertEqual(sessions.activeStoredId, "B")
+        XCTAssertEqual(runtimeB, "runtime-B")
         XCTAssertEqual(sessions.activeRuntimeId, "runtime-B")
 
         await gate.release()
-        for _ in 0..<4 { await Task.yield() }
+        _ = await lateA.value
         XCTAssertEqual(sessions.activeStoredId, "B")
         XCTAssertEqual(sessions.activeRuntimeId, "runtime-B",
                        "a late A resume must be fenced by B's selection token")
@@ -644,182 +648,18 @@ final class CacheFirstLaunchTests: XCTestCase {
         XCTAssertFalse(sessions.isDraft)
     }
 
-    // MARK: - Prefetch (happy path + cancellation + skip-fresh)
-
-    func testPrefetchWarmsUncachedRecentSessions() async throws {
-        let (connection, sessions, _) = makeGraph()
-        connection.serverURLString = serverURL
-        let cache = try makeInMemoryCache()
-        sessions.attachCache(cache)
-        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
-        // Two visible (non-cron) sessions, neither transcript-cached yet.
-        let rows = [makeSummary(id: "p1", lastActive: 200), makeSummary(id: "p2", lastActive: 100)]
-        try await cache.saveSessionList(rows, scope: scope)
-        sessions.sessions = rows
-
-        let fetched = TestActorBox<Set<String>>([])
-        sessions.prefetchFetch = { @Sendable id in
-            await fetched.insert(id)
-            return [stubStored("hello-\(id)")]
-        }
-
-        sessions.prefetchRecentTranscripts()
-        // Drain through the durable write boundary, not merely the fetch
-        // callback: the callback completes before each GRDB save starts.
-        try await Self.poll {
-            guard await fetched.value.count == 2 else { return false }
-            let hasP1 = (try? await cache.hasTranscript(self.cacheIdentity("p1"))) == true
-            let hasP2 = (try? await cache.hasTranscript(self.cacheIdentity("p2"))) == true
-            return hasP1 && hasP2
-        }
-
-        let got = await fetched.value
-        XCTAssertEqual(got, ["p1", "p2"])
-        let hasP1 = try await cache.hasTranscript(cacheIdentity("p1"))
-        let hasP2 = try await cache.hasTranscript(cacheIdentity("p2"))
-        XCTAssertTrue(hasP1 && hasP2, "prefetch wrote both transcripts through to disk")
-    }
-
-    func testPrefetchCarriesOwningProfileToFetchAndCacheIdentity() async throws {
-        let (connection, sessions, _) = makeGraph()
-        connection.serverURLString = serverURL
-        let cache = try makeInMemoryCache()
-        sessions.attachCache(cache)
-        let work = makeSummary(id: "work-session", lastActive: 200, profile: "work")
-        sessions.sessions = [work]
-        try await cache.saveSessionList(
-            [work],
-            scope: CacheScope(serverId: serverURL, profileId: "work")
-        )
-
-        let observed = TestActorBox<String>("")
-        sessions.prefetchFetchWithProfile = { @Sendable id, profile in
-            await observed.set("\(id):\(profile)")
-            return [stubStored("work transcript")]
-        }
-
-        sessions.prefetchRecentTranscripts()
-        try await Self.poll {
-            guard await observed.value == "work-session:work" else { return false }
-            return (try? await cache.hasTranscript(
-                CacheIdentity(
-                    serverId: self.serverURL,
-                    profileId: "work",
-                    sessionId: "work-session"
-                )
-            )) == true
-        }
-
-        let hasWorkTranscript = try await cache.hasTranscript(
-            CacheIdentity(serverId: serverURL, profileId: "work", sessionId: "work-session")
-        )
-        XCTAssertTrue(hasWorkTranscript)
-    }
-
-    func testPrefetchSkipsActiveSessionAndFreshCache() async throws {
-        let (connection, sessions, _) = makeGraph()
-        connection.serverURLString = serverURL
-        let cache = try makeInMemoryCache()
-        sessions.attachCache(cache)
-        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
-        let rows = [
-            makeSummary(id: "open", lastActive: 300),
-            makeSummary(id: "fresh", lastActive: 100),
-            makeSummary(id: "stale", lastActive: 200),
-            makeSummary(id: "cronjob", lastActive: 250, source: "cron"),
-        ]
-        try await cache.saveSessionList(rows, scope: scope)
-        // `fresh` already has a current transcript on disk → must be skipped.
-        try await cache.saveTranscript(
-            identity: cacheIdentity("fresh"), messages: [stubStored("cached")]
-        )
-        sessions.sessions = rows
-        sessions.activeStoredId = "open"  // the open session owns its own fetch
-
-        let fetched = TestActorBox<Set<String>>([])
-        sessions.prefetchFetch = { @Sendable id in
-            await fetched.insert(id)
-            return [stubStored("net-\(id)")]
-        }
-
-        sessions.prefetchRecentTranscripts()
-        try await Self.poll { await fetched.value == ["stale"] }
-
-        let got = await fetched.value
-        XCTAssertEqual(got, ["stale"],
-                       "skips the open session, the fresh-cached one, and cron")
-    }
-
-    func testCancelPrefetchStopsTheSweep() async throws {
-        let (connection, sessions, _) = makeGraph()
-        connection.serverURLString = serverURL
-        let cache = try makeInMemoryCache()
-        sessions.attachCache(cache)
-        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
-        let rows = (0..<10).map { makeSummary(id: "c\($0)", lastActive: Double(100 - $0)) }
-        try await cache.saveSessionList(rows, scope: scope)
-        sessions.sessions = rows
-
-        let started = TestActorBox<Int>(0)
-        let gate = TestActorBox<Bool>(false)
-        sessions.prefetchFetch = { @Sendable id in
-            await started.increment()
-            // Block until released so cancellation can land mid-sweep.
-            while await gate.value == false {
-                if Task.isCancelled { throw CancellationError() }
-                try? await Task.sleep(for: .milliseconds(5))
-            }
-            return []
-        }
-
-        sessions.prefetchRecentTranscripts()
-        // Let the concurrency window (3) spin up, then cancel.
-        try await Self.poll { await started.value >= 1 }
-        sessions.cancelPrefetch()
-        await gate.set(true)  // release any blocked fetches so they can observe cancel
-
-        // No more than the concurrency window ever started; nothing past it ran.
-        let count = await started.value
-        XCTAssertLessThanOrEqual(count, 3,
-                                 "cancellation stops the sweep within the concurrency window")
-    }
-
-    // MARK: - Poll helper
-
-    /// Spin until `condition` is true or a generous deadline elapses (hermetic —
-    /// no live gateway, so the closures resolve immediately; this just yields the
-    /// detached sweep enough turns to drain).
-    private static func poll(
-        timeout: Duration = .seconds(3),
-        _ condition: @escaping () async -> Bool
-    ) async throws {
-        let deadline = ContinuousClock.now + timeout
-        while ContinuousClock.now < deadline {
-            if await condition() { return }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        XCTFail("poll timed out")
-    }
 }
 
 // MARK: - Test helpers
 
-/// Free `@Sendable` StoredMessage factory for the prefetch seams (a MainActor
-/// XCTestCase method can't be called from inside a `@Sendable` closure).
 private func stubStored(_ text: String, wireId: Int? = nil) -> StoredMessage {
     StoredMessage(role: "assistant", content: .string(text), timestamp: 1, wireId: wireId)
 }
 
-/// A tiny Sendable box so the `@Sendable` prefetch seams can record their calls
-/// from the detached task group without data races.
 private actor TestActorBox<T: Sendable> {
     private(set) var value: T
     init(_ initial: T) { self.value = initial }
     func set(_ v: T) { value = v }
-}
-
-private extension TestActorBox where T == Set<String> {
-    func insert(_ s: String) { value.insert(s) }
 }
 
 private extension TestActorBox where T == Int {

@@ -1,6 +1,10 @@
 # Option C upstream-first forward-port ledger
 
-Status: P-1 through H5 implemented; existing iOS app remains the release foundation
+Status: Option C implemented on the existing iOS app and reconciled with fork build 145
+
+Final upstream reconciliation: `326bdfb7a2` (2026-08-10)
+
+Fork release baseline preserved: `11c7bb5a16` (`ship: TestFlight build 145`)
 
 Upstream baseline: `31cedb4830191da7f8c3ea4b962d40997cd85b21`
 
@@ -60,8 +64,8 @@ use is separately classified below.
 
 | Fork behavior/seam | Replacement |
 |---|---|
-| `TOKEN_AUTHENTICATORS`, `IDENTITY_VALIDATORS`, `SOCKET_OBSERVERS`, `SESSION_OWNERSHIP_CHECKERS` | Stock `DashboardAuthProvider` credentials plus H2 authenticated-principal propagation and generic action authorization |
-| Device credential accepted as another long-lived WS `?token=` | Provider-verified bearer/refresh, stock one-use WS ticket, principal attached to `WSTransport`; legacy shared `?token=` remains loopback compatibility only |
+| `TOKEN_AUTHENTICATORS`, `IDENTITY_VALIDATORS`, `SOCKET_OBSERVERS`, `SESSION_OWNERSHIP_CHECKERS` | Stock dashboard browser-session authentication plus authenticated-principal propagation and generic action authorization |
+| Device credential accepted as another long-lived WS `?token=` | Stock WebKit/system cookies for gated REST and a freshly minted one-use `/api/auth/ws-ticket` for every WebSocket connection; shared token remains the bounded token-gateway compatibility path |
 | Fork WebSocket device lifecycle wrappers around every route | One stock authenticated transport context plus provider revocation callback; no per-route socket wrapper layer |
 | Fork `register_prompt_receipt_provider()` and inline `prompt.submit` patch | H3 generic prompt-admission contract in current `tui_gateway/methods_prompt.py`; storage remains provider-owned |
 | Ad-hoc device ownership checks on selected RPCs | One H2 admission helper covering live resume/activate, submit/queue/truncate, steer/redirect/interrupt, secure responses, attachments, conversation controls, session-scoped writes, and takeover |
@@ -76,10 +80,8 @@ modules, auth middleware, WS ticket store, and session locks.
 
 | Current module/responsibility | Smallest retained surface |
 |---|---|
-| `device_tokens.py` and device routes | A `DashboardAuthProvider`-compatible credential/refresh/revocation store, one-time pairing bootstrap, authenticated principal, ownership revision/policy state |
 | `prompt_receipts.py` | Durable implementation of H3 reserve/complete/release; no session or transcript authority |
 | `push_engine.py` plus APNs/Live Activity registration | Optional Apple delivery adapter consuming stock outcomes; no waiter/session lifecycle ownership |
-| `mobile_pair.py` | Provider CLI that emits a short-lived one-use bootstrap code, never shared/final bearer credentials |
 | Background notification response | Thin adapter into stock approval/clarify/action authorization; no duplicate approval resolver |
 
 The provider package must remain fully removable: stock Hermes chat, attachments, files,
@@ -132,9 +134,9 @@ versioned read-only shim. Conditions:
 - REST transcripts are bounded/paged and resume/export safety limits are configurable.
 - `gateway/turn_lease.py` and active-turn crash markers supply safety invariants but govern
   the messaging gateway, not `tui_gateway` cross-device ownership.
-- Dashboard auth supplies provider registration, bearer sessions, refresh, RFC 8252 for
-  Desktop, and one-use WS tickets. H2 extends identity continuity into JSON-RPC and
-  loopback capable clients; it does not create a mobile auth stack.
+- Dashboard auth supplies browser login sessions, system-cookie authentication, and
+  one-use WS tickets. iOS uses those stock mechanisms directly; no mobile credential,
+  refresh, pairing, or revocation stack remains in the plugin.
 
 ## P-1 exit criteria
 
@@ -270,7 +272,14 @@ Verification evidence:
 - Runtime simulator execution remains blocked by the previously documented host
   CoreSimulatorService `ENOMEM` failure; no raw `xcodebuild` was used.
 
-## H4 native credential contract
+## H4 native credential experiment (superseded at build-145 reconciliation)
+
+The implementation record below is historical. Fork build 145 introduced the better
+stock path: WebKit/system cookies for gated REST sessions plus a fresh one-use stock
+WebSocket ticket for each connection. The final coordinated release therefore removes
+`NativeAuthClient`, the provider access/refresh bundle, `mobile_auth.py`, `mobile_pair.py`,
+the pairing dashboard route/manifest, and their tests. There is no
+`/api/plugins/hermes-mobile/pair/exchange` route in the target architecture.
 
 Backend provider result:
 
@@ -369,7 +378,7 @@ Client verification evidence:
   explicitly read-only compatibility fallback for legacy transcript hints whose old
   upload paths are outside stock media roots; no new write can create that shape.
 - The composer attachment affordance no longer depends on the plugin upload capability.
-  Stock Hermes is the authority in both shared-token and provider-authenticated modes.
+  Stock Hermes is the authority in both shared-token and gated cookie-authenticated modes.
 - Focused tests prove `image.attach_bytes` carries the expected session/base64 payload,
   clears the pending item only after Hermes returns a path, preserves full-path transcript
   hints, and decodes/queries stock media reads. The full Swift 6 test target builds for
@@ -497,10 +506,10 @@ Client verification evidence:
 - Removed plugin pending-attention delta/tombstone/cursor reconciliation models. The retained
   GRDB prompt rows are bounded presentation cache only, and every restored actionable row is
   expired before display unless a fresh live Hermes request re-arms it.
-- Production iOS now has exactly two explicit mobile-plugin paths: native provider bootstrap
-  exchange (the irreducible credential provider) and a documented read-only legacy attachment
-  fallback. All current writes, live actions, transcript/search/file state, provider/toolset
-  settings, and workflow ordering use stock Hermes authority.
+- Production iOS now has exactly one explicit mobile-plugin path: the documented read-only
+  legacy attachment fallback. All authentication, current writes, live actions,
+  transcript/search/file state, provider/toolset settings, and workflow ordering use stock
+  Hermes authority.
 - The complete Swift 6 application and unit-test targets build for testing through the safe
   wrapper after project regeneration. Runtime simulator execution remains blocked by the
   host CoreSimulator `ENOMEM` condition recorded above.
@@ -508,9 +517,10 @@ Client verification evidence:
 ## Final coordinated-release gate
 
 The approved Option C sprint is implementation-complete on the existing iOS application.
-The last cleanup removed the inactive plugin-era device-token migration, its device-limit
-advisory UI, and its debug/test seams. Native provider pairing still retains the local
-device-name hint, but credential ownership now has exactly one live path.
+The final build-145 reconciliation removed both the inactive plugin-era device-token
+migration and the custom native access/refresh credential experiment. Gated connections
+now use stock WebKit/system cookies and stock one-use WebSocket tickets; token gateways
+retain their existing shared-token compatibility mode.
 
 Final acceptance evidence:
 
@@ -518,19 +528,17 @@ Final acceptance evidence:
   'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
   'EXCLUDED_SOURCE_FILE_NAMES=Assets.xcassets'` succeeds with Swift 6 complete strict
   concurrency enabled for the application and test targets.
-- 58 focused Python tests pass across native mobile authentication, durable prompt
-  admission, revisioned action authority/takeover, dashboard WebSocket authentication,
-  and the native provider flow. The dashboard test process was run with
+- 50 focused Python tests pass across durable prompt admission, revisioned action
+  authority/takeover, and stock dashboard/WebSocket authentication. The dashboard test
+  process was run with
   `HERMES_DASHBOARD_WS_HOST` explicitly empty so the developer machine's configured
   sidecar host could not contaminate the no-bound-host fixture.
-- Production Swift contains only two explicit `hermes-mobile` plugin paths:
-  `/api/plugins/hermes-mobile/pair/exchange` and the read-only legacy
-  `/api/plugins/hermes-mobile/attachments/{name}` compatibility fallback.
-- The thin plugin owns only three SQLite tables: `native_pair_bootstraps`,
-  `native_client_sessions`, and `prompt_receipts`. It has no transcript, attachment,
-  file, timeline, queue, action-ordering, or workflow tables.
-- Provider REST credentials remain in authorization headers, provider WebSockets use a
-  fresh stock one-use ticket, and no access/refresh credential is placed in a URL or log.
+- Production Swift contains only one explicit `hermes-mobile` plugin path: the read-only
+  legacy `/api/plugins/hermes-mobile/attachments/{name}` compatibility fallback.
+- The thin plugin owns only the `prompt_receipts` SQLite table. It has no credential,
+  transcript, attachment, file, timeline, queue, action-ordering, or workflow tables.
+- Gated REST authentication uses the stock system cookie jar. Every WebSocket connection
+  mints a fresh stock one-use ticket; no long-lived credential is placed in a URL or log.
 - Restored prompt-cache rows are presentation-only and non-actionable until a fresh live
   Hermes request arrives. Foreground responses preserve Hermes' original session,
   runtime, and request identities.
@@ -549,6 +557,7 @@ in reverse dependency order: final device-migration cleanup, `c5ff3220a0`, `7f89
 `9e9a92a894`, `c4932f0f6b`, `ae9b8f0545`, `d80db9a164`, `bd248c72c8`, `ea07c3618e`,
 `c8e357668a`, `1e421e73c4`, `271104a763`, `67fd84f0e6`, and `4b082aadf7`.
 Existing bounded iOS cache data may be discarded at any rollback point; Hermes canonical
-state and files are not migrated or deleted by this sequence. Native provider SQLite rows
-may remain inert if their provider commits are reverted, or be removed only after a
-separately authorized credential revocation/export decision.
+state and files are not migrated or deleted by this sequence. The final plugin contains no
+native credential rows requiring migration or revocation; prompt receipts may remain inert
+or be discarded after rollback because they are admission deduplication records, not
+canonical transcript or workflow state.

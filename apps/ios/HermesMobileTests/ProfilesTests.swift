@@ -3,8 +3,8 @@ import XCTest
 
 /// F4B-A.6 coverage for the DORMANT multi-profile switcher: the `profiles`
 /// capability probe state machine, the `ProfileSummary` / `ProfilesSessionsResult`
-/// fixture decodes (captured verbatim from the pinned upstream shapes in
-/// CONTRACT-F4B.md §Interface), the `SessionSummary.profile` round-trip (incl. the
+/// fixture decodes (captured verbatim from the gateway wire shapes), the
+/// `SessionSummary.profile` round-trip (incl. the
 /// dormant-path nil regression guard), the switcher visibility gate, the
 /// `visibleSessions` profile filter, the create/resume `profile` threading
 /// decision, and the REST per-session error surfacing.
@@ -85,7 +85,6 @@ final class ProfilesTests: XCTestCase {
             var appVersion = "1 (1)"
             var upload = ServerCapabilities.State.available
             var pushRegistry = ServerCapabilities.State.unknown
-            var broadcast = ServerCapabilities.State.unknown
             var fs = ServerCapabilities.State.available
             var subagentEvents = ServerCapabilities.State.unknown
             var profiles = ServerCapabilities.State.available
@@ -232,11 +231,8 @@ final class ProfilesTests: XCTestCase {
         XCTAssertEqual(s.messageCount, 2)
     }
 
-    func testMemberwisePositionalCallersCompileWithProfileLast() {
-        // `profile` is the LAST stored property with a default, so the synthesized
-        // memberwise init keeps it a trailing optional param: the positional
-        // callers compile without passing it (this build IS the assertion). Mirror
-        // the 3 callers' positional shape here.
+    func testMemberwiseCallersCompileWithOptionalMetadata() {
+        // Optional row metadata keeps existing memberwise callers source-compatible.
         let s = SessionSummary(
             id: "id", title: nil, preview: nil, startedAt: nil,
             messageCount: nil, source: nil, lastActive: nil, cwd: nil
@@ -502,7 +498,11 @@ final class ProfilesTests: XCTestCase {
         chat.attach(connection: connection, sessions: sessions, attachments: attachments)
         sessions.attach(connection: connection, chat: chat)
         sessions.activeProfile = DefaultsKeys.allProfilesScope
-        sessions.profileThreadingAvailableForTesting = true
+        connection.capabilities._seedProfilesCapabilityForTesting(.available)
+        sessions._seedProfilesForTesting([
+            ProfileSummary(name: "work", isDefault: false, description: nil),
+            ProfileSummary(name: "personal", isDefault: false, description: nil),
+        ])
 
         var resumeProfile: String?
         sessions.resumeRPC = { requested, params in
@@ -526,14 +526,50 @@ final class ProfilesTests: XCTestCase {
 
         sessions.open(row("parent-session", profile: "work"))
         await sessions.waitForPendingOpenForTesting()
+        let runtime = await sessions.ensureActiveRuntime()
 
+        XCTAssertEqual(runtime, "runtime-child")
         XCTAssertEqual(resumeProfile, "work")
         XCTAssertTrue(transcriptCalls.contains { $0.sessionId == "parent-session" && $0.profile == "work" })
         XCTAssertTrue(transcriptCalls.contains { $0.sessionId == "child-session" && $0.profile == "work" },
                       "Compression-chain continuation seed must keep the parent row's profile scope")
         XCTAssertEqual(runtimeBoundCount, 1,
                        "The authoritative chain tip must pass the post-resume fence and drain queued work")
-        sessions.profileThreadingAvailableForTesting = nil
+    }
+
+    func testCustomDeploymentEchoDoesNotBecomeDrawerProfileScope() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        connection.capabilities._seedProfilesCapabilityForTesting(.available)
+        sessions._seedProfilesForTesting([
+            ProfileSummary(name: "default", isDefault: true, description: nil),
+            ProfileSummary(name: "work", isDefault: false, description: nil),
+        ])
+        sessions.activeProfile = SessionStore.defaultProfileName
+        let untagged = row("custom-home-session", profile: nil)
+        sessions.sessions = [untagged]
+        sessions.transcriptFetchWithProfile = { _, _ in [] }
+        sessions.resumeRPC = { _, _ in
+            JSONValue.object([
+                "session_id": .string("runtime-custom-home"),
+                "resumed": .string("custom-home-session"),
+                "info": .object(["profile_name": .string("custom")]),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+
+        sessions.open(untagged)
+        await sessions.waitForPendingOpenForTesting()
+        let runtime = await sessions.ensureActiveRuntime()
+
+        XCTAssertEqual(runtime, "runtime-custom-home")
+        XCTAssertEqual(sessions.activeProfile, SessionStore.defaultProfileName)
+        XCTAssertEqual(sessions.activeStoredProfile, SessionStore.defaultProfileName)
+        XCTAssertEqual(sessions.visibleSessions.map(\.id), ["custom-home-session"],
+                       "An opaque custom-home echo must not filter default drawer rows away")
     }
 
     func testDefaultProfileRowsKeepProfilelessPerSessionActions() {

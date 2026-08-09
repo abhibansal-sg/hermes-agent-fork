@@ -13,38 +13,6 @@ import XCTest
 /// `HermesMobileUITests/ChatFlowUITests.swift`.
 final class RestClientLiveTests: XCTestCase {
 
-    func testTranscriptPageFetchUsesStockLatestWindow() async {
-        TranscriptPageStubProtocol.nextResponse = (
-            #"{"messages":[{"id":41,"role":"user","content":"older"}],"pagination":{"limit":50,"offset":0,"order":"latest","returned":1}}"#.data(using: .utf8)!,
-            200
-        )
-        TranscriptPageStubProtocol.requestedPath = nil
-        TranscriptPageStubProtocol.requestedQuery = nil
-        let rest = transcriptPageStubClient()
-
-        let page = await fetchTranscriptPage(rest: rest, sessionId: "s 1", limit: 50, before: 42)
-
-        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/sessions/s%201/messages")
-        XCTAssertEqual(TranscriptPageStubProtocol.requestedQuery, "limit=50&offset=0&order=latest")
-        XCTAssertEqual(page?.messages.map(\.wireId), [41])
-        XCTAssertEqual(page?.oldestId, 41)
-        XCTAssertEqual(page?.hasMoreBefore, false)
-    }
-
-    func testTranscriptPageFetchDoesNotRequirePluginPathStyle() async {
-        TranscriptPageStubProtocol.nextResponse = (
-            #"{"messages":[],"pagination":{"limit":50,"offset":0,"order":"latest","returned":0}}"#.data(using: .utf8)!,
-            200
-        )
-        TranscriptPageStubProtocol.requestedPath = nil
-        let rest = transcriptPageStubClient()
-
-        let page = await fetchTranscriptPage(rest: rest, sessionId: "s1", limit: 50)
-
-        XCTAssertNotNil(page)
-        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/sessions/s1/messages")
-    }
-
     func testStockTranscriptPageUsesOffsetAndProfile() async {
         TranscriptPageStubProtocol.nextResponse = (
             #"{"session_id":"s 1","messages":[{"id":11,"role":"user","content":"older"}],"pagination":{"limit":10,"offset":10,"returned":1}}"#.data(using: .utf8)!,
@@ -72,6 +40,67 @@ final class RestClientLiveTests: XCTestCase {
         )
         XCTAssertEqual(page?.messages.map(\.wireId), [11])
         XCTAssertEqual(page?.hasMoreBefore, true)
+    }
+
+    func testTranscriptPageFetchUsesStockLatestWindow() async {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"messages":[{"id":41,"role":"user","content":"older"}],"pagination":{"limit":50,"offset":0,"order":"latest","returned":1}}"#.data(using: .utf8)!,
+            200
+        )
+        TranscriptPageStubProtocol.requestedPath = nil
+        TranscriptPageStubProtocol.requestedQuery = nil
+        let rest = transcriptPageStubClient()
+
+        let page = await fetchTranscriptPage(rest: rest, sessionId: "s 1", limit: 50)
+
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/sessions/s%201/messages")
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedQuery, "limit=50&offset=0&order=latest")
+        XCTAssertEqual(page?.messages.map(\.wireId), [41])
+        XCTAssertEqual(page?.oldestId, 41)
+        XCTAssertEqual(page?.hasMoreBefore, false)
+    }
+
+    func testTranscriptPageFetchDoesNotRequirePluginPathStyle() async {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"messages":[],"pagination":{"limit":50,"offset":0,"order":"latest","returned":0}}"#.data(using: .utf8)!,
+            200
+        )
+        TranscriptPageStubProtocol.requestedPath = nil
+        let rest = transcriptPageStubClient()
+
+        let page = await fetchTranscriptPage(rest: rest, sessionId: "s1", limit: 50)
+
+        XCTAssertNotNil(page)
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/sessions/s1/messages")
+    }
+
+    func testBoundedTranscriptTailUsesStockHistory() async throws {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"session_id":"s 1","messages":[{"id":51,"role":"user","content":"tail"}],"pagination":{"limit":50,"offset":10,"returned":1}}"#.data(using: .utf8)!,
+            200
+        )
+        TranscriptPageStubProtocol.requestedPath = nil
+        TranscriptPageStubProtocol.requestedQuery = nil
+        let rest = transcriptPageStubClient()
+
+        let messages = try await fetchBoundedStockTranscript(
+            rest: rest,
+            sessionId: "s 1",
+            profile: "work profile",
+            messageCount: 60,
+            limit: 50
+        )
+
+        XCTAssertEqual(
+            TranscriptPageStubProtocol.requestedPath,
+            "/api/sessions/s%201/messages",
+            "Chat hydration must use the stock gateway even when notification plugin routes exist"
+        )
+        XCTAssertEqual(
+            TranscriptPageStubProtocol.requestedQuery,
+            "limit=50&offset=10&profile=work%20profile"
+        )
+        XCTAssertEqual(messages.map(\.wireId), [51])
     }
 
     /// `GET /api/sessions?order=recent` must round-trip with its query string

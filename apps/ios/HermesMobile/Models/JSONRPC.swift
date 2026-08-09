@@ -24,18 +24,9 @@ struct JSONRPCInboundFrame: Decodable, Sendable {
     let result: JSONValue?
     let error: JSONRPCErrorPayload?
     let params: JSONValue?
-    /// Coalesced dropped-frame count from the gateway's broadcast overflow policy
-    /// (`tui_gateway/ws.py` `obj = {**obj, "broadcast_gap": dropped}`), written at
-    /// the FRAME TOP LEVEL — a sibling of `method`/`params`, NOT inside `params`.
-    /// Decoded here at the top level and threaded into `GatewayEvent` so the REST
-    /// gap-recovery backfill (`ConnectionStore`) actually fires. The prior code
-    /// read it from `params`, where it never appears, so it was structurally
-    /// always nil and the backfill never ran.
-    let broadcastGap: Int?
 
     enum CodingKeys: String, CodingKey {
         case id, method, result, error, params
-        case broadcastGap = "broadcast_gap"
     }
 
     var isEvent: Bool { method == "event" }
@@ -101,6 +92,9 @@ enum GatewayError: Error, LocalizedError, Sendable {
 
 /// Well-known gateway error codes (tui_gateway/server.py).
 enum GatewayErrorCode {
+    /// `prompt.submit` resolves its in-memory runtime through `_sess_nowait`,
+    /// which returns 4001 when that runtime has expired.
+    static let promptSessionNotFound = 4001
     static let invalidParam = 4002
     static let missingParam = 4006
     static let sessionNotFound = 4007
@@ -111,4 +105,8 @@ enum GatewayErrorCode {
     /// `_set_session_cwd` `ValueError` — "working directory does not exist").
     static let cwdMissing = 4017
     static let staleTruncation = 4018
+
+    static func isPromptSessionNotFound(code: Int, message: String) -> Bool {
+        code == promptSessionNotFound && message == "session not found"
+    }
 }

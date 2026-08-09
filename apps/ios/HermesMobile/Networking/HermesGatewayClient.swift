@@ -152,7 +152,7 @@ actor HermesGatewayClient {
     /// How long `probeLiveness` waits for the ping pong before declaring the
     /// socket dead. Kept as a named constant so tests can reason about its value
     /// without depending on a magic number.
-    static let livenessPingTimeout: Duration = .seconds(4)
+    static let livenessPingTimeout: Duration = .seconds(15)
 
     /// Probe whether the current socket is still alive by sending a WebSocket
     /// ping and waiting for the pong (or a timeout). Read-only: if the ping
@@ -197,22 +197,17 @@ actor HermesGatewayClient {
     /// `GatewayError` on transport failure or if no ready frame arrives within
     /// 15 seconds. Any existing connection is torn down first.
     ///
-    /// - Parameter mode: the active connection mode, used to derive the correct
-    ///   `Host` header (loopback for Serve/sharedDashboard; real host for a
-    ///   non-loopback remoteURL target). Defaults to `.remoteURL` so callers that
-    ///   do not supply a mode keep the conservative real-host behaviour.
-    func connect(baseURL: URL, token: String, mode: ConnectionMode = .remoteURL) async throws {
+    func connect(baseURL: URL, token: String) async throws {
         try await connect(
-            request: WSURLBuilder.wsRequest(baseURL: baseURL, token: token, mode: mode)
+            request: WSURLBuilder.wsRequest(baseURL: baseURL, token: token)
         )
     }
 
-    /// Connect with a stock native-session one-use WebSocket ticket. Keeping
-    /// this separate from the legacy token overload prevents provider access or
-    /// refresh tokens from ever entering a WebSocket URL.
-    func connect(baseURL: URL, ticket: String, mode: ConnectionMode = .remoteURL) async throws {
+    /// Gated-gateway counterpart to token auth. The ticket is minted by
+    /// `POST /api/auth/ws-ticket` immediately before this call.
+    func connect(baseURL: URL, ticket: String) async throws {
         try await connect(
-            request: WSURLBuilder.wsRequest(baseURL: baseURL, ticket: ticket, mode: mode)
+            request: WSURLBuilder.wsTicketRequest(baseURL: baseURL, ticket: ticket)
         )
     }
 
@@ -454,10 +449,7 @@ actor HermesGatewayClient {
     }
 
     private func handleEvent(_ frame: JSONRPCInboundFrame) {
-        guard let event = GatewayEvent(
-            params: frame.params ?? .null,
-            broadcastGap: frame.broadcastGap
-        ) else { return }
+        guard let event = GatewayEvent(params: frame.params ?? .null) else { return }
 
         // The first `gateway.ready` event marks the connection open and
         // unblocks `connect`.

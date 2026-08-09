@@ -13,6 +13,20 @@ struct DraftModelSelection: Codable, Equatable, Sendable {
     var provider: String
     var reasoningEffort: String?
     var fast: Bool?
+
+    func apply(toCreateParams params: inout [String: JSONValue]) {
+        if !model.isEmpty {
+            params["model"] = .string(model)
+            if !provider.isEmpty { params["provider"] = .string(provider) }
+        }
+        if let reasoningEffort {
+            params["reasoning_effort"] = .string(
+                reasoningEffort.isEmpty ? "none" : reasoningEffort)
+        }
+        // Stock session.create distinguishes true from omitted, but not an
+        // explicit false. False is normalized once after creation below.
+        if fast == true { params["fast"] = .bool(true) }
+    }
 }
 
 /// Observable owner of the gateway connection lifecycle.
@@ -221,22 +235,16 @@ final class ConnectionStore {
         draftSelection = nil
     }
 
-    /// Apply a pended draft pick to the just-created session. Best-effort BY
-    /// DESIGN: a failure must not block (or lose) the user's first message —
-    /// the session then simply runs on the global default and the pill follows
-    /// the server truth from `session.info`.
-    func applyDraftSelection(sessionId: String) async {
-        guard let d = draftSelection else { return }
+    /// Consume the selection already carried by stock `session.create`.
+    /// The only follow-up stock cannot express is explicit normal mode.
+    func finishDraftCreation(
+        selection: DraftModelSelection?,
+        sessionId: String
+    ) async {
+        guard draftSelection == selection else { return }
         draftSelection = nil
-        if !d.model.isEmpty {
-            let value = d.provider.isEmpty ? d.model : "\(d.model) --provider \(d.provider)"
-            try? await sessionSetModel(value, sessionId: sessionId)
-        }
-        if let effort = d.reasoningEffort {
-            try? await sessionSetReasoning(effort.isEmpty ? "none" : effort, sessionId: sessionId)
-        }
-        if let fast = d.fast {
-            try? await sessionSetFast(fast, sessionId: sessionId)
+        if selection?.fast == false {
+            try? await sessionSetFast(false, sessionId: sessionId)
         }
     }
 
@@ -294,10 +302,13 @@ final class ConnectionStore {
         sessionCwd = trimmed.isEmpty ? nil : trimmed
     }
 
-    func applySessionModel(_ model: String?) {
+    func applySessionModel(_ model: String?, provider: String? = nil) {
         guard let model, !model.isEmpty else { return }
         sessionModel = Self.shortModelName(provider: nil, model: model)
         sessionModelRaw = model
+        if let provider, !provider.isEmpty {
+            sessionProvider = provider
+        }
     }
 
     /// Reset active session hot-swap state when a session is torn down or
@@ -501,45 +512,6 @@ final class ConnectionStore {
         true
     }
 
-    /// Base address for the transparent stock-protocol lane. The existing relay
-    /// override selects the proxy host; without one, direct gateway behavior is
-    /// preserved during the Phase 2 rollout.
-    private func stockProxyOverrideURL() -> URL? {
-        let rawOverride: String?
-        #if DEBUG
-        let environmentOverride = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        rawOverride = environmentOverride?.isEmpty == false
-            ? environmentOverride
-            : DefaultsKeys.relayURLOverrideValue()
-        #else
-        rawOverride = DefaultsKeys.relayURLOverrideValue()
-        #endif
-        guard let rawOverride,
-              let override = URL(string: rawOverride),
-              var components = URLComponents(url: override, resolvingAgainstBaseURL: false)
-        else { return nil }
-        switch override.scheme?.lowercased() {
-        case "https", "wss": components.scheme = "https"
-        case "http", "ws": components.scheme = "http"
-        default: return nil
-        }
-        components.path = ""
-        components.queryItems = nil
-        return components.url
-    }
-
-    func stockProxyURL(forGateway gatewayURL: URL) -> URL {
-        stockProxyOverrideURL() ?? gatewayURL
-    }
-
-    /// A relay URL is the public WebSocket endpoint, so its real Host header
-    /// must survive the upgrade. Direct gateway connections keep their configured
-    /// mode (including the shared-dashboard loopback override).
-    func stockProxyWebSocketMode(forGateway gatewayURL: URL) -> ConnectionMode {
-        stockProxyOverrideURL() == nil ? connectionMode : .remoteURL
-    }
-
     /// The accepted transport generation. Runtime bindings use this value to
     /// reject work produced by a prior socket after reconnect.
     private(set) var transportEpoch: UInt64 = 0
@@ -577,9 +549,8 @@ final class ConnectionStore {
         )
     }
 
-    /// A stock Hermes REST client built from the active credential, or `nil` if
-    /// unconfigured. Provider sessions share one rotating credential controller;
-    /// legacy local pairings retain the saved gateway token.
+    /// A stock Hermes REST client built from the active cookie or token session,
+    /// or `nil` if the gateway is unconfigured.
     var rest: RestClient? {
         #if DEBUG
         // Test-only: a seeded override short-circuits the URL+token build so a
@@ -589,21 +560,10 @@ final class ConnectionStore {
         if let _restOverrideForTesting { return _restOverrideForTesting }
         #endif
         guard let url = URL(string: serverURLString) else { return nil }
-        let baseURL = stockProxyURL(forGateway: url)
-        let mode = stockProxyWebSocketMode(forGateway: url)
-        if let providerCredentialSnapshot, let nativeCredentialController {
-            return RestClient(
-                baseURL: baseURL,
-                providerCredential: providerCredentialSnapshot,
-                controller: nativeCredentialController,
-                connectionMode: mode
-            )
-        }
-        guard let token = currentToken else { return nil }
-        return RestClient(
-            baseURL: baseURL,
-            token: token,
-            connectionMode: mode
+        return restClient(
+            baseURL: url,
+            authMode: activeAuthMode,
+            token: currentToken
         )
     }
 
@@ -680,21 +640,10 @@ final class ConnectionStore {
         if let _restOverrideForTesting { return _restOverrideForTesting }
         #endif
         guard let url = URL(string: serverURLString) else { return nil }
-        let baseURL = stockProxyURL(forGateway: url)
-        let mode = stockProxyWebSocketMode(forGateway: url)
-        if let providerCredentialSnapshot, let nativeCredentialController {
-            return RestClient(
-                baseURL: baseURL,
-                providerCredential: providerCredentialSnapshot,
-                controller: nativeCredentialController,
-                connectionMode: mode
-            )
-        }
-        guard let token = currentToken else { return nil }
-        return RestClient(
-            baseURL: baseURL,
-            token: token,
-            connectionMode: mode
+        return restClient(
+            baseURL: url,
+            authMode: activeAuthMode,
+            token: currentToken
         )
     }
 
@@ -717,8 +666,8 @@ final class ConnectionStore {
     /// Wired by `AppEnvironment` (ChatStore holds no reference to it).
     weak var queueStore: QueueStore?
 
-    /// The global approval/clarification inbox. The event router fans the
-    /// broadcast prompt events to it (in addition to `ChatStore`) so pending
+    /// The global approval/clarification inbox. The event router forwards prompt
+    /// events to it (in addition to `ChatStore`) so pending
     /// requests from every session collect in one place. Wired by
     /// `AppEnvironment`; `ChatStore` holds no reference to it.
     weak var inboxStore: InboxStore?
@@ -729,14 +678,29 @@ final class ConnectionStore {
     private let sessionStore: SessionStore
     private let chatStore: ChatStore
 
-    /// The token for the active connection (kept in memory; also in Keychain).
+    /// The token for the active connection; nil for cookie sessions.
     private var currentToken: String?
-    /// Stock native-session authority for provider-paired servers. One actor is
-    /// shared by REST and every reconnect so rotating refresh tokens cannot be
-    /// replayed by competing requests. The snapshot is presentation/debug data;
-    /// the actor owns the live credential after construction.
-    private var nativeCredentialController: NativeCredentialController?
-    private var providerCredentialSnapshot: ProviderCredentialBundle?
+    private var activeAuthMode: GatewayAuthMode = .saved()
+
+    private func restClient(
+        baseURL: URL,
+        authMode: GatewayAuthMode,
+        token: String?
+    ) -> RestClient? {
+        switch authMode {
+        case .token:
+            guard let token, !token.isEmpty else { return nil }
+            return RestClient(
+                baseURL: baseURL,
+                token: token
+            )
+        case .session:
+            return RestClient(
+                baseURL: baseURL,
+                token: ""
+            )
+        }
+    }
     /// Monotonic ownership token for every connection lifecycle. Any task that
     /// crosses an await captures this value and must revalidate it before it can
     /// publish connection state or schedule more work. Configure and every
@@ -750,7 +714,6 @@ final class ConnectionStore {
     @discardableResult
     private func advanceConnectionGeneration() -> UInt64 {
         connectionGeneration &+= 1
-        gatewayProtocolCapabilities.removeAll()
         setTransportReadiness(.unconfigured, resolveWaiters: true)
         sessionStore.transportDidBecomeUnavailable()
         sessionStore.invalidateConnectionWork()
@@ -938,7 +901,7 @@ final class ConnectionStore {
     /// pattern as `SessionStore.resumeRPC`. Defaults to `nil`; the live path
     /// is taken in production (the nil-check is free). Set by unit tests to
     /// make the loop deterministic without a live socket.
-    var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
+    var connectRPC: ((_ url: URL, _ token: String) async throws -> Void)?
 
     #if DEBUG
     /// Injectable configure status probe (tests). When non-nil, replaces the live
@@ -1145,12 +1108,10 @@ final class ConnectionStore {
     /// after `isBootstrapping` has cleared (the cold-launch-offline window the old
     /// `hasConnected || isBootstrapping` gate dropped to `WelcomeView`).
     ///
-    /// The signal is the persisted server URL: legacy `configure()` writes it only
-    /// after a verified connection. Provider pairing writes it immediately after
-    /// a successful one-use bootstrap exchange and atomic Keychain commit so an
-    /// interruption cannot strand the consumed bootstrap. A genuinely-unconfigured
-    /// install (or a pairing that failed before durable credential admission)
-    /// reports `false` and still routes to `WelcomeView`. The in-memory
+    /// The signal is the persisted server URL: `configure()` writes it to
+    /// UserDefaults ONLY after a verified connection, so a genuinely-unconfigured
+    /// install (or one whose only `configure` attempt FAILED validation — nothing
+    /// persisted) reports `false` and still routes to `WelcomeView`. The in-memory
     /// `serverURLString` is the cache-first early-set fallback (set in
     /// `paintCacheFirst` before any persistence) so the gate holds during the very
     /// first launch frames too. A deliberate `disconnect()` clears the persisted
@@ -1235,7 +1196,11 @@ final class ConnectionStore {
             await paintCacheFirst(serverURLString: url)
             guard isCurrentGeneration(generation) else { return }
             _ = await configure(
-                urlString: url, token: token, issuedDeviceId: nil, generation: generation
+                urlString: url,
+                token: token,
+                authMode: .token,
+                issuedDeviceId: nil,
+                generation: generation
             )
             guard isCurrentGeneration(generation) else { return }
             isBootstrapping = false
@@ -1254,7 +1219,9 @@ final class ConnectionStore {
             await paintCacheFirst(serverURLString: savedURL)
             guard isCurrentGeneration(generation) else { return }
 
-            guard let credential = KeychainService.loadCredential(server: savedURL) else {
+            let authMode = GatewayAuthMode.saved()
+            let token = KeychainService.loadToken(server: savedURL)
+            if authMode == .token && token == nil {
                 // A cached URL still identifies a returning user even when the
                 // token is unavailable on this install. Keep the cached shell
                 // visible; a fresh install has no saved URL and still reaches
@@ -1264,45 +1231,13 @@ final class ConnectionStore {
                 return
             }
 
-            switch credential {
-            case .sharedToken(let token):
-                _ = await configure(
-                    urlString: savedURL,
-                    token: token,
-                    issuedDeviceId: nil,
-                    generation: generation
-                )
-            case .provider(let bundle):
-                guard let gatewayURL = URL(string: savedURL) else {
-                    phase = .offline("Saved gateway URL is invalid")
-                    isBootstrapping = false
-                    return
-                }
-                let controller: NativeCredentialController
-                if serverURLString == savedURL,
-                   providerCredentialSnapshot?.clientId == bundle.clientId,
-                   let existing = nativeCredentialController {
-                    // Explicit offline/reconnect can re-enter bootstrap while
-                    // request completions from the prior generation are still
-                    // unwinding. Reuse the one actor for this provider client so
-                    // two controllers can never replay one rotating refresh token.
-                    controller = existing
-                } else {
-                    controller = NativeCredentialController(
-                        baseURL: stockProxyURL(forGateway: gatewayURL),
-                        credentialStoreKey: savedURL,
-                        bundle: bundle
-                    )
-                }
-                _ = await configure(
-                    urlString: savedURL,
-                    token: bundle.accessToken,
-                    issuedDeviceId: nil,
-                    generation: generation,
-                    providerBundle: bundle,
-                    providerController: controller
-                )
-            }
+            _ = await configure(
+                urlString: savedURL,
+                token: token,
+                authMode: authMode,
+                issuedDeviceId: nil,
+                generation: generation
+            )
             guard isCurrentGeneration(generation) else { return }
             isBootstrapping = false
             enterDraftAfterBootstrapConfigure()
@@ -1397,82 +1332,78 @@ final class ConnectionStore {
         return await configure(
             urlString: urlString,
             token: token,
+            authMode: .token,
             issuedDeviceId: issuedDeviceId,
             generation: generation
         )
     }
 
-    /// Exchange a one-use thin-provider bootstrap for stock Hermes native
-    /// session credentials, persist the rotating pair atomically in Keychain,
-    /// then enter the same validation/connect/hydration workflow as legacy
-    /// pairings. The bootstrap itself is never persisted.
-    func configureProvider(urlString: String, bootstrap: String) async -> String? {
+    func configureAuthenticatedSession(urlString: String) async -> String? {
         let generation = advanceConnectionGeneration()
-        let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedBootstrap = bootstrap.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let gatewayURL = URL(string: trimmedURL),
-              gatewayURL.scheme?.lowercased() == "https",
-              gatewayURL.host != nil else {
-            phase = .offline("Provider pairing requires a valid HTTPS gateway URL")
-            return "Provider pairing requires a valid HTTPS gateway URL."
-        }
-        guard !trimmedBootstrap.isEmpty else {
-            phase = .offline("Missing pairing bootstrap")
-            return "This pairing code is incomplete. Generate a new code."
-        }
-
-        hasConnected = false
-        phase = .connecting
-        let transportURL = stockProxyURL(forGateway: gatewayURL)
-        let bundle: ProviderCredentialBundle
-        do {
-            bundle = try await NativeAuthClient(baseURL: transportURL).exchange(
-                bootstrap: trimmedBootstrap,
-                deviceName: Self.deviceNameHint
-            )
-        } catch {
-            guard isCurrentGeneration(generation) else { return nil }
-            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            phase = .offline(message)
-            return message
-        }
-        guard isCurrentGeneration(generation) else { return nil }
-
-        // The bootstrap is one-use. Commit its durable replacement before any
-        // subsequent probe or socket attempt, and persist the URL immediately so
-        // a launch interruption can resume through the saved refresh credential.
-        do {
-            try KeychainService.saveProviderCredential(bundle, server: trimmedURL)
-        } catch {
-            phase = .offline("Could not save the paired credential securely")
-            return "Could not save the paired credential securely. Generate a new pairing code."
-        }
-        UserDefaults.standard.set(trimmedURL, forKey: DefaultsKeys.serverURL)
-        let controller = NativeCredentialController(
-            baseURL: transportURL,
-            credentialStoreKey: trimmedURL,
-            bundle: bundle
-        )
         return await configure(
-            urlString: trimmedURL,
-            token: bundle.accessToken,
+            urlString: urlString,
+            token: nil,
+            authMode: .session,
             issuedDeviceId: nil,
-            generation: generation,
-            providerBundle: bundle,
-            providerController: controller
+            generation: generation
         )
+    }
+
+    func probeAuthentication(urlString: String) async throws -> GatewayAuthProbe {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil else {
+            throw RestError.network("That doesn't look like a valid server URL.")
+        }
+        return try await RestClient(
+            baseURL: url,
+            token: ""
+        ).authProbe()
+    }
+
+    private func connectGateway(
+        baseURL: URL,
+        authMode: GatewayAuthMode,
+        token: String?
+    ) async throws {
+        switch authMode {
+        case .token:
+            guard let token, !token.isEmpty else {
+                throw RestError.network("Missing gateway token")
+            }
+            if let connectRPC {
+                try await connectRPC(baseURL, token)
+            } else {
+                try await client.connect(baseURL: baseURL, token: token)
+            }
+        case .session:
+            guard let rest = restClient(
+                baseURL: baseURL,
+                authMode: .session,
+                token: nil
+            ) else {
+                throw RestError.network("Gateway session unavailable")
+            }
+            let ticket = try await rest.webSocketTicket()
+            if let connectRPC {
+                try await connectRPC(baseURL, ticket)
+            } else {
+                try await client.connect(baseURL: baseURL, ticket: ticket)
+            }
+        }
     }
 
     private func configure(
         urlString: String,
-        token: String,
+        token: String?,
+        authMode: GatewayAuthMode,
         issuedDeviceId: String?,
-        generation: UInt64,
-        providerBundle: ProviderCredentialBundle? = nil,
-        providerController: NativeCredentialController? = nil
+        generation: UInt64
     ) async -> String? {
         let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines)
         let previousServerURL = serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Scheme is restricted to http/https — `URL(string:)` happily accepts
@@ -1484,17 +1415,11 @@ final class ConnectionStore {
             phase = .offline("Invalid server URL")
             return "That doesn't look like a valid server URL."
         }
-        guard !trimmedToken.isEmpty else {
+        if authMode == .token && (trimmedToken?.isEmpty != false) {
             phase = .offline("Missing token")
             return "A session token is required."
         }
-        let stockTransportURL = stockProxyURL(forGateway: url)
-        let stockTransportMode = stockProxyWebSocketMode(forGateway: url)
-        let usesProviderCredentials = providerBundle != nil && providerController != nil
-        guard (providerBundle == nil) == (providerController == nil) else {
-            phase = .offline("Incomplete provider credential state")
-            return "The saved provider credential is incomplete. Pair again."
-        }
+        let stockTransportURL = url
 
         // Cancel any reconnect loop tied to a previous configuration.
         reconnectTask?.cancel()
@@ -1510,14 +1435,6 @@ final class ConnectionStore {
         // must not qualify as active (especially a late `.open`).
         hasConnected = false
 
-        if let activeController = nativeCredentialController,
-           activeController !== providerController {
-            await activeController.retire()
-            guard isCurrentGeneration(generation) else { return nil }
-            nativeCredentialController = nil
-            providerCredentialSnapshot = nil
-        }
-
         phase = .connecting
 
         // S3: arm the network-path monitor BEFORE the REST probe. A cold-launch-
@@ -1530,57 +1447,40 @@ final class ConnectionStore {
 
         // Probe REST first to fail fast with a clear message before opening WS.
         let previousToken = KeychainService.loadToken(server: trimmedURL)
-        let isSavedTokenReuse = !usesProviderCredentials
-            && issuedDeviceId == nil
-            && previousToken == trimmedToken
+        let isSavedTokenReuse =
+            authMode == .token && issuedDeviceId == nil && previousToken == trimmedToken
 
         do {
             #if DEBUG
-            if let statusRPC, !usesProviderCredentials {
+            if authMode == .token, let statusRPC, let trimmedToken {
                 try await statusRPC(stockTransportURL, trimmedToken)
-            } else if let providerBundle, let providerController {
-                let probe = RestClient(
-                    baseURL: stockTransportURL,
-                    providerCredential: providerBundle,
-                    controller: providerController,
-                    connectionMode: stockTransportMode
-                )
-                _ = try await probe.status()
             } else {
-                let probe = RestClient(
+                guard let probe = restClient(
                     baseURL: stockTransportURL,
-                    token: trimmedToken,
-                    connectionMode: stockTransportMode
-                )
+                    authMode: authMode,
+                    token: trimmedToken
+                ) else {
+                    throw RestError.network("Missing gateway credential")
+                }
                 _ = try await probe.status()
             }
             #else
-            let probe: RestClient
-            if let providerBundle, let providerController {
-                probe = RestClient(
-                    baseURL: stockTransportURL,
-                    providerCredential: providerBundle,
-                    controller: providerController,
-                    connectionMode: stockTransportMode
-                )
-            } else {
-                probe = RestClient(
-                    baseURL: stockTransportURL,
-                    token: trimmedToken,
-                    connectionMode: stockTransportMode
-                )
+            guard let probe = restClient(
+                baseURL: stockTransportURL,
+                authMode: authMode,
+                token: trimmedToken
+            ) else {
+                throw RestError.network("Missing gateway credential")
             }
             _ = try await probe.status()
             #endif
         } catch {
             guard isCurrentGeneration(generation) else { return nil }
-            if Self.requiresRepair(error) {
+            if Self.isAuthFailure(error) {
                 reauthRequired = true
                 requireTransportReauthentication()
                 phase = .needsSetup
-                return error is NativeCredentialError
-                    ? (error as? LocalizedError)?.errorDescription ?? Self.reauthMessage
-                    : Self.reauthMessage
+                return Self.reauthMessage
             }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
@@ -1590,34 +1490,14 @@ final class ConnectionStore {
 
         do {
             beginTransportAttempt()
-            if let providerController {
-                let ticket = try await providerController.webSocketTicket()
-                guard isCurrentGeneration(generation) else { return nil }
-                try await client.connect(
-                    baseURL: stockTransportURL,
-                    ticket: ticket,
-                    mode: stockTransportMode
-                )
-            } else if let connectRPC {
-                try await connectRPC(stockTransportURL, trimmedToken, stockTransportMode)
-            } else {
-                try await client.connect(
-                    baseURL: stockTransportURL,
-                    token: trimmedToken,
-                    mode: stockTransportMode
-                )
-            }
+            try await connectGateway(
+                baseURL: stockTransportURL,
+                authMode: authMode,
+                token: trimmedToken
+            )
         } catch {
             guard isCurrentGeneration(generation) else { return nil }
             markTransportUnavailable()
-            if Self.requiresRepair(error) {
-                reauthRequired = true
-                requireTransportReauthentication()
-                phase = .needsSetup
-                return error is NativeCredentialError
-                    ? (error as? LocalizedError)?.errorDescription ?? Self.reauthMessage
-                    : Self.reauthMessage
-            }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
             return message
@@ -1643,15 +1523,14 @@ final class ConnectionStore {
 
         // Persist only after a verified connection.
         serverURLString = trimmedURL
-        currentToken = trimmedToken
-        nativeCredentialController = providerController
-        providerCredentialSnapshot = providerBundle
+        activeAuthMode = authMode
+        currentToken = authMode == .token ? trimmedToken : nil
         UserDefaults.standard.set(trimmedURL, forKey: DefaultsKeys.serverURL)
-        if providerBundle == nil {
-            try? KeychainService.saveSharedCredentialReplacingProvider(
-                trimmedToken,
-                server: trimmedURL
-            )
+        UserDefaults.standard.set(authMode.rawValue, forKey: DefaultsKeys.gatewayAuthMode)
+        if authMode == .token, let trimmedToken {
+            try? KeychainService.saveToken(trimmedToken, server: trimmedURL)
+        } else {
+            KeychainService.deleteToken(server: trimmedURL)
         }
 
         // Preserve legacy v2 QR identity only for safe reconciliation of cleanup
@@ -1820,14 +1699,11 @@ final class ConnectionStore {
             }
         }
         // The initial slice is deliberately provisional. Reconcile the normal
-        // compression-aware recent snapshot off the reveal path, then warm its
-        // transcripts. The same task also recovers when the 8s fallback cancelled
-        // the first-paint request.
+        // compression-aware recent snapshot off the reveal path. The same task
+        // also recovers when the 8s fallback cancelled the first-paint request.
         Task { [weak self] in
             guard let self, self.isActiveGeneration(generation) else { return }
             await self.sessionStore.refresh()
-            guard self.isActiveGeneration(generation) else { return }
-            self.sessionStore.prefetchRecentTranscripts()
         }
         // Hygiene (WhatsApp bar): run the daily-throttled eviction sweep so the
         // cache never grows unbounded. Self-throttled to once/24h in CacheStore.
@@ -1931,9 +1807,6 @@ final class ConnectionStore {
         activeModelName = nil
         // Clear the per-session hot-swap state so the next session starts clean.
         clearSessionState()
-        // CACHE-FIRST coverage (WhatsApp bar): stop any paced background prefetch
-        // so it never outlives the connection it ran under.
-        sessionStore.cancelPrefetch()
         // Finalize any in-flight stream explicitly and SYNCHRONOUSLY (R1
         // #9/#42), before the teardown await opens a suspension window. The
         // live state observer will also see the `.closed` transition below and
@@ -1977,7 +1850,7 @@ final class ConnectionStore {
            !target.isEmpty {
             return true
         }
-        return KeychainService.loadCredential(server: server) != nil
+        return KeychainService.loadToken(server: server) != nil
     }
 
     /// Apply a ``GatewayForgetCoordinator.Decision`` to the persisted tombstone.
@@ -2031,7 +1904,7 @@ final class ConnectionStore {
             // for the re-paired server remains, restore the URL so the cache-first
             // paint below binds the correct scope.
             if defaults.string(forKey: DefaultsKeys.serverURL) == nil,
-               KeychainService.loadCredential(server: tombstone.server) != nil {
+               KeychainService.loadToken(server: tombstone.server) != nil {
                 defaults.set(tombstone.server, forKey: DefaultsKeys.serverURL)
             }
             return false
@@ -2084,11 +1957,17 @@ final class ConnectionStore {
             defaults.set(data, forKey: DefaultsKeys.gatewayCleanupTombstone)
         }
         var remoteFailed = false
-        do { try await remoteCleanup?() } catch { remoteFailed = true }
+        do {
+            if let remoteCleanup {
+                try await remoteCleanup()
+            } else if activeAuthMode == .session {
+                try await rest?.logoutSession()
+            }
+        } catch {
+            remoteFailed = true
+        }
         guard isCurrentGeneration(generation) else { return }
         await stopLiveWork(returningTo: nil, clearSpotlight: true, generation: generation)
-        guard isCurrentGeneration(generation) else { return }
-        await nativeCredentialController?.retire()
         guard isCurrentGeneration(generation) else { return }
         sessionStore.removeForgottenGatewayState()
         // Forget is a privacy erase: the last-viewed transcript stays resident in
@@ -2105,6 +1984,7 @@ final class ConnectionStore {
         await AttachmentBlobCache.shared.clearAll()
         LiveActivityManager.shared.end()
         defaults.removeObject(forKey: DefaultsKeys.serverURL)
+        defaults.removeObject(forKey: DefaultsKeys.gatewayAuthMode)
         defaults.removeObject(forKey: DefaultsKeys.connectionOffline)
         defaults.removeObject(forKey: DefaultsKeys.serverCapabilities)
         defaults.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
@@ -2113,11 +1993,14 @@ final class ConnectionStore {
         defaults.removeObject(forKey: DefaultsKeys.pushLastRegistrationScope)
         defaults.removeObject(forKey: DefaultsKeys.pushRegistrationHealthy)
         DefaultsKeys.setDeviceId(nil, server: server)
-        KeychainService.deleteCredentials(server: server)
+        KeychainService.deleteToken(server: server)
+        if let url = URL(string: server),
+           let cookies = HTTPCookieStorage.shared.cookies(for: url) {
+            cookies.forEach(HTTPCookieStorage.shared.deleteCookie)
+        }
         serverURLString = ""
         currentToken = nil
-        nativeCredentialController = nil
-        providerCredentialSnapshot = nil
+        activeAuthMode = .token
         if remoteFailed {
             if let data = try? JSONEncoder().encode(GatewayCleanupTombstone(
                 server: server, deviceId: deviceId, remoteRetryNeeded: true
@@ -2189,24 +2072,8 @@ final class ConnectionStore {
         // user just left can't re-claim a turn or mutate store state
         // (ABH-52 judge round).
         guard isActiveGeneration(generation) else { return }
-        // ABH-46 item 8: a frame carrying `broadcast_gap` means the gateway's
-        // bounded per-client broadcast queue dropped frames before this one
-        // (F3 overflow policy, ws.py:253). The live stream has a hole, so
-        // reconcile: REST-backfill the active transcript (authoritative) and
-        // refresh the drawer so list state catches up too. Runs alongside
-        // normal routing — the carrying frame itself is still applied below.
-        if let gap = event.broadcastGap, gap > 0 {
-            Task {
-                guard self.isActiveGeneration(generation) else { return }
-                await self.chatStore.backfill()
-                guard self.isActiveGeneration(generation) else { return }
-                await self.sessionStore.refresh()
-                guard self.isActiveGeneration(generation) else { return }
-            }
-        }
         switch event.type {
         case .gatewayReady:
-            applyGatewayReadyCapabilities(event.payload)
             Task {
                 guard self.isActiveGeneration(generation) else { return }
                 await self.sessionStore.refresh()
@@ -2222,18 +2089,15 @@ final class ConnectionStore {
              .error,
              // F4A-A2: subagent delegation frames were previously dropped to
              // `.unknown` at this whitelist (one of the THREE drop layers). They
-             // carry the parent runtime's `session_id` (+ `stored_session_id` on
-             // broadcast frames), so they stamp activity and route through the
+             // carry the parent runtime's `session_id`, so they stamp activity and route through the
              // same ownership gate as message/tool frames.
              .subagentStart, .subagentThinking, .subagentTool,
              .subagentProgress, .subagentComplete,
-             // F4A-A2: secure prompts. These are session-local (the gateway does
-             // not broadcast-mirror them), carry the requesting runtime's
+             // F4A-A2: secure prompts. These are session-local and carry the requesting runtime's
              // `session_id`, and drive ChatStore's transient secure-prompt state.
              .sudoRequest, .secretRequest:
             // The first observed subagent frame proves the patched gateway emits
-            // delegation events (E1 passive capability signal — mirror
-            // `noteBroadcastObserved`). Done here, at the routing source, before
+            // delegation events (E1 passive capability signal). Done here, at the routing source, before
             // ownership classification, so the inspector affordance can appear.
             switch event.type {
             case .subagentStart, .subagentThinking, .subagentTool,
@@ -2243,9 +2107,8 @@ final class ConnectionStore {
                 break
             }
             // Stamp the live-activity registry so the drawer can pulse a row
-            // whose conversation just moved (this device or a broadcasting
-            // client). Prefer the frame's stored id (present on broadcast /
-            // mirror frames); otherwise, for our own active runtime turn, use
+            // whose conversation just moved. Prefer the frame's stored id;
+            // otherwise, for our own active runtime turn, use
             // the active stored id. Stamping before `handle` is harmless — it
             // only feeds the drawer's dot and never gates transcript routing.
             stampActivity(for: event)
@@ -2262,8 +2125,8 @@ final class ConnectionStore {
                 // top of the drawer the instant a turn starts/finishes — the
                 // server only advances lastActive on completion, so without this
                 // the row sits in its old slot until a refresh round-trips. Use
-                // the broadcast frame's stored id (foreign turns) or, for our own
-                // active turn, the active stored id. Unknown ids no-op here and
+                // the frame's stored id or, for our own active turn, the active
+                // stored id. Unknown ids no-op here and
                 // are picked up by the debounced refresh below (covers a brand-new
                 // remote session's first message).
                 let activityStoredId = event.storedSessionId
@@ -2302,7 +2165,7 @@ final class ConnectionStore {
                 break
             }
             chatStore.handle(event: event)
-            // The inbox accumulates broadcast approval/clarify prompts across
+            // The inbox accumulates approval/clarify prompts across
             // every session and expires them on message.complete. It ignores
             // all other event types, so forwarding here is a no-op for them.
             // Routed AFTER `chatStore.handle` so the active-session chat
@@ -2346,14 +2209,11 @@ final class ConnectionStore {
     }
 
     /// Resolve the *stored* session id a streaming frame belongs to and stamp the
-    /// session store's live-activity registry. Broadcast/mirror frames carry
+    /// session store's live-activity registry. Frames may carry
     /// `stored_session_id` directly; for a frame on our own active runtime turn
     /// (no stored id on the wire) we attribute it to the active stored session.
     private func stampActivity(for event: GatewayEvent) {
         if let stored = event.storedSessionId, !stored.isEmpty {
-            // A frame carrying stored_session_id proves broadcast enrichment is
-            // live on this gateway (E1: the broadcast capability is passive).
-            capabilities.noteBroadcastObserved()
             sessionStore.noteActivity(storedSessionId: stored)
         } else if let sid = event.sessionId,
                   sid == sessionStore.activeRuntimeId,
@@ -2615,7 +2475,7 @@ final class ConnectionStore {
                 guard !Task.isCancelled, self.isActiveGeneration(generation) else { return }
 
                 guard let url = URL(string: self.serverURLString),
-                      let token = self.currentToken else {
+                      self.activeAuthMode == .session || self.currentToken != nil else {
                     // Config vanished mid-loop (e.g. a disconnect raced the
                     // backoff sleep). Route to setup WITH `hasConnected`
                     // cleared — leaving it true would strand the user on the
@@ -2628,29 +2488,14 @@ final class ConnectionStore {
                     self.reconnectTask = nil
                     return
                 }
-                let stockTransportURL = self.stockProxyURL(forGateway: url)
-                let stockTransportMode = self.stockProxyWebSocketMode(forGateway: url)
-
+                let stockTransportURL = url
                 do {
                     self.beginTransportAttempt()
-                    if let credentials = self.nativeCredentialController {
-                        let ticket = try await credentials.webSocketTicket()
-                        guard !Task.isCancelled,
-                              self.isActiveGeneration(generation) else { return }
-                        try await self.client.connect(
-                            baseURL: stockTransportURL,
-                            ticket: ticket,
-                            mode: stockTransportMode
-                        )
-                    } else if let hook = self.connectRPC {
-                        try await hook(stockTransportURL, token, stockTransportMode)
-                    } else {
-                        try await self.client.connect(
-                            baseURL: stockTransportURL,
-                            token: token,
-                            mode: stockTransportMode
-                        )
-                    }
+                    try await self.connectGateway(
+                        baseURL: stockTransportURL,
+                        authMode: self.activeAuthMode,
+                        token: self.currentToken
+                    )
                     guard !Task.isCancelled,
                           self.isActiveGeneration(generation) else { return }
                     // End grace immediately on the successful connect, BEFORE
@@ -2706,7 +2551,7 @@ final class ConnectionStore {
                     // rejects repeatedly".)
                     self.consecutiveReconnectFailures += 1
                     if self.consecutiveReconnectFailures >= Self.authReprobeThreshold,
-                       await self.probeIsAuthRevoked(url: url, token: token) {
+                       await self.probeIsAuthRevoked(url: url) {
                         guard !Task.isCancelled,
                               self.isActiveGeneration(generation) else { return }
                         // A hard auth revocation must never be swallowed by
@@ -2735,30 +2580,20 @@ final class ConnectionStore {
     /// outcome (success, network error, other status) returns `false` so the
     /// reconnect loop keeps retrying rather than dumping the user to re-pair on a
     /// transient outage.
-    private func probeIsAuthRevoked(url: URL, token: String) async -> Bool {
+    private func probeIsAuthRevoked(url: URL) async -> Bool {
         #if DEBUG
         if let hook = probeIsAuthRevokedRPC { return await hook() }
         #endif
         do {
-            let baseURL = stockProxyURL(forGateway: url)
-            let mode = stockProxyWebSocketMode(forGateway: url)
-            if let providerCredentialSnapshot, let nativeCredentialController {
-                _ = try await RestClient(
-                    baseURL: baseURL,
-                    providerCredential: providerCredentialSnapshot,
-                    controller: nativeCredentialController,
-                    connectionMode: mode
-                ).status()
-            } else {
-                _ = try await RestClient(
-                    baseURL: baseURL,
-                    token: token,
-                    connectionMode: mode
-                ).status()
-            }
+            guard let rest = restClient(
+                baseURL: url,
+                authMode: activeAuthMode,
+                token: currentToken
+            ) else { return true }
+            _ = try await rest.status()
             return false
         } catch {
-            return Self.requiresRepair(error)
+            return Self.isAuthFailure(error)
         }
     }
 
@@ -2784,10 +2619,6 @@ final class ConnectionStore {
             return code == 401 || code == 403
         }
         return false
-    }
-
-    private static func requiresRepair(_ error: Error) -> Bool {
-        isAuthFailure(error) || error is NativeCredentialError
     }
 
     /// The user-facing message returned to a configure caller when the token is
@@ -2838,6 +2669,7 @@ final class ConnectionStore {
         let generation = advanceConnectionGeneration()
         serverURLString = serverURL
         currentToken = token
+        activeAuthMode = .token
         hasConnected = true
         reauthRequired = false
         phase = .connected
@@ -2854,6 +2686,7 @@ final class ConnectionStore {
         advanceConnectionGeneration()
         serverURLString = serverURL
         currentToken = token
+        activeAuthMode = .token
         hasConnected = true
         reauthRequired = false
         phase = .connected
@@ -2887,7 +2720,7 @@ final class ConnectionStore {
     static var deviceNameHint: String {
         #if canImport(UIKit)
         let name = UIDevice.current.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return name.isEmpty ? "iPhone" : String(name.prefix(128))
+        return name.isEmpty ? "iPhone" : name
         #else
         return "iPhone"
         #endif
@@ -2966,10 +2799,6 @@ final class ConnectionStore {
                 guard self.isActiveGeneration(generation) else { return }
             }
         }
-        // Re-resolve the running model — it may have changed while we were
-        // offline (another client switched it) (F0).
-        await refreshActiveModel(generation: generation)
-        guard isActiveGeneration(generation) else { return false }
         // A failed resume for the still-selected session means this reconnect
         // did not recover a usable chat and must retry. A nil result after the
         // selection changed is supersession instead: follow the latest intent
@@ -2977,31 +2806,33 @@ final class ConnectionStore {
         // treating the old A failure as B's failure.
         var selectedIdentity = sessionStore.activeScopedIdentity
         while let expectedIdentity = selectedIdentity {
+            let requiresRuntime = sessionStore.activeSessionRequiresRuntimeRecovery
             let resumedRuntime = await sessionStore.resumeActiveAfterReconnect()
             guard isActiveGeneration(generation) else { return false }
             if resumedRuntime != nil { break }
 
             let latestIdentity = sessionStore.activeScopedIdentity
+            if latestIdentity == expectedIdentity, !requiresRuntime { break }
             guard latestIdentity != expectedIdentity else { return false }
             selectedIdentity = latestIdentity
         }
         if sessionStore.activeStoredId != nil {
             await chatStore.backfill()
             guard isActiveGeneration(generation) else { return false }
-            // Flush the offline outbox now the transcript is current — but only
-            // with a live runtime session, or the queue would burn through with
-            // a "No active session" error (see QueueStore drain notes).
-            if sessionStore.activeRuntimeId != nil {
-                // ABH-465: the durable outbox drains itself — wake() schedules the
-                // flush without blocking reconnect (drain-in-line was the old queue).
-                queueStore?.wake()
-            }
+            // The durable outbox resolves or creates its own runtime destination.
+            // A passively-opened session intentionally has no active runtime, so
+            // gating this wake on one would strand prompts queued while offline.
+            queueStore?.wake()
         }
         await sessionStore.refresh()
         guard isActiveGeneration(generation) else { return false }
-        // CACHE-FIRST coverage (WhatsApp bar): re-warm the recent transcripts now
-        // the list is current again — covers sessions that moved while offline.
-        sessionStore.prefetchRecentTranscripts()
+        // `model.info` is the gateway default, not the selected session's model.
+        // Existing sessions get their truth from active_list / resume info above;
+        // only a session-less draft needs the global default refreshed.
+        if sessionStore.activeStoredId == nil {
+            await refreshActiveModel(generation: generation)
+            guard isActiveGeneration(generation) else { return false }
+        }
         return true
     }
 
@@ -3014,13 +2845,10 @@ final class ConnectionStore {
     /// IMMEDIATE reconnect attempt — the client must not sit in a multi-second
     /// backoff window while the user is staring at the screen. Then always
     /// backfill the transcript over REST to re-sync with other clients.
-    /// `.background`/`.inactive`: cancel the paced transcript prefetch (WhatsApp
-    /// bar) so it doesn't run against a socket iOS is about to kill; otherwise a
-    /// no-op — the socket may be killed and we recover on the next foreground.
+    /// `.background`/`.inactive`: record that the phone left the foreground; the
+    /// socket may be killed and we recover on the next foreground.
     func handleScenePhase(_ scenePhase: ScenePhase) {
         guard scenePhase == .active else {
-            // Leaving the foreground: stop any in-flight prefetch sweep.
-            sessionStore.cancelPrefetch()
             updatePhoneForeground(nil)
             return
         }

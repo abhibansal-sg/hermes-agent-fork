@@ -8,7 +8,6 @@ import Security
 /// non-throwing (a missing or unreadable item simply yields `nil`).
 enum KeychainService {
     private static let service = "ai.hermes.mobile"
-    private static let providerPrefix = "nativeProvider:"
 
     /// Persist `token` for `server`, replacing any existing value.
     /// - Throws: ``KeychainError/unexpectedStatus(_:)`` if the keychain rejects the write.
@@ -73,65 +72,6 @@ enum KeychainService {
             kSecAttrAccount as String: server,
         ]
         SecItemDelete(query as CFDictionary)
-    }
-
-    // MARK: - Stock native-session credential bundles
-
-    /// Commit a rotated access/refresh pair as one Keychain value. The old
-    /// per-server shared-token item is removed only after this write succeeds.
-    static func saveProviderCredential(
-        _ credential: ProviderCredentialBundle,
-        server: String
-    ) throws {
-        guard credential.isUsable else { throw KeychainError.encodingFailed }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data: Data
-        do {
-            data = try encoder.encode(credential)
-        } catch {
-            throw KeychainError.encodingFailed
-        }
-        try saveData(data, account: providerAccount(server))
-        deleteToken(server: server)
-    }
-
-    static func loadProviderCredential(server: String) -> ProviderCredentialBundle? {
-        guard let data = loadData(account: providerAccount(server)),
-              let bundle = try? JSONDecoder().decode(ProviderCredentialBundle.self, from: data),
-              bundle.isUsable else { return nil }
-        return bundle
-    }
-
-    /// Provider sessions are preferred when present; legacy loopback/shared
-    /// tokens remain readable for old gateways and existing installs.
-    static func loadCredential(server: String) -> StoredGatewayCredential? {
-        if let provider = loadProviderCredential(server: server) {
-            return .provider(provider)
-        }
-        guard let token = loadToken(server: server), !token.isEmpty else { return nil }
-        return .sharedToken(token)
-    }
-
-    static func deleteCredentials(server: String) {
-        deleteValue(account: providerAccount(server))
-        deleteToken(server: server)
-    }
-
-    /// Commit a verified legacy/shared credential before removing any stale
-    /// provider bundle. This mirrors provider migration ordering in reverse:
-    /// there is always at least one durable credential if the process stops
-    /// between the two operations.
-    static func saveSharedCredentialReplacingProvider(
-        _ token: String,
-        server: String
-    ) throws {
-        try saveToken(token, server: server)
-        deleteValue(account: providerAccount(server))
-    }
-
-    private static func providerAccount(_ server: String) -> String {
-        providerPrefix + server
     }
 
     // MARK: - Transient provider-key storage (ABH-183)

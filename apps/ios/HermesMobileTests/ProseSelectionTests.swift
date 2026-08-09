@@ -83,11 +83,22 @@ final class ProseSelectionTests: XCTestCase {
             textView.attributedText.string.hasSuffix(fixture.expectedVisibleTail),
             "the mounted selection surface must retain the physical-device fixture's final sentence"
         )
+        XCTAssertTrue(
+            textView.attributedText.string.contains("10.\tFor R2 work"),
+            "the double-digit list item must retain its body, not only its marker"
+        )
         XCTAssertGreaterThan(
             textView.bounds.height,
             0,
             "the complete long document must receive a non-zero measured height"
         )
+        if let fragment = layoutManager.textLayoutFragment(for: tailLocation) {
+            XCTAssertLessThanOrEqual(
+                fragment.layoutFragmentFrame.maxY,
+                proseView.bounds.height + 1,
+                "the final fragment must be inside the mounted view's measured frame, not merely realized outside a clipped viewport"
+            )
+        }
     }
 
     /// A settled assistant message of TWO paragraphs must mount exactly ONE
@@ -421,6 +432,56 @@ final class ProseSelectionTests: XCTestCase {
         }
         XCTAssertEqual(updated.selectedRange, word,
                        "equal-content re-renders must never yank an in-progress selection")
+    }
+
+    func testContainerRelayoutsWhenOrderedListGrowsAfterMount() throws {
+        func prose(_ body: String) throws -> NSAttributedString {
+            let pieces = ProseFlowBuilder.pieces(
+                body: body,
+                style: makeStyle(),
+                linkColor: .blue
+            )
+            guard case .prose(let attr) = pieces.first else {
+                throw NSError(domain: "ProseSelectionTests", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "expected prose piece"])
+            }
+            return attr
+        }
+
+        let prefix = try prose("9. ninth item is already visible\n10." + " ")
+        let completed = try prose("""
+        9. ninth item is already visible
+        10. tenth item now has the complete sentence that used to be hidden
+        11. eleventh item remains visible after the growing list
+        """)
+        let controller = UIHostingController(
+            rootView: ProseSelectionContainer(text: prefix)
+                .frame(width: 360, alignment: .topLeading)
+        )
+        controller.view.frame = CGRect(x: 0, y: 0, width: 360, height: 900)
+        if let window = attachToWindow(controller) { attachedWindows.append(window) }
+        pumpLayout(controller)
+        let first = try XCTUnwrap(allTextViews(in: controller.view).first as? ProseTextView)
+        let prefixHeight = first.intrinsicContentSize.height
+        let prefixFrameHeight = first.frame.height
+
+        controller.rootView = ProseSelectionContainer(text: completed)
+            .frame(width: 360, alignment: .topLeading)
+        pumpLayout(controller)
+        let updated = try XCTUnwrap(allTextViews(in: controller.view).first as? ProseTextView)
+
+        XCTAssertTrue(updated.attributedText.string.contains("10.\ttenth item now"),
+                      "the updated ordered-list body must reach the native text view")
+        XCTAssertGreaterThan(
+            updated.intrinsicContentSize.height,
+            prefixHeight,
+            "growing a streamed list must invalidate the existing container's measured height"
+        )
+        XCTAssertGreaterThan(
+            updated.frame.height,
+            prefixFrameHeight,
+            "the SwiftUI-hosted text view itself must grow; an intrinsic-height change that leaves the old frame in place still clips the list tail"
+        )
     }
 
     // MARK: - Opt-in on-screen evidence (word selection + handles)

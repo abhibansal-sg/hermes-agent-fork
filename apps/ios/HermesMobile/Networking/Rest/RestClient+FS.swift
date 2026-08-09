@@ -18,7 +18,8 @@ extension RestClient {
     func probeStockFSEndpoint() async -> UploadProbeResult {
         let request = makeRequest(path: "/api/fs/default-cwd", method: "GET")
         do {
-            let (data, response) = try await authorizedDataResponse(for: request)
+            let (data, response) = try await session.data(for: request)
+            guard let response = response as? HTTPURLResponse else { return .inconclusive }
             switch response.statusCode {
             case 200:
                 guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

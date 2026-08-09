@@ -214,6 +214,9 @@ from agent.tool_dispatch_helpers import (
     _paths_overlap,  # noqa: F401  # re-exported for tests that `from run_agent import _paths_overlap`
     _is_multimodal_tool_result,
     _multimodal_text_summary,
+    _validate_tool_result_persistence_content,
+    TOOL_RESULT_PERSISTENCE_CONTENT_KEY,
+    project_messages_for_durable_use,
     _append_subdir_hint_to_multimodal,  # noqa: F401  # re-exported for tests that `from run_agent import _append_subdir_hint_to_multimodal`
     _extract_file_mutation_targets,
     _extract_landed_file_mutation_paths,
@@ -697,7 +700,10 @@ class AIAgent:
 
         if old_session_id and previous_messages is not None and hasattr(engine, "on_session_end"):
             try:
-                engine.on_session_end(old_session_id, previous_messages)
+                engine.on_session_end(
+                    old_session_id,
+                    project_messages_for_durable_use(previous_messages),
+                )
             except Exception as exc:
                 logger.debug("context engine on_session_end during transition: %s", exc)
 
@@ -2213,8 +2219,17 @@ class AIAgent:
                     _row_api_content = content
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
-                # for cross-session replay.
-                if _is_multimodal_tool_result(content):
+                # for cross-session replay. An explicit validated override is
+                # the opt-in exception and is a complete replacement.
+                _tool_persistence_override = None
+                if role == "tool":
+                    _tool_persistence_override = _validate_tool_result_persistence_content(
+                        msg.get("tool_name") or msg.get("name"),
+                        msg.get(TOOL_RESULT_PERSISTENCE_CONTENT_KEY)
+                    )
+                if _tool_persistence_override is not None:
+                    content = _tool_persistence_override
+                elif _is_multimodal_tool_result(content):
                     content = _multimodal_text_summary(content)
                 elif isinstance(content, list):
                     # List of OpenAI-style content parts: strip images, keep text.
@@ -4140,7 +4155,7 @@ class AIAgent:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
-                    messages or [],
+                    project_messages_for_durable_use(messages or []),
                 )
             except Exception:
                 pass
@@ -4165,7 +4180,7 @@ class AIAgent:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
-                    messages or [],
+                    project_messages_for_durable_use(messages or []),
                 )
             except Exception:
                 pass
@@ -4218,7 +4233,7 @@ class AIAgent:
         try:
             sync_kwargs = {"session_id": self.session_id or ""}
             if messages is not None:
-                sync_kwargs["messages"] = messages
+                sync_kwargs["messages"] = project_messages_for_durable_use(messages)
             self._memory_manager.sync_all(
                 user_text,
                 response_text,

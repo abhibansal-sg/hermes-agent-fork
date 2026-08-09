@@ -46,6 +46,11 @@ from agent.turn_context import (
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
+from agent.memory_manager import build_memory_context_block
+from agent.tool_dispatch_helpers import (
+    TOOL_RESULT_PERSISTENCE_CONTENT_KEY,
+    project_messages_for_durable_use,
+)
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -1829,7 +1834,6 @@ def run_conversation(
 
         api_messages = []
         for idx, msg in enumerate(messages):
-
             # Structural clone, NOT msg.copy(): every in-place transform
             # below (canonicalize/repair, surrogate + non-ASCII sanitizers,
             # cache decoration) must be unable to reach the persisted
@@ -1856,6 +1860,7 @@ def run_conversation(
             # Bookkeeping, never a provider field — only the chat-completions
             # transport strips underscore keys, so drop it centrally here.
             api_msg.pop("_row_id", None)
+            api_msg.pop(TOOL_RESULT_PERSISTENCE_CONTENT_KEY, None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -2590,7 +2595,7 @@ def run_conversation(
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
                             user_message=original_user_message,
-                            conversation_history=list(messages),
+                            conversation_history=project_messages_for_durable_use(messages),
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
@@ -2598,9 +2603,11 @@ def run_conversation(
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
                             retry_count=retry_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
+                            request_messages=(
+                                project_messages_for_durable_use(request_messages)
+                                if isinstance(request_messages, list)
+                                else []
+                            ),
                             message_count=len(api_messages),
                             tool_count=len(agent.tools or []),
                             approx_input_tokens=approx_tokens,

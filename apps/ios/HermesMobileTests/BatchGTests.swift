@@ -63,7 +63,6 @@ final class BatchGTests: XCTestCase {
 
         let caps = ServerCapabilities()
         caps.noteSubagentObserved()
-        caps.noteBroadcastObserved()
         XCTAssertEqual(caps.subagentEvents, .available)
 
         await caps.probe(serverURL: url, rest: rest, force: true)
@@ -71,7 +70,6 @@ final class BatchGTests: XCTestCase {
         // Passive observations belonged to the PRE-restart server instance;
         // the forced fresh probe resets them to be re-learned live.
         XCTAssertEqual(caps.subagentEvents, .unknown)
-        XCTAssertEqual(caps.broadcast, .unknown)
     }
 
     // MARK: - #19 client half: readable chat-disabled close

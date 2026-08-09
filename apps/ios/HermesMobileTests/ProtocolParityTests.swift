@@ -310,6 +310,9 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(sessions.sessionBinding?.runtimeID, "runtime-desktop")
         XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
         XCTAssertEqual(connection.sessionModelRaw, "watch-model")
+        XCTAssertTrue(chat.isStreaming, "a stock active-list working status must restore the live Stop state immediately")
+        XCTAssertFalse(chat.localTurnInFlight)
+        XCTAssertEqual(chat.interruptTarget, "runtime-desktop")
 
         chat.handle(event: GatewayEvent(params: .object([
             "type": .string("message.start"),
@@ -317,8 +320,29 @@ final class ProtocolParityTests: XCTestCase {
             "stored_session_id": .string("stored-desktop"),
             "payload": .object([:]),
         ]))!)
-        XCTAssertEqual(chat.foreignMirrorTelemetry.foreignAdopted, 1)
+        XCTAssertTrue(chat.isStreaming, "a repeated live start must preserve the adopted watch")
+        XCTAssertEqual(chat.interruptTarget, "runtime-desktop")
         XCTAssertFalse(chat.localTurnInFlight)
+    }
+
+    func testStoredSessionListPreservesItsActualModelIdentity() throws {
+        let json = JSONValue.object([
+            "id": .string("stored-model"),
+            "title": .string("Model truth"),
+            "model": .string("qwen3.8-max"),
+            "billing_provider": .string("openrouter"),
+        ])
+
+        let summary = try XCTUnwrap(json.decoded(as: SessionSummary.self))
+        XCTAssertEqual(summary.model, "qwen3.8-max")
+        XCTAssertEqual(summary.billingProvider, "openrouter")
+    }
+
+    func testStockActiveStatusesMapToRunningWithoutNewVocabulary() {
+        XCTAssertFalse(SessionActiveItem.Status.idle.isRunning)
+        XCTAssertTrue(SessionActiveItem.Status.starting.isRunning)
+        XCTAssertTrue(SessionActiveItem.Status.waiting.isRunning)
+        XCTAssertTrue(SessionActiveItem.Status.working.isRunning)
     }
 
     func testPassiveOpenUsesStockWatchSnapshotWithoutResume() async {
@@ -428,7 +452,7 @@ final class ProtocolParityTests: XCTestCase {
         await sessions.closeActive()
     }
 
-    func testOpenResumesOnceWhenSessionIsNotLive() async {
+    func testPassiveOpenOfIdleSessionDoesNotResume() async {
         let chat = ChatStore()
         let sessions = SessionStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
@@ -449,14 +473,199 @@ final class ProtocolParityTests: XCTestCase {
         sessions.open(SessionSummary(
             id: "stored-idle", title: "Idle", preview: nil,
             startedAt: 1, messageCount: 1, source: nil,
-            lastActive: 1, cwd: nil
+            lastActive: 1, cwd: nil,
+            model: "stored-model", billingProvider: "openrouter"
         ))
         await sessions.waitForPendingOpenForTesting()
 
-        XCTAssertEqual(resumeCalls, 1)
-        XCTAssertEqual(sessions.sessionBinding?.runtimeID, "runtime-phone")
+        XCTAssertEqual(resumeCalls, 0)
+        XCTAssertEqual(sessions.sessionBinding?.storedID, "stored-idle")
+        XCTAssertNil(sessions.sessionBinding?.runtimeID)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertNil(sessions.sessionBinding?.generation)
+        XCTAssertEqual(connection.sessionModelRaw, "stored-model")
+        XCTAssertNil(
+            connection.sessionProvider,
+            "billing_provider is accounting metadata, not runtime provider truth"
+        )
+        XCTAssertFalse(chat.isStreaming)
+
+        let runtime = await sessions.ensureActiveRuntime()
+        XCTAssertEqual(resumeCalls, 1, "the first drive action owns the resume edge")
+        XCTAssertEqual(runtime, "runtime-phone")
         XCTAssertEqual(sessions.sessionBinding?.mode, .drive)
-        XCTAssertEqual(sessions.sessionBinding?.generation, 0)
+    }
+
+    func testReconnectToWorkingStockSessionRestoresWatchState() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("an already-live session must stay on the read-only watch path")
+            throw GatewayError.notConnected
+        }
+        sessions.activeListRPC = {
+            SessionActiveListResult(sessions: [
+                SessionActiveItem(
+                    id: "runtime-working",
+                    sessionKey: "stored-working",
+                    status: .working,
+                    model: "gpt-5.6-sol"
+                ),
+            ])
+        }
+
+        sessions.open(SessionSummary(
+            id: "stored-working", title: "Working", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil,
+            model: "gpt-5.6-sol", billingProvider: "openai-codex"
+        ))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+
+        chat.handleConnectionDrop()
+        sessions.transportDidBecomeUnavailable()
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertNil(sessions.activeRuntimeId)
+
+        let runtime = await sessions.resumeActiveAfterReconnect()
+
+        XCTAssertEqual(runtime, "runtime-working")
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(chat.interruptTarget, "runtime-working")
+    }
+
+    func testVisibleIdleSessionObservesWorkingStateFromActiveList() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        var isWorking = false
+        sessions.activeListRPC = {
+            SessionActiveListResult(sessions: isWorking ? [
+                SessionActiveItem(
+                    id: "runtime-foreign",
+                    sessionKey: "stored-visible",
+                    status: .working,
+                    model: "gpt-5.6-sol"
+                ),
+            ] : [])
+        }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("foreground observation must never resume or steal an idle session")
+            throw GatewayError.notConnected
+        }
+        sessions.open(SessionSummary(
+            id: "stored-visible", title: "Visible", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil,
+            model: "gpt-5.6-sol", billingProvider: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertFalse(chat.isStreaming)
+
+        isWorking = true
+        await sessions.reconcileVisibleLiveStatus()
+
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertEqual(chat.interruptTarget, "runtime-foreign")
+    }
+
+    func testWatchOnlyWorkingSettlesOnceWhenActiveListBecomesIdle() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        var status: SessionActiveItem.Status = .working
+        var historyCalls = 0
+        sessions.activeListRPC = {
+            SessionActiveListResult(sessions: [
+                SessionActiveItem(
+                    id: self.activeRuntime,
+                    sessionKey: self.storedId,
+                    status: status,
+                    model: nil
+                )
+            ])
+        }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("watch-only observation must never resume or steal the session")
+            throw GatewayError.notConnected
+        }
+        chat.backfillFetch = { _ in
+            historyCalls += 1
+            return [
+                StoredMessage(role: "user", content: .string("desktop prompt")),
+                StoredMessage(role: "assistant", content: .string("desktop reply")),
+            ]
+        }
+
+        sessions.open(SessionSummary(
+            id: storedId, title: "Watched", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+
+        status = .idle
+        await sessions.reconcileVisibleLiveStatus()
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertEqual(historyCalls, 1)
+        XCTAssertTrue(chat.messages.contains { $0.text == "desktop reply" })
+
+        await sessions.reconcileVisibleLiveStatus()
+        XCTAssertEqual(historyCalls, 1, "the running-to-idle edge refreshes exactly once")
+    }
+
+    func testLocalWorkingSettlesWhenActiveListBecomesIdle() async {
+        let (chat, sessions) = makeStore()
+        _ = try? await sessions.beginPromptSubmission(runtimeID: activeRuntime)
+        var status: SessionActiveItem.Status = .working
+        var historyCalls = 0
+        sessions.activeListRPC = {
+            SessionActiveListResult(sessions: [
+                SessionActiveItem(
+                    id: self.activeRuntime,
+                    sessionKey: self.storedId,
+                    status: status,
+                    model: nil
+                )
+            ])
+        }
+        chat.backfillFetch = { _ in
+            historyCalls += 1
+            return [
+                StoredMessage(role: "user", content: .string("phone prompt")),
+                StoredMessage(role: "assistant", content: .string("phone reply")),
+            ]
+        }
+        chat.handle(event: localFrame(type: "message.start"))
+        XCTAssertTrue(chat.localTurnInFlight)
+        XCTAssertTrue(chat.isStreaming)
+
+        status = .idle
+        await sessions.reconcileVisibleLiveStatus()
+
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertFalse(chat.localTurnInFlight)
+        XCTAssertEqual(historyCalls, 1)
+        XCTAssertTrue(chat.messages.contains { $0.text == "phone reply" })
+
+        await sessions.reconcileVisibleLiveStatus()
+        XCTAssertEqual(historyCalls, 1, "idle polling must settle once")
     }
 
     func testSilentLocalTurnPreservesWorkingStockSessionWithoutHistoryFetch() async {
@@ -523,44 +732,6 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertFalse(chat.localTurnInFlight)
     }
 
-    // MARK: - Item 8: broadcast_gap parsing
-
-    func testBroadcastGapParsesFromFrameTopLevel() throws {
-        // The gateway writes broadcast_gap at the FRAME TOP LEVEL (a sibling of
-        // `method`/`params`): tui_gateway/ws.py — obj = {**obj, "broadcast_gap":
-        // dropped}. Exercise the REAL wire path end to end: decode a full
-        // JSON-RPC frame via JSONRPCInboundFrame (which must surface the gap at
-        // the top level), then construct the event exactly as the client's
-        // `handleEvent` does. A prior version of this test injected broadcast_gap
-        // INSIDE `params`, green-lighting the old buggy decode against input that
-        // never occurs on the wire.
-        // Decode raw frame bytes with the SAME plain JSONDecoder the socket
-        // handler uses (HermesGatewayClient.decoder / handleEvent), so this
-        // exercises the real wire path. (A JSONValue round-trip would apply
-        // .convertFromSnakeCase and mask the top-level decode.)
-        let frameData = Data("""
-        {"jsonrpc":"2.0","method":"event","broadcast_gap":7,\
-        "params":{"type":"message.delta","session_id":"rt9",\
-        "payload":{"text":"x"}}}
-        """.utf8)
-        let frame = try XCTUnwrap(
-            try? JSONDecoder().decode(JSONRPCInboundFrame.self, from: frameData))
-        XCTAssertEqual(frame.broadcastGap, 7, "the gap must decode at the frame top level")
-        let event = try XCTUnwrap(
-            GatewayEvent(params: frame.params ?? .null, broadcastGap: frame.broadcastGap))
-        XCTAssertEqual(event.broadcastGap, 7)
-    }
-
-    func testBroadcastGapAbsentOrZeroIsNil() throws {
-        let absent = try XCTUnwrap(GatewayEvent(params: .object([
-            "type": .string("message.delta"), "payload": .null])))
-        XCTAssertNil(absent.broadcastGap)
-        let zero = try XCTUnwrap(GatewayEvent(params: .object([
-            "type": .string("message.delta"),
-            "broadcast_gap": .number(0), "payload": .null])))
-        XCTAssertNil(zero.broadcastGap)
-    }
-
     // MARK: - Item 9: subagent failed/interrupted → error
 
     func testSubagentTerminalStatusMapping() {
@@ -617,44 +788,6 @@ final class ProtocolParityTests: XCTestCase {
     }
 
     // MARK: - Parts adoption review fixes (#1–#5, #7)
-
-    /// Review #7(a) + #5: the FOREIGN-mirrored live path must preserve
-    /// text→tool→text order too — the `flushBuffersImmediately()` at the top of
-    /// `handleToolStart` is what guarantees the pre-tool text is flushed into a
-    /// part before the tool part is created, on both the local and foreign
-    /// switches. The stash only tested the local path.
-    func testForeignMirroredPartsPreserveTextToolTextOrder() async throws {
-        let (chat, _) = makeStore()
-        let foreign = "rt-foreign"
-        // Adopt the foreign turn (no local turn in flight), then drive its live
-        // deltas: text → tool → text, all tagged with the open stored id.
-        chat.handle(event: foreignFrame(type: "message.start", runtime: foreign))
-        XCTAssertTrue(chat.isStreaming, "adopting a foreign start should begin streaming")
-        chat.handle(event: foreignFrame(
-            type: "message.delta", runtime: foreign,
-            payload: .object(["text": .string("Before tool. ")])))
-        chat.handle(event: foreignFrame(type: "tool.start", runtime: foreign, payload: .object([
-            "tool_id": .string("ft-order"), "name": .string("shell")])))
-        chat.handle(event: foreignFrame(type: "tool.complete", runtime: foreign, payload: .object([
-            "tool_id": .string("ft-order"), "name": .string("shell"),
-            "result": .object(["output": .string("ok")]), "duration_s": .number(0.1)])))
-        chat.handle(event: foreignFrame(
-            type: "message.delta", runtime: foreign,
-            payload: .object(["text": .string("After tool.")])))
-
-        await waitUntil { (chat.messages.last?.parts.count ?? 0) == 3 }
-
-        let message = try XCTUnwrap(chat.messages.last)
-        let parts = message.parts
-        XCTAssertEqual(parts.count, 3, "foreign mirror keeps text→tool→text as three ordered parts")
-        guard parts.count == 3 else { return }
-        guard case .text(_, let firstText) = parts[0] else { return XCTFail("expected leading text") }
-        XCTAssertEqual(firstText, "Before tool. ")
-        guard case .tools(_, let tools, _, _) = parts[1] else { return XCTFail("expected middle tool") }
-        XCTAssertEqual(tools.first?.id, "ft-order")
-        guard case .text(_, let secondText) = parts[2] else { return XCTFail("expected trailing text") }
-        XCTAssertEqual(secondText, "After tool.")
-    }
 
     /// Review #7(c): `message.complete` carrying authoritative
     /// text/reasoning/warning/usage must keep the LEGACY fields and the ordered
@@ -826,7 +959,7 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertNotNil(seeded.usage)
     }
 
-    /// Review #4: a mirrored turn that received text→tool but whose authoritative
+    /// Review #4: a reconciled turn that received text→tool but whose authoritative
     /// final text EXTENDS into post-tool prose must keep the new prose AFTER the
     /// tool, not float it above by merging into the pre-tool text part.
     func testApplyFinalTextKeepsPostToolProseAfterTool() {
@@ -980,7 +1113,7 @@ final class ProtocolParityTests: XCTestCase {
         )
     }
 
-    // MARK: - Harness (mirrors ChatStoreForeignMirrorTests.makeStore)
+    // MARK: - Harness
 
     /// Poll a @MainActor condition until it holds or `timeout` elapses. Replaces
     /// fixed `Task.sleep(120ms)` waits that race the streaming debounce flush
@@ -1022,15 +1155,4 @@ final class ProtocolParityTests: XCTestCase {
         ]))!
     }
 
-    /// A broadcast frame from a FOREIGN runtime, tagged with the stored id the
-    /// app has open (so it passes the correlation gate and is adopted as a
-    /// mirror). Mirrors `ChatStoreForeignMirrorTests.foreignFrame`.
-    private func foreignFrame(type: String, runtime: String, payload: JSONValue = .null) -> GatewayEvent {
-        GatewayEvent(params: .object([
-            "type": .string(type),
-            "session_id": .string(runtime),
-            "stored_session_id": .string(storedId),
-            "payload": payload,
-        ]))!
-    }
 }

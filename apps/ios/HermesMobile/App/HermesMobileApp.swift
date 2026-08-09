@@ -59,6 +59,12 @@ final class StateFlushCoordinator {
         while let task = flushTask { await task.value }
     }
 
+    func enterForeground() async {
+        let pending = flushTask
+        pending?.cancel()
+        await pending?.value
+    }
+
     private func expire() {
         guard identifier != .invalid else { return }
         flushTask?.cancel()
@@ -240,10 +246,10 @@ struct HermesMobileApp: App {
                         }
                     }
                     #if DEBUG
-                    // Inc-3b UITest seam: HERMES_UITEST_DEEPLINK fires a deep link
+                    // UITest seam: HERMES_UITEST_DEEPLINK fires a deep link
                     // immediately after bootstrap, exactly as if onOpenURL had been
                     // called with that URL. Allows the UITest harness to trigger deep
-                    // links (including manual_token pair payloads) from the test
+                    // links from the test
                     // runner without relying on xcrun simctl (not available inside
                     // the iOS test runner process). Gated on DEBUG so it is never
                     // compiled into Release.
@@ -258,9 +264,6 @@ struct HermesMobileApp: App {
                             inbox: environment.inboxStore,
                             requestPairConfirmation: { payload in
                                 deepLink.requestPairConfirmation(payload)
-                            },
-                            requestManualTokenPair: { payload in
-                                deepLink.requestManualTokenPair(payload)
                             }
                         )
                     }
@@ -281,7 +284,10 @@ struct HermesMobileApp: App {
                     environment.connectionStore.handleScenePhase(newPhase)
                     environment.appLock.handleScenePhase(newPhase)
                     if newPhase == .active {
-                        environment.queueStore.resumeFromBackground()
+                        Task {
+                            await environment.stateFlushCoordinator.enterForeground()
+                            environment.queueStore.resumeFromBackground()
+                        }
                         Task { await AttachmentBlobCache.shared.respondToLowAvailableCapacity() }
                     }
                     // On foreground: apply parked App Intents, surface/drain the
@@ -333,12 +339,6 @@ struct HermesMobileApp: App {
                         // inside `route`, never reaching this seam).
                         requestPairConfirmation: { payload in
                             deepLink.requestPairConfirmation(payload)
-                        },
-                        // Inc-3b: Local-desktop pairing when the token cannot be
-                        // recovered by the plugin (manual_token=true). Stash the
-                        // payload and let ManualTokenPromptView ask the user.
-                        requestManualTokenPair: { payload in
-                            deepLink.requestManualTokenPair(payload)
                         }
                     )
                 }

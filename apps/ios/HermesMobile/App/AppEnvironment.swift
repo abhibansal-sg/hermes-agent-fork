@@ -118,6 +118,9 @@ final class AppEnvironment {
                     // after the live socket completed `gateway.ready`.
                     return connectionStore.isTransportReady
                 },
+                canRetryAmbiguousSubmit: { [weak chatStore] in
+                    chatStore?.promptReceiptsObserved == true
+                },
                 busySessionID: { [weak chatStore] in
                     // Per-session serialization (Lane C fix 1): a turn streaming —
                     // or a local turn in flight — belongs to the ACTIVE session.
@@ -135,7 +138,8 @@ final class AppEnvironment {
                     return try await sessionStore.createOutboxDestination(job: job)
                 },
                 resolveRuntime: { [weak sessionStore] storedID in
-                    return await sessionStore?.runtimeForOutboxDestination(storedID)
+                    guard let sessionStore else { throw GatewayError.notConnected }
+                    return try await sessionStore.runtimeForOutboxDestination(storedID)
                 },
                 uploadAsset: { [weak connectionStore, weak workRepository] job, snapshot in
                     guard let connectionStore,
@@ -144,7 +148,7 @@ final class AppEnvironment {
                     }
                     let client = connectionStore.client
                     let data = try await workRepository.assetData(snapshot.asset)
-                    guard let runtimeID = await sessionStore.runtimeForOutboxDestination(
+                    guard let runtimeID = try await sessionStore.runtimeForOutboxDestination(
                         job.destinationSessionID ?? job.storedSessionID ?? ""
                     ) else { throw OutboxProcessorError.destinationUnavailable }
                     let contentBase64 = await Task.detached(priority: .userInitiated) {
@@ -170,9 +174,7 @@ final class AppEnvironment {
                         remotePath: remotePath
                     )
                 },
-                willSubmit: { [weak chatStore] job, paths in
-                    chatStore?.prepareOutboxSubmission(job: job, remotePaths: paths)
-                },
+                willSubmit: { _, _ in },
                 submit: { [weak chatStore] job, runtimeID, paths in
                     guard let chatStore else { throw GatewayError.notConnected }
                     return try await chatStore.submitOutboxPrompt(
@@ -240,8 +242,8 @@ final class AppEnvironment {
                 sessionStore?.projectsCacheScope
             })
         }
-        // The inbox accumulates broadcast approval/clarify prompts and answers
-        // them against each prompt's own runtime via the gateway client.
+        // The inbox combines the pending-attention snapshot with live prompt
+        // events and answers each item against its own runtime.
         inboxStore.attach(connection: connectionStore)
         inboxStore.onCommittedSnapshot = { [weak chatStore, weak inboxStore] snapshot in
             if let items = inboxStore?.pendingItems {
@@ -364,14 +366,15 @@ final class AppEnvironment {
             loadPairing: {
                 let defaults = UserDefaults.standard
                 guard let url = defaults.string(forKey: DefaultsKeys.serverURL)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !url.isEmpty,
-                      let credential = KeychainService.loadCredential(server: url) else { return nil }
+                      !url.isEmpty else { return nil }
                 let token: String
-                switch credential {
-                case .sharedToken(let value): token = value
-                case .provider(let bundle): token = bundle.accessToken
+                if GatewayAuthMode.saved(defaults) == .session {
+                    token = ""
+                } else {
+                    guard let savedToken = KeychainService.loadToken(server: url),
+                          !savedToken.isEmpty else { return nil }
+                    token = savedToken
                 }
-                guard !token.isEmpty else { return nil }
                 let profile = defaults.string(forKey: DefaultsKeys.activeProfile) ?? DefaultsKeys.allProfilesScope
                 return BackgroundManifestScope(gatewayURL: url, scope: profile, token: token)
             },

@@ -9,7 +9,7 @@ import XCTest
 /// HERMES_TOKEN inside the app process). Skips gracefully when absent.
 ///
 /// Gateway rig (set up by the caller before running this suite):
-///   - HERMES_GATEWAY_BROADCAST=1, own token, port :9123, bound to 0.0.0.0
+///   - own token, port :9123, bound to 0.0.0.0
 ///   - /health returns 200 before tests run
 ///   - One seeded session row in the DB so the drawer is non-empty
 ///   - NEVER the live :9119 dashboard
@@ -26,7 +26,7 @@ final class RemoteURLModeUITests: XCTestCase {
     // MARK: - Test 1: Remote-URL mode reaches .connected via real host
 
     /// Connects directly via the dev-env path (HERMES_URL/HERMES_TOKEN),
-    /// which exercises the full `configure → WSURLBuilder.wsRequest(mode:) →
+    /// which exercises the full `configure → WSURLBuilder.wsRequest() →
     /// client.connect` chain with the mode derived from the persisted value.
     /// The pre-launch argument seeds `.remoteURL` so the transport omits the
     /// loopback Host override — the gateway's `0.0.0.0` bind accepts the real

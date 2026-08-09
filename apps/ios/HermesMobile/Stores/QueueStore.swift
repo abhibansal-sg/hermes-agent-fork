@@ -25,7 +25,7 @@ final class QueueStore {
             /// connection, sending, or needing a manual retry.
             var title: String {
                 switch self {
-                case .waiting: "Waiting for connection"
+                case .waiting: "Waiting to send"
                 case .uploading: "Uploading"
                 case .sending: "Sending"
                 case .sent: "Sent"
@@ -86,9 +86,11 @@ final class QueueStore {
             state = job.state
             errorMessage = job.lastErrorMessage
             isClaimed = job.leaseOwner != nil
-            switch job.lastErrorCode {
-            case "in_progress": displayState = .inProgress
-            case "indeterminate", "transport_ambiguous": displayState = .indeterminate
+            switch (job.lastErrorCode, job.state) {
+            case ("in_progress", _): displayState = .inProgress
+            case ("transport_ambiguous", .failed): displayState = .failed
+            case ("indeterminate", _), ("transport_ambiguous", _):
+                displayState = .indeterminate
             default:
                 switch job.state {
                 case .waitingForScope, .queued, .creatingDestination, .retryWait:
@@ -330,7 +332,9 @@ final class QueueStore {
         storedSessionId: String? = nil,
         assets: [WorkAssetInput] = [],
         newSession: Bool = false,
-        wake: Bool = false,
+        cwd: String? = nil,
+        modelSelectionJSON: String? = nil,
+        wake: Bool = true,
         clientMessageID: String? = nil
     ) async -> QueuedPrompt? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -349,6 +353,8 @@ final class QueueStore {
                 scope: scope,
                 intentKind: newSession ? .newSession : nil,
                 text: outgoing,
+                cwd: cwd,
+                modelSelectionJSON: modelSelectionJSON,
                 storedSessionID: storedSessionId
             )
             if let clientMessageID, let reused = UUID(uuidString: clientMessageID) {
@@ -414,8 +420,10 @@ final class QueueStore {
     }
 
     func retry(id: UUID) async {
-        guard (try? await repository.retryFailedJob(id: id.uuidString.lowercased())) != nil else { return }
-        processor?.wake()
+        do {
+            _ = try await repository.retryFailedJob(id: id.uuidString.lowercased())
+            processor?.wake()
+        } catch {}
     }
 
     /// "Resend" a stuck/failed transcript bubble (C1). Re-drives the EXISTING

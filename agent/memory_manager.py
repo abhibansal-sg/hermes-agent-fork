@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
+from agent.tool_dispatch_helpers import project_messages_for_durable_use
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -864,6 +865,7 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        messages = project_messages_for_durable_use(messages or [])
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -977,6 +979,7 @@ class MemoryManager:
         Returns combined text from providers to include in the compression
         summary prompt. Empty string if no provider contributes.
         """
+        messages = project_messages_for_durable_use(messages or [])
         parts = []
         for provider in self._providers:
             try:

@@ -39,11 +39,15 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
         ]))!
     }
 
-    private func storedMessage(role: String, text: String) -> StoredMessage {
-        StoredMessage(json: .object([
+    private func storedMessage(
+        role: String, text: String, wireId: Int? = nil
+    ) -> StoredMessage {
+        var json: [String: JSONValue] = [
             "role": .string(role),
             "content": .string(text),
-        ]))!
+        ]
+        if let wireId { json["id"] = .number(Double(wireId)) }
+        return StoredMessage(json: .object(json))!
     }
 
     private func beginLocalPartialTurn(_ chat: ChatStore) -> ChatMessage {
@@ -186,5 +190,108 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
         XCTAssertFalse(assistantRows.first?.isStreaming ?? true)
         XCTAssertEqual(warningTexts(in: assistantRows.first), ["Agent failed after reconnect"],
                        "a failed/warning-bearing resumed completion must keep its warning part instead of clearing it as stale")
+    }
+
+    func testAuthoritativeReconcilePersistsGapSnapshotWithoutReplacingLiveProjection() async {
+        var fetches = 0
+        let (chat, _) = makeStore { _ in
+            fetches += 1
+            return [
+                self.storedMessage(
+                    role: "user", text: "prompt before drop", wireId: 1
+                ),
+                self.storedMessage(
+                    role: "assistant", text: "persisted partial", wireId: 2
+                ),
+            ]
+        }
+        _ = beginLocalPartialTurn(chat)
+
+        await chat.reconcileAuthoritativeTranscript()
+
+        XCTAssertEqual(fetches, 1, "an authoritative checkpoint must not no-op while streaming")
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(
+            chat.messages.filter { $0.role == .assistant }.count,
+            1,
+            "the live projection stays in place while the authoritative snapshot is fetched"
+        )
+        XCTAssertTrue(
+            chat.messages.last?.text.contains("partial reply") == true,
+            "a gap reconcile must not replace a newer live bubble mid-turn"
+        )
+    }
+
+    func testLocalCompletionReconcilesOntoExistingBubbleWithoutDuplicate() async {
+        let fetched = expectation(description: "terminal authoritative transcript fetched")
+        let (chat, _) = makeStore { _ in
+            fetched.fulfill()
+            return [
+                self.storedMessage(
+                    role: "user", text: "prompt before drop", wireId: 1
+                ),
+                self.storedMessage(
+                    role: "assistant", text: "authoritative final", wireId: 2
+                ),
+            ]
+        }
+        let live = beginLocalPartialTurn(chat)
+
+        chat.handle(event: localFrame(
+            type: "message.complete",
+            payload: ["text": "frame final", "status": "complete"]
+        ))
+        await fulfillment(of: [fetched], timeout: 1)
+        for _ in 0..<5 { await Task.yield() }
+
+        let assistants = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(assistants.count, 1)
+        XCTAssertEqual(assistants.first?.id, live.id)
+        XCTAssertEqual(assistants.first?.text, "authoritative final")
+        XCTAssertFalse(chat.isStreaming)
+    }
+
+    func testColdWatchCompletionRetiresLiveTwinOfAlreadyPaintedAuthority() async {
+        let authoritative = [
+            storedMessage(role: "user", text: "cold-open prompt", wireId: 1),
+            storedMessage(role: "assistant", text: "cold-open answer", wireId: 2),
+        ]
+        let fetched = expectation(description: "watch terminal reconciled")
+        let (chat, _) = makeStore { _ in
+            fetched.fulfill()
+            return authoritative
+        }
+
+        // Cold-open race: the bounded REST seed completes just before the
+        // reattached live turn projects its own temporary assistant row.
+        chat.seed(from: authoritative)
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: activeRuntime,
+            snapshotRunning: true,
+            watchOnly: true
+        )
+        XCTAssertEqual(chat.messages.filter { $0.role == .assistant }.count, 2)
+
+        chat.handle(event: localFrame(
+            type: "message.complete",
+            payload: ["text": "cold-open answer", "status": "complete"]
+        ))
+        await fulfillment(of: [fetched], timeout: 1)
+        for _ in 0..<5 { await Task.yield() }
+
+        XCTAssertEqual(
+            chat.messages.filter { $0.role == .assistant && $0.text == "cold-open answer" }.count,
+            1,
+            "the authoritative row and its reattached live placeholder are one logical reply"
+        )
+        XCTAssertFalse(chat.messages.contains(where: \.isStreaming))
+
+        // A real terminal also releases watch ownership. Otherwise the next
+        // authoritative seed is silently ignored by seed(normalized:policy:).
+        chat.seed(from: authoritative + [
+            storedMessage(role: "user", text: "later prompt", wireId: 3),
+            storedMessage(role: "assistant", text: "later answer", wireId: 4),
+        ], policy: .union)
+        XCTAssertEqual(chat.messages.filter { $0.text == "later answer" }.count, 1)
     }
 }

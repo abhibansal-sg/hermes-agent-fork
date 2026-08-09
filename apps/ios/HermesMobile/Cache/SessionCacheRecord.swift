@@ -64,7 +64,7 @@ struct CacheIdentity: Sendable, Equatable, Hashable {
 //
 // One row per session (raw, includes cron). The full SessionSummary is stored
 // as a JSON blob in `summaryJSON`; only the four SQL-useful fields are promoted
-// to real columns for indexed WHERE/ORDER BY. See CONTRACT-OFFLINE-CACHE.md §2.2.
+// to real columns for indexed WHERE/ORDER BY.
 
 struct SessionCacheRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// SessionSummary.id (stored_session_id; stable across compression chains)
@@ -124,6 +124,8 @@ extension SessionSummary: Encodable {
         try container.encodeIfPresent(lastActive, forKey: .lastActive)
         try container.encodeIfPresent(cwd, forKey: .cwd)
         try container.encodeIfPresent(profile, forKey: .profile)
+        try container.encodeIfPresent(model, forKey: .model)
+        try container.encodeIfPresent(billingProvider, forKey: .billingProvider)
     }
 
     /// CodingKeys that match the wire's snake_case -> camelCase decode
@@ -140,6 +142,8 @@ extension SessionSummary: Encodable {
         case lastActive
         case cwd
         case profile
+        case model
+        case billingProvider
     }
 }
 

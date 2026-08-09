@@ -26,10 +26,9 @@ enum RestError: Error, LocalizedError, Sendable {
 
 /// Stateless HTTP client for the hermes gateway's REST surface.
 ///
-/// Every request applies the gateway's loopback Host override and uses either
-/// the legacy `X-Hermes-Session-Token` credential or a stock native-session
-/// Bearer credential. Provider-authenticated requests resolve the live access
-/// token through one shared refresh actor and retry one rejected request.
+/// Token gateways receive `X-Hermes-Session-Token`; session gateways use the
+/// system cookie jar. Remote requests keep their real Host, matching Desktop.
+/// All requests use a 15-second timeout and throw ``RestError`` on failure.
 ///
 /// The core endpoint groups live in `extension RestClient` files
 /// (`RestClient+Sessions.swift`, `RestClient+Control.swift`, `RestClient+Audio.swift`).
@@ -38,48 +37,23 @@ enum RestError: Error, LocalizedError, Sendable {
 /// those same-module extensions reuse one implementation instead of cloning it.
 struct RestClient: Sendable {
     let baseURL: URL
-    /// Compatibility/debug snapshot. Provider-authenticated requests resolve
-    /// the live access token through ``providerCredentials`` before sending.
     let token: String
     let session: URLSession
-    private let providerCredentials: NativeCredentialController?
-    let connectionMode: ConnectionMode
     /// - Parameters:
     ///   - baseURL: The gateway base, e.g. `https://host[:port]`.
     ///   - token: The session token sent as `X-Hermes-Session-Token`.
     init(
         baseURL: URL,
-        token: String,
-        connectionMode: ConnectionMode = .sharedDashboard
+        token: String
     ) {
-        let config = URLSessionConfiguration.ephemeral
+        let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = Self.timeout
         config.waitsForConnectivity = false
-        self.init(
-            baseURL: baseURL,
-            token: token,
-            session: URLSession(configuration: config),
-            connectionMode: connectionMode,
-            providerCredentials: nil
-        )
-    }
-
-    init(
-        baseURL: URL,
-        providerCredential: ProviderCredentialBundle,
-        controller: NativeCredentialController,
-        connectionMode: ConnectionMode = .remoteURL
-    ) {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = Self.timeout
-        config.waitsForConnectivity = false
-        self.init(
-            baseURL: baseURL,
-            token: providerCredential.accessToken,
-            session: URLSession(configuration: config),
-            connectionMode: connectionMode,
-            providerCredentials: controller
-        )
+        config.httpCookieStorage = .shared
+        config.httpShouldSetCookies = true
+        self.baseURL = baseURL
+        self.token = token
+        self.session = URLSession(configuration: config)
     }
 
     /// Testing-only initialiser: accepts a pre-built ``URLSession`` so tests
@@ -88,47 +62,11 @@ struct RestClient: Sendable {
     init(
         baseURL: URL,
         token: String,
-        session: URLSession,
-        connectionMode: ConnectionMode = .sharedDashboard
-    ) {
-        self.init(
-            baseURL: baseURL,
-            token: token,
-            session: session,
-            connectionMode: connectionMode,
-            providerCredentials: nil
-        )
-    }
-
-    /// Testable provider-session initializer using an injected URLSession.
-    init(
-        baseURL: URL,
-        providerCredential: ProviderCredentialBundle,
-        controller: NativeCredentialController,
-        session: URLSession,
-        connectionMode: ConnectionMode = .remoteURL
-    ) {
-        self.init(
-            baseURL: baseURL,
-            token: providerCredential.accessToken,
-            session: session,
-            connectionMode: connectionMode,
-            providerCredentials: controller
-        )
-    }
-
-    private init(
-        baseURL: URL,
-        token: String,
-        session: URLSession,
-        connectionMode: ConnectionMode,
-        providerCredentials: NativeCredentialController?
+        session: URLSession
     ) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
-        self.connectionMode = connectionMode
-        self.providerCredentials = providerCredentials
     }
 
     private static let timeout: TimeInterval = 15
@@ -139,6 +77,35 @@ struct RestClient: Sendable {
     func status() async throws -> ServerStatus {
         let data = try await get(path: "/api/status")
         return try decode(ServerStatus.self, from: data, context: "status")
+    }
+
+    func authProbe() async throws -> GatewayAuthProbe {
+        let status = try await status()
+        guard status.authRequired == true else {
+            return GatewayAuthProbe(mode: .token, providers: [], version: status.version)
+        }
+        let data = try await get(path: "/api/auth/providers")
+        struct Envelope: Decodable {
+            let providers: [GatewayAuthProvider]
+        }
+        let providers = try decode(Envelope.self, from: data, context: "auth providers").providers
+        return GatewayAuthProbe(mode: .session, providers: providers, version: status.version)
+    }
+
+    func webSocketTicket() async throws -> String {
+        var request = makeRequest(path: "/api/auth/ws-ticket", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let data = try await perform(request)
+        struct Ticket: Decodable { let ticket: String }
+        let ticket = try decode(Ticket.self, from: data, context: "WebSocket ticket").ticket
+        guard !ticket.isEmpty else {
+            throw RestError.decoding("WebSocket ticket was empty")
+        }
+        return ticket
+    }
+
+    func logoutSession() async throws {
+        _ = try await perform(makeRequest(path: "/auth/logout", method: "POST"))
     }
 
     /// `GET /api/sessions` — session list ordered by most recent activity.
@@ -244,12 +211,15 @@ struct RestClient: Sendable {
     /// both shapes are handled. Entries that fail ``StoredMessage`` parsing
     /// are dropped.
     ///
-    /// `shape` remains as a source-compatible hint for older callers. Stock Hermes
-    /// owns transcript shaping and pagination, so the client does not send a
-    /// plugin-only query parameter.
+    /// `shape` (WS-5.1): `"skeleton"` requests conversational text only (heavy
+    /// `reasoning_content` + `tool_calls` nulled server-side) for a fast cold-open
+    /// paint, then a follow-up full fetch hydrates them. Only the hermes-mobile
+    /// PLUGIN mount honors `shape`; a stock gateway ignores the unknown query param
+    /// and returns the full transcript unchanged, so this stays fully
+    /// backward-safe. `nil` (default) is the shipped full fetch.
     func messages(sessionId: String, shape: String? = nil) async throws -> [StoredMessage] {
-        _ = shape
-        let path = "/api/sessions/\(sessionId)/messages"
+        var path = "/api/sessions/\(sessionId)/messages"
+        if let shape, !shape.isEmpty { path += "?shape=\(shape)" }
         let data = try await get(path: path)
 
         let root = try decodeJSONValue(from: data, context: "messages")
@@ -265,20 +235,17 @@ struct RestClient: Sendable {
         return array.compactMap(StoredMessage.init(json:))
     }
 
-    /// Outcome of the zero-side-effect plugin/profile capability checks.
+    /// Result of a side-effect-free stock-gateway capability probe.
     enum UploadProbeResult: Sendable, Equatable {
-        /// `400` — the endpoint exists and rejected the missing multipart field.
         case available
-        /// `404`/`405` — the endpoint isn't routed on this (stock) gateway.
         case unavailable
-        /// Any other status or a transport error — can't decide from this probe.
         case inconclusive
     }
 
     // MARK: - Request plumbing
     //
     // `internal` (not `private`) so the `RestClient+*` extension files reuse this
-    // single implementation rather than cloning the loopback Host override, auth
+    // single implementation rather than cloning Host derivation, authentication,
     // header, timeout, status check, and error mapping.
 
     /// JSON key-decoding strategy a caller needs for a given response shape.
@@ -322,14 +289,10 @@ struct RestClient: Sendable {
             timeoutInterval: Self.timeout
         )
         request.httpMethod = method
-        // Preserve the real host for native remote/relay paths; only Serve and
-        // loopback modes require the gateway's loopback Host override.
-        if let host = WSURLBuilder.effectiveHost(for: baseURL, mode: connectionMode) {
+        if let host = WSURLBuilder.effectiveHost(for: baseURL) {
             request.setValue(host, forHTTPHeaderField: "Host")
         }
-        if providerCredentials != nil {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        } else {
+        if !token.isEmpty {
             request.setValue(token, forHTTPHeaderField: "X-Hermes-Session-Token")
         }
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -351,38 +314,6 @@ struct RestClient: Sendable {
 
     /// Execute a request and validate the HTTP status, mapping failures to ``RestError``.
     func perform(_ request: URLRequest) async throws -> Data {
-        let response = try await authorizedDataResponse(for: request)
-        return try validatedData(response.data, response: response.response)
-    }
-
-    func authorizedRequest(_ request: URLRequest) async throws -> URLRequest {
-        guard let providerCredentials else { return request }
-        return try await providerCredentials.authorize(request)
-    }
-
-    /// Execute through the active credential authority and return the raw HTTP
-    /// response. Capability probes use this to inspect 404/405 without cloning
-    /// or bypassing provider refresh behavior.
-    func authorizedDataResponse(
-        for request: URLRequest
-    ) async throws -> (data: Data, response: HTTPURLResponse) {
-        let authorized = try await authorizedRequest(request)
-        let first = try await dataResponse(for: authorized)
-        if first.response.statusCode == 401,
-           let providerCredentials,
-           let rejected = Self.bearerToken(in: authorized) {
-            let retry = try await providerCredentials.retryAuthorization(
-                authorized,
-                rejectedAccessToken: rejected
-            )
-            return try await dataResponse(for: retry)
-        }
-        return first
-    }
-
-    private func dataResponse(
-        for request: URLRequest
-    ) async throws -> (data: Data, response: HTTPURLResponse) {
         let data: Data
         let response: URLResponse
         do {
@@ -393,23 +324,11 @@ struct RestClient: Sendable {
         guard let http = response as? HTTPURLResponse else {
             throw RestError.network("Non-HTTP response")
         }
-        return (data, http)
-    }
-
-    private func validatedData(_ data: Data, response http: HTTPURLResponse) throws -> Data {
         guard (200..<300).contains(http.statusCode) else {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw RestError.badStatus(http.statusCode, body: String(body.prefix(512)))
         }
         return data
-    }
-
-    private static func bearerToken(in request: URLRequest) -> String? {
-        guard let value = request.value(forHTTPHeaderField: "Authorization"),
-              value.lowercased().hasPrefix("bearer ") else { return nil }
-        let token = String(value.dropFirst("Bearer ".count))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return token.isEmpty ? nil : token
     }
 
     /// Decode `data` into `T`, applying the requested key strategy.
@@ -453,8 +372,8 @@ struct RestClient: Sendable {
 // MARK: - Stock bounded transcript fetch
 
 /// Compatibility name retained for callers while authority moves entirely to
-/// stock session history. Hermes now bounds the default response server-side;
-/// the local cache is only a presentation accelerator, never a delta authority.
+/// stock session history. Hermes bounds the default response server-side; the
+/// local cache is only a presentation accelerator.
 func fetchTranscriptDeltaAware(
     rest: RestClient,
     cacheStore: CacheStore?,

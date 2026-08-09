@@ -1,14 +1,9 @@
 import Foundation
 
-// MARK: - F4b multi-profile REST surface (feature-detected, DORMANT by default)
+// MARK: - Feature-detected multi-profile REST surface
 //
-// The multi-profile endpoints (`GET /api/profiles`, `GET /api/profiles/sessions`,
-// and the optional `profile` scope on per-session GET/PATCH/DELETE) arrive only at
-// the upstream rebase — they are ABSENT from today's live 9119 backend. This
-// extension codes against the pinned upstream shapes (see CONTRACT-F4B.md
-// §Interface); every caller in `SessionStore` gates on
-// `capabilities.profiles == .available`, so on a stock / pre-multi-profile gateway
-// none of this is reached and the app is byte-for-byte its pre-F4b self.
+// Every caller gates on `capabilities.profiles == .available`, so gateways
+// without these routes keep the profile UI dormant.
 //
 // Kept on `RestClient` (mirroring `RestClient+FS.swift`) so these inherit the
 // loopback `Host` override, the `X-Hermes-Session-Token` auth header, the
@@ -45,7 +40,8 @@ extension RestClient {
     func probeProfilesEndpoint() async -> UploadProbeResult {
         let request = makeRequest(path: "/api/profiles/sessions", method: "GET")
         do {
-            let (data, response) = try await authorizedDataResponse(for: request)
+            let (data, response) = try await session.data(for: request)
+            guard let response = response as? HTTPURLResponse else { return .inconclusive }
             switch response.statusCode {
             case 200:
                 // Confirm the body really is the aggregate wrapper before trusting

@@ -44,44 +44,6 @@ final class ConnectionPhaseTests: XCTestCase {
         XCTAssertEqual(connection.phase, .connecting)
     }
 
-    func testRelayWebSocketUsesItsPublicHost() {
-        let defaults = UserDefaults.standard
-        let prior = defaults.object(forKey: DefaultsKeys.relayURLOverride)
-        defer {
-            if let prior {
-                defaults.set(prior, forKey: DefaultsKeys.relayURLOverride)
-            } else {
-                defaults.removeObject(forKey: DefaultsKeys.relayURLOverride)
-            }
-        }
-
-        let (connection, _, _) = makeStore()
-        connection.connectionMode = .sharedDashboard
-        let gateway = URL(string: "https://gateway.tailnet.ts.net:9443")!
-
-        defaults.set(
-            "https://gateway.tailnet.ts.net:9445",
-            forKey: DefaultsKeys.relayURLOverride
-        )
-        XCTAssertEqual(
-            connection.stockProxyURL(forGateway: gateway).absoluteString,
-            "https://gateway.tailnet.ts.net:9445",
-            "an HTTPS relay override must never be downgraded to plain HTTP"
-        )
-        XCTAssertEqual(
-            connection.stockProxyWebSocketMode(forGateway: gateway),
-            .remoteURL,
-            "the transparent relay must receive its real Host during WebSocket upgrade"
-        )
-
-        defaults.removeObject(forKey: DefaultsKeys.relayURLOverride)
-        XCTAssertEqual(
-            connection.stockProxyWebSocketMode(forGateway: gateway),
-            .sharedDashboard,
-            "direct stock-gateway connections keep the configured loopback Host rule"
-        )
-    }
-
     #if DEBUG
     func testHydratingPhaseLabel() {
         // The DEBUG snapshot mirror (gstack bridge, UI-G) must carry a stable
@@ -104,7 +66,7 @@ final class ConnectionPhaseTests: XCTestCase {
         // `phase == .connected`, so the label is the only observable.
         let (connection, _, _) = makeStore()
         connection.graceWindowOverride = .seconds(60)
-        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.connectRPC = { _, _ in throw URLError(.cannotConnectToHost) }
         connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "test-stable-token")
         connection._handleGatewayStateForTesting(.failed("gateway process exited"))
         XCTAssertEqual(connection.phase, .connected)
@@ -361,8 +323,8 @@ final class ConnectionPhaseTests: XCTestCase {
 
     // MARK: - Replace-connection confirmation gate (Inc-4 Hardening #2)
     //
-    // `ConnectionSetupView.connect()` and `ManualTokenPromptView.connect()` gate
-    // on `connection.hasConnected` before calling `configure()` — showing a
+    // `ConnectionSetupView.connect()` gates on `connection.hasConnected` before
+    // calling `configure()` — showing a
     // destructive-confirmation alert instead of silently swapping the gateway.
     // These tests pin the store-side discriminators the view logic reads.
 

@@ -33,13 +33,11 @@ private struct DrawerExportedTranscript: Identifiable, Equatable {
 /// live-pulse + source glyphs, collapsible/pinnable workspace groups, the Inbox
 /// sheet, and the opt-in quick-capture entry.
 ///
-/// ## UI Batch I — I4 (FULL NATIVE drawer internals)
+/// ## Native drawer internals
 /// The drawer **mechanics** (push-card gesture, width, scrim-less layering) are
 /// UNCHANGED — they live in ``CompactLayout`` (RootView), not here. The drawer
 /// **internals** moved from a hand-rolled `ScrollView` + `LazyVStack` to a system
-/// `List(.plain)` with system `Section` headers, per CONTRACT-UI-I §I4 ("rows/
-/// sections move to system List (plainStyle) IF it coexists with the drawer's
-/// gesture + scroll edge effect").
+/// `List(.plain)` with system `Section` headers.
 ///
 /// Coexistence was validated against the binding architecture before adopting
 /// List:
@@ -1745,18 +1743,14 @@ struct DrawerView: View {
     /// Open an existing session and dismiss the drawer (compact). Activation is
     /// instant (transcript + resume continue in the background).
     ///
-    /// R40 — REVEAL-ON-PAINT (supersedes FIX 4). Keep the drawer OPEN through the
-    /// tap and hand `open(_:)` the close as `revealOnFirstPaint`: the store fires
-    /// it the instant the new transcript's first frame is painted (cache hit ≈ one
-    /// frame; miss = the skeleton), so the rigid close-slide uncovers SETTLED
-    /// content. The prior FIX-4 order closed on frame 0 while the async cache paint
-    /// landed a frame later — mid-slide — which the user saw as "the transcript
-    /// moves on its own beat before the chat-view layer." The switch-hitch FIX 4
-    /// targeted is still avoided: `open()` keeps deferring its heavy teardown, and
-    /// nothing heavy runs on the close-spring's frame 0 (the slide now even starts
-    /// a frame later, fully clear of the activation work).
+    /// Close on the tap edge. SessionStore already defers transcript teardown and
+    /// paints cache-first, so the drawer does not need to coordinate its state with
+    /// an asynchronous first-paint callback. Keeping that callback here made a
+    /// successful row selection intermittently leave the drawer fully open.
     private func open(_ summary: SessionSummary) {
-        sessions.open(summary) { onNavigate() }
+        sessions.recordDrawerUserGesture()
+        sessions.open(summary)
+        onNavigate()
     }
 
     /// Start a fresh local draft chat (B3 API) and dismiss the drawer. Draft

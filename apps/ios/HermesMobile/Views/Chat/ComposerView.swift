@@ -152,10 +152,8 @@ struct ComposerView: View {
         }
     }
 
-    /// While a turn is live on this stored session — a local one or an adopted
-    /// foreign mirror — the send button enqueues instead of sends (both mean
-    /// the session is busy; they differ in what STOP targets, which
-    /// `ChatStore.interrupt()` routes to the stream's own runtime, R1 #2).
+    /// While a turn is live on this stored session, the send button enqueues
+    /// instead of sending immediately.
     /// DISCONNECTED with queueable text also enters queue mode: that is the
     /// offline outbox's front door — previously the enqueue affordance only
     /// existed while streaming, so the persisted outbox + reconnect-drain
@@ -294,7 +292,7 @@ struct ComposerView: View {
             // session (so even the first turn runs on the chosen model).
             SessionModelPickerContent(
                 connection: connection,
-                sessionId: (sessions.activeRuntimeId?.isEmpty == false) ? sessions.activeRuntimeId : nil,
+                sessions: sessions,
                 themeStore: themeStore,
                 isPresented: $showModelPicker
             )
@@ -1844,7 +1842,7 @@ private struct QueueSheet: View {
                                 // Lane C fix 3: only a genuinely failed row shows
                                 // its raw error in red — a queued-offline row that
                                 // is merely waiting must not render a red error
-                                // line under its "Waiting for connection" label.
+                                // line under its "Waiting to send" label.
                                 errorMessage: item.showsError ? item.errorMessage : nil,
                                 editable: item.isEditable,
                                 canRetry: item.canRetry,

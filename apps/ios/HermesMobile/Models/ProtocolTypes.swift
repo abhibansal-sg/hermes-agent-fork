@@ -34,11 +34,14 @@ struct SessionSummary: Decodable, Identifiable, Sendable, Equatable {
     /// `profile_name`, which is the distinct ``SessionRuntimeInfo/profileName``
     /// create/resume `info` key). The stock `GET /api/sessions` row and the WS
     /// `session.list` shape both omit it, so it decodes `nil` there — the dormant
-    /// single-profile path stays byte-for-byte unchanged. Declared LAST with a
-    /// default so the synthesized memberwise init keeps it as a trailing optional
-    /// parameter: the three positional callers (`asSessionSummary`, `rename`'s
-    /// rebuild, the test fixture helper) compile without passing it.
+    /// single-profile path stays byte-for-byte unchanged. Declared with a default
+    /// so existing memberwise-init callers compile without passing it.
     var profile: String? = nil
+    /// Durable model identity from stock `GET /api/sessions`.
+    var model: String? = nil
+    /// Accounting bucket from the stored row. This is not runtime routing
+    /// authority; the active provider comes from ``SessionRuntimeInfo/provider``.
+    var billingProvider: String? = nil
 
     /// Drawer/list identity is scoped because stored session ids may collide
     /// across profiles on the same gateway.
@@ -261,6 +264,10 @@ struct SessionActiveItem: Decodable, Sendable, Equatable {
         case starting
         case waiting
         case working
+
+        var isRunning: Bool {
+            self != .idle
+        }
     }
 }
 
@@ -815,10 +822,9 @@ struct SubagentNode: Sendable, Equatable, Identifiable {
     /// Stable identity used both as the dictionary key and the SwiftUI id.
     let id: String
     /// The runtime `session_id` that owns this branch — the `GatewayEvent`'s
-    /// session id at the time the node was created: our own active runtime for
-    /// a local turn, or the adopted foreign mirror's runtime for a mirrored
-    /// delegation tree. `subagent.interrupt` (STR-145) must target THIS
-    /// session, not whatever `activeSessionId`/`mirroringRuntimeId` happens to
+    /// session id at the time the node was created. `subagent.interrupt`
+    /// (STR-145) must target THIS
+    /// session, not whatever `activeSessionId` happens to
     /// resolve to later — the owning runtime is fixed at the branch's creation.
     var sessionId: String
     /// Parent node id, or `nil` for a top-level branch.
