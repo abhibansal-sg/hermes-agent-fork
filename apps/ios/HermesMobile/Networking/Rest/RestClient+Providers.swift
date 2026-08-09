@@ -52,11 +52,9 @@ enum ProviderAuthType: String, Sendable, Equatable {
     /// A custom OpenAI/Anthropic-compatible provider (Tier B).
     case custom = "custom"
 
-    /// Whether this auth type can be provisioned from a raw key on mobile
-    /// (Tier A / Tier B). OAuth/external types must be set up on the desktop.
-    /// ABH-257: `.custom` is provisionable — tapping an authenticated custom
-    /// provider row opens a pre-filled edit/rotate form (same upsert endpoint).
-    var provisionableFromKey: Bool { self == .apiKey || self == .custom }
+    /// Stock `model.save_key` accepts registered API-key providers. Custom and
+    /// OAuth/external providers remain read-only in this panel.
+    var provisionableFromKey: Bool { self == .apiKey }
 }
 
 /// One provider row from `GET <prefix>/providers`. The plugin's list projects
@@ -207,6 +205,13 @@ struct ProviderKeyResult: Sendable, Equatable {
         self.validationDetail = root["validation_detail"]?.stringValue
         self.persisted = root["persisted"]?.boolValue
     }
+
+    init(row: ProviderRow, validationStatus: ProviderKeyValidationStatus, persisted: Bool?) {
+        self.row = row
+        self.validationStatus = validationStatus
+        self.validationDetail = nil
+        self.persisted = persisted
+    }
 }
 
 /// `DELETE <prefix>/providers/{slug}/key` result — the slug + name + a
@@ -283,14 +288,10 @@ extension RestClient {
 
     // MARK: - List the provider universe (the picker's data)
 
-    /// `GET <prefix>/providers` → decode `{"providers":[…]}` into the
-    /// ``ProviderRow`` rows the Model Provider picker renders. Reveals names +
-    /// slugs + auth type + the per-provider `authenticated` boolean ONLY — NEVER
-    /// a key value or secret (the plugin contract). Server order is the inventory
-    /// order. Throws ``RestError`` (e.g. `badStatus(401, …)` on a bad/absent
-    /// credential) for the caller to map to a native inline error.
+    /// Stock model inventory. Reveals names, auth hints, and authentication state
+    /// but never credential values.
     func listProviders() async throws -> [ProviderRow] {
-        let data = try await get(path: "\(mobileAPIPrefix)/providers")
+        let data = try await get(path: "/api/model/options?include_unconfigured=true")
         let root = try decodeJSONValue(from: data, context: "providers.list")
         let array = root["providers"]?.arrayValue
             ?? (root.arrayValue ?? [])
@@ -405,6 +406,29 @@ extension RestClient {
         )
         let data = try await perform(request)
         let root = try decodeJSONValue(from: data, context: "providers.removeKey")
+        return ProviderDisconnectResult(json: root)
+    }
+}
+
+// Stock Hermes owns built-in provider credential mutations over JSON-RPC.
+extension HermesGatewayClient {
+    func saveModelProviderKey(slug: String, apiKey: String) async throws -> ProviderKeyResult {
+        let root = try await requestRaw(
+            "model.save_key",
+            params: .object(["slug": .string(slug), "api_key": .string(apiKey)])
+        )
+        return ProviderKeyResult(
+            row: ProviderRow(json: root["provider"] ?? root),
+            validationStatus: .verified,
+            persisted: true
+        )
+    }
+
+    func disconnectModelProvider(slug: String) async throws -> ProviderDisconnectResult {
+        let root = try await requestRaw(
+            "model.disconnect",
+            params: .object(["slug": .string(slug)])
+        )
         return ProviderDisconnectResult(json: root)
     }
 }

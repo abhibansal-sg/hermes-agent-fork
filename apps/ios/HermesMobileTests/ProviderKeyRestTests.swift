@@ -105,8 +105,14 @@ final class ProviderKeyRestTests: XCTestCase {
 
             var client = makeClient(style: style, script: [(listBody, 200)])
             _ = try await client.listProviders()
-            XCTAssertEqual(recordedPaths, ["\(prefix)/providers"])
+            XCTAssertEqual(recordedPaths, ["/api/model/options"])
             XCTAssertEqual(recordedMethods, ["GET"])
+            let listURL = try XCTUnwrap(RecordingProtocol.requests.first?.url)
+            XCTAssertEqual(
+                URLComponents(url: listURL, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "include_unconfigured" })?.value,
+                "true"
+            )
 
             client = makeClient(style: style, script: [(providerBody, 200)])
             _ = try await client.setProviderKey(slug: "deepseek", apiKey: "sk-123")
@@ -301,6 +307,7 @@ final class ProviderKeyRestTests: XCTestCase {
         XCTAssertEqual(row.authType, .custom)
         XCTAssertEqual(row.baseURL, "https://proxy.example.com")
         XCTAssertEqual(row.apiMode, .anthropicMessages)
+        XCTAssertFalse(row.provisionableFromKey, "custom rows stay read-only on the stock built-in key surface")
     }
 
     func testProviderRowCopyPreservesCustomMetadataThroughDisconnect() {

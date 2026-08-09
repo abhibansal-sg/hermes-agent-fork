@@ -2,8 +2,9 @@ import SwiftUI
 
 // MARK: - ABH-183 provider / API-key-entry UI
 //
-// Three views, all reached ONLY from the Settings "Model Provider" section
-// (which gates on `capabilities.pluginMount == .available`):
+// Built-in provider reads and mutations use stock Hermes model APIs. Custom
+// provider editing is intentionally not mounted until the native custom-endpoint
+// contract is adopted; existing custom rows remain visible and read-only.
 //
 //   • ``ProviderListView``       — the provider universe + authenticated? status.
 //   • ``EnterProviderKeyView``   — Tier A: a SecureField for a registered
@@ -54,7 +55,7 @@ enum ProviderKeySaveDecision: Equatable {
 }
 
 /// The Model Provider picker — a FULL NATIVE `List` of every provider in the
-/// universe (`GET <prefix>/providers`) with its auth status: "authenticated"
+/// universe (stock `/api/model/options`) with its auth status: "authenticated"
 /// (green chip), "Add key" (a registered api_key provider the user can provision
 /// on mobile), or "OAuth — set up on desktop" (an OAuth/external provider that
 /// cannot be provisioned from a key alone). A trailing "Custom OpenAI-compatible"
@@ -70,6 +71,8 @@ struct ProviderListView: View {
     /// The REST client for the active connection (device or shared token — both
     /// accepted by the plugin routes, same as DevicesView).
     let rest: RestClient
+    /// Stock JSON-RPC credential authority. Nil only in isolated UI-test seeds.
+    let gateway: HermesGatewayClient?
 
     /// Invoked after a successful key save / custom add / disconnect so the owner
     /// (SettingsView) can re-resolve the running model + repopulate the Model
@@ -91,13 +94,6 @@ struct ProviderListView: View {
     /// The provider whose EnterProviderKeyView is presented (Tier A push).
     @State private var pendingKeyProvider: ProviderRow?
 
-    /// ABH-257: the authenticated custom provider whose edit/rotate sheet is
-    /// presented (Tier B edit path). Set on tap of an authenticated `.custom` row.
-    @State private var pendingEditCustom: ProviderRow?
-
-    /// Whether the CustomProviderView is presented (Tier B — Add New).
-    @State private var showingCustom = false
-
     /// The provider awaiting a disconnect confirmation.
     @State private var pendingDisconnect: ProviderRow?
     /// The slug currently being disconnected (disables its row while in flight).
@@ -105,8 +101,13 @@ struct ProviderListView: View {
     /// The in-flight disconnect mutation, cancelled when the list disappears.
     @State private var disconnectTask: Task<Void, Never>?
 
-    init(rest: RestClient, onProvidersChanged: (() -> Void)? = nil) {
+    init(
+        rest: RestClient,
+        gateway: HermesGatewayClient? = nil,
+        onProvidersChanged: (() -> Void)? = nil
+    ) {
         self.rest = rest
+        self.gateway = gateway
         self.onProvidersChanged = onProvidersChanged
         #if DEBUG
         self.debugSeedProviders = nil
@@ -120,6 +121,7 @@ struct ProviderListView: View {
         onProvidersChanged: (() -> Void)? = nil
     ) {
         self.rest = rest
+        self.gateway = nil
         self.onProvidersChanged = onProvidersChanged
         self.debugSeedProviders = debugSeedProviders
         self._phase = State(initialValue: .loaded(debugSeedProviders))
@@ -137,7 +139,6 @@ struct ProviderListView: View {
                     }
                 }
                 providersSection(providers)
-                customSection
             }
             .listStyle(.insetGrouped)
             .scrollContentBackground(.hidden)
@@ -153,32 +154,11 @@ struct ProviderListView: View {
             Text(actionError ?? "")
         }
         .navigationDestination(item: $pendingKeyProvider) { provider in
-            EnterProviderKeyView(rest: rest, provider: provider) { updated in
+            EnterProviderKeyView(gateway: gateway, provider: provider) { updated in
                 updateRow(updated)
                 onProvidersChanged?()
             }
             .background(theme.bg)
-        }
-        .sheet(isPresented: $showingCustom) {
-            NavigationStack {
-                CustomProviderView(rest: rest) { added in
-                    upsertRow(added)
-                    onProvidersChanged?()
-                }
-            }
-            // \.hermesTheme does not inherit across a sheet presentation; re-inject.
-            .environment(\.hermesTheme, theme)
-        }
-        // ABH-257: edit/rotate sheet for an authenticated custom provider. Same
-        // sheet shape as Add New, but pre-filled from the existing row.
-        .sheet(item: $pendingEditCustom) { provider in
-            NavigationStack {
-                CustomProviderView(rest: rest, existing: provider) { updated in
-                    upsertRow(updated)
-                    onProvidersChanged?()
-                }
-            }
-            .environment(\.hermesTheme, theme)
         }
         .confirmationDialog(
             "Disconnect this provider?",
@@ -220,31 +200,6 @@ struct ProviderListView: View {
             Text("Providers")
         } footer: {
             Text("Add an API key to use a provider's models in new chats. OAuth providers must be set up on the desktop.")
-        }
-    }
-
-    @ViewBuilder
-    private var customSection: some View {
-        Section {
-            Button {
-                actionError = nil
-                showingCustom = true
-            } label: {
-                HStack(spacing: 12) {
-                    Label {
-                        Text("Custom OpenAI-compatible")
-                            .foregroundStyle(theme.fg)
-                    } icon: {
-                        Image(systemName: "plus.circle")
-                            .foregroundStyle(theme.midground)
-                    }
-                    Spacer(minLength: 8)
-                }
-            }
-            .accessibilityIdentifier("providerAddCustom")
-            .listRowBackground(theme.card)
-        } footer: {
-            Text("Add an OpenAI- or Anthropic-compatible endpoint (a proxy, a self-host, or any provider with a base URL).")
         }
     }
 
@@ -297,24 +252,22 @@ struct ProviderListView: View {
             .gesture(canProvision ? TapGesture().onEnded {
                 guard disconnectingSlug == nil else { return }
                 actionError = nil
-                if provider.authType == .custom {
-                    pendingEditCustom = provider
-                } else {
-                    pendingKeyProvider = provider
-                }
+                pendingKeyProvider = provider
             } : nil)
             // A re-provision (replace key) is available for provisionable providers
             // even when already authenticated; OAuth-only providers are read-only.
             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                Button(role: .destructive) {
-                    actionError = nil
-                    pendingDisconnect = provider
-                } label: {
-                    Label("Disconnect", systemImage: "trash")
-                        .foregroundStyle(theme.destructive)
+                if provider.authType != .custom {
+                    Button(role: .destructive) {
+                        actionError = nil
+                        pendingDisconnect = provider
+                    } label: {
+                        Label("Disconnect", systemImage: "trash")
+                            .foregroundStyle(theme.destructive)
+                    }
+                    .disabled(disconnectingSlug != nil)
+                    .accessibilityIdentifier("providerDisconnect-\(provider.slug)")
                 }
-                .disabled(disconnectingSlug != nil)
-                .accessibilityIdentifier("providerDisconnect-\(provider.slug)")
             }
         } else if canProvision {
             // Provisionable, not yet authenticated → tap to enter a key.
@@ -323,14 +276,7 @@ struct ProviderListView: View {
             // to the Tier A key-entry form.
             Button {
                 actionError = nil
-                if provider.authType == .custom {
-                    // An unauthenticated custom row is rare (disconnect clears
-                    // the config entry entirely), but route it to the create
-                    // form pre-filled rather than the Tier A key form.
-                    pendingEditCustom = provider
-                } else {
-                    pendingKeyProvider = provider
-                }
+                pendingKeyProvider = provider
             } label: {
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -400,7 +346,8 @@ struct ProviderListView: View {
             }
         }
         do {
-            _ = try await rest.removeProviderKey(slug: provider.slug)
+            guard let gateway else { throw GatewayError.notConnected }
+            _ = try await gateway.disconnectModelProvider(slug: provider.slug)
             guard !Task.isCancelled else { return }
             // Flip the row locally: same slug, now unauthenticated.
             if var rows = phase.value {
@@ -491,7 +438,7 @@ struct ProviderListView: View {
 /// OAuth-only providers never reach this view (they show a read-only
 /// "set up on desktop" row in the list).
 struct EnterProviderKeyView: View {
-    let rest: RestClient
+    let gateway: HermesGatewayClient?
     let provider: ProviderRow
     /// Invoked with the refreshed provider row on a successful save.
     let onSaved: (ProviderRow) -> Void
@@ -614,7 +561,8 @@ struct EnterProviderKeyView: View {
                 }
             }
             do {
-                let result = try await rest.setProviderKey(slug: slug, apiKey: trimmed)
+                guard let gateway else { throw GatewayError.notConnected }
+                let result = try await gateway.saveModelProviderKey(slug: slug, apiKey: trimmed)
                 guard !Task.isCancelled else { return }
                 switch ProviderKeySaveDecision(result) {
                 case .confirmed:
@@ -870,53 +818,7 @@ struct CustomProviderView: View {
     private func save() {
         guard canSave else { return }
         nameFieldFocused = false
-        errorText = nil
-        noticeText = nil
-        isSaving = true
-        let trimmedName = name.trimmingCharacters(in: .whitespaces)
-        let trimmedBase = baseURL.trimmingCharacters(in: .whitespaces)
-        let trimmedKey = apiKey.trimmingCharacters(in: .whitespaces)
-        // Transient Keychain hold for the POST duration (slug = the name).
-        do {
-            try KeychainService.saveProviderKey(trimmedKey, slug: trimmedName)
-        } catch {
-            isSaving = false
-            errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            return
-        }
-        saveTask?.cancel()
-        saveTask = Task {
-            defer {
-                KeychainService.deleteProviderKey(slug: trimmedName)
-                if !Task.isCancelled {
-                    isSaving = false
-                    saveTask = nil
-                }
-            }
-            do {
-                let result = try await rest.addCustomProvider(
-                    name: trimmedName,
-                    baseURL: trimmedBase,
-                    rawAPIMode: selectedRawAPIMode,
-                    apiKey: trimmedKey
-                )
-                guard !Task.isCancelled else { return }
-                switch ProviderKeySaveDecision(result) {
-                case .confirmed:
-                    onAdded(result.row)
-                    dismiss()
-                case .rejected(let message):
-                    errorText = message
-                    return
-                case .savedUnverified(let message):
-                    noticeText = message
-                    onAdded(result.row)
-                }
-            } catch {
-                guard !Task.isCancelled else { return }
-                errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            }
-        }
+        errorText = "Custom provider editing has moved to Hermes Desktop until iOS adopts the stock endpoint's required model catalog workflow."
     }
 
     private var footerText: String {

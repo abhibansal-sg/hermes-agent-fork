@@ -801,11 +801,9 @@ struct SettingsView: View {
     // MARK: - Models & Keys (model picker, provider keys, toolset keys)
 
     /// Whether the section would render at least one visible row. Avoids a
-    /// header-with-no-rows flash when disconnected and the plugin mount isn't
-    /// known available yet.
+    /// header-with-no-rows flash when disconnected.
     private var modelsAndKeysSectionVisible: Bool {
         if connectionStore.control != nil { return true }
-        if connectionStore.capabilities.pluginMount == .available, connectionStore.rest != nil { return true }
         #if DEBUG
         if Self.providerKeySurvivalSeedEnabled { return true }
         #endif
@@ -827,14 +825,9 @@ struct SettingsView: View {
         }
     }
 
-    /// The ABH-183 Model provider keys row — a single push to
-    /// ``ProviderListView`` (the provider universe + authenticated? + add-key /
-    /// custom-provider / disconnect affordances). Rendered ONLY when the
-    /// connected gateway advertises the plugin mount (these routes live on
-    /// `/api/plugins/hermes-mobile/providers`); on a stock hermes-agent
-    /// (`pluginMount != .available`) the row is absent (graceful stock
-    /// degradation). On a plugin-mount gateway that PREDATES the provider
-    /// routes, the list surfaces the 404 as an inline error.
+    /// Stock model-provider inventory plus built-in API-key save/disconnect.
+    /// Custom provider rows are read-only here; Desktop owns that richer native
+    /// custom-endpoint workflow until iOS adopts its model field contract.
     @ViewBuilder
     private var modelProviderRow: some View {
         #if DEBUG
@@ -856,13 +849,11 @@ struct SettingsView: View {
                 .font(.footnote)
                 .foregroundStyle(theme.mutedFg)
                 .listRowBackground(theme.card)
-        } else if connectionStore.capabilities.pluginMount == .available,
-                  let rest = connectionStore.rest {
+        } else if let rest = connectionStore.rest {
             liveModelProviderRow(rest: rest)
         }
         #else
-        if connectionStore.capabilities.pluginMount == .available,
-           let rest = connectionStore.rest {
+        if let rest = connectionStore.rest {
             liveModelProviderRow(rest: rest)
         }
         #endif
@@ -871,7 +862,7 @@ struct SettingsView: View {
     @ViewBuilder
     private func liveModelProviderRow(rest: RestClient) -> some View {
         NavigationLink {
-            ProviderListView(rest: rest) {
+            ProviderListView(rest: rest, gateway: connectionStore.client) {
                 // Re-resolve the running model + repopulate the Model
                 // picker so a newly-authenticated provider's models (or a
                 // just-disconnected provider's removal) is reflected.

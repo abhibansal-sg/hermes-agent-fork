@@ -419,3 +419,19 @@ Client verification evidence:
   the same stock routes, redacted config decoding, trimmed secret writes, stock credential
   deletion, provider selection, canonical refresh, auth headers, and non-2xx propagation.
   The complete Swift 6 app and unit-test targets build for testing through the safe wrapper.
+
+## H6c stock built-in model-provider authority result
+
+- The iOS provider panel is no longer gated on the mobile plugin. Its inventory comes from
+  stock `/api/model/options?include_unconfigured=true`; built-in key saves and disconnects
+  use stock `model.save_key` and `model.disconnect` JSON-RPC methods on the authenticated
+  gateway connection.
+- API keys retain the existing transient Keychain handoff and are sent once to Hermes. iOS
+  never stores provider credentials as durable app authority, and the refreshed provider row
+  continues to come from Hermes' inventory contract.
+- The old custom-provider create/edit sheet is no longer mounted. Stock Hermes has a richer
+  custom-endpoint contract that requires an explicit model/catalog workflow; silently mapping
+  the old plugin form would lose semantics. Existing custom rows remain visible and read-only
+  until that native workflow is implemented deliberately.
+- A session-switch-safe stock WebSocket remains the mutation transport; the complete Swift 6
+  application and unit-test targets build for testing through the safe wrapper.
