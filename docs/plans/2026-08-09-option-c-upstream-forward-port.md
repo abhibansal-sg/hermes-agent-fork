@@ -1,6 +1,6 @@
 # Option C upstream-first forward-port ledger
 
-Status: P-1 complete; H1 implemented and awaiting review gate
+Status: P-1 and H1 complete; H2 implemented and awaiting review gate
 
 Upstream baseline: `31cedb4830191da7f8c3ea4b962d40997cd85b21`
 
@@ -65,7 +65,7 @@ use is separately classified below.
 | Fork WebSocket device lifecycle wrappers around every route | One stock authenticated transport context plus provider revocation callback; no per-route socket wrapper layer |
 | Fork `register_prompt_receipt_provider()` and inline `prompt.submit` patch | H3 generic prompt-admission contract in current `tui_gateway/methods_prompt.py`; storage remains provider-owned |
 | Ad-hoc device ownership checks on selected RPCs | One H2 admission helper covering live resume/activate, submit/queue/truncate, steer/redirect/interrupt, secure responses, attachments, conversation controls, session-scoped writes, and takeover |
-| Plugin capability bundle detection | Individually versioned stock capabilities (`session_watch_v1`, `session_action_auth_v1`, `prompt_receipt_admission_v1`, `session_files_v1`) |
+| Plugin capability bundle detection | Individually versioned stock capabilities (`session_watch_v1`, `session_action_authority_v1`, `prompt_receipt_admission_v1`, `session_files_v1`) |
 | iOS connection paths that assume non-loopback `--insecure` | Current upstream rule: non-loopback is always gated; loopback shared-token fallback is explicit and bounded |
 
 None of the 16 fork-only commits touching `tui_gateway`/dashboard auth/web-server are
@@ -183,3 +183,42 @@ Verification evidence:
   concurrency mode through `scripts/ios-build.sh` with the asset catalog excluded.
 - Runtime simulator execution remains blocked by the host CoreSimulatorService
   `ENOMEM` failure confirmed independently through `simctl`.
+
+## H2 implementation result
+
+- Dashboard-auth `Session` can carry an optional provider-verified `client_id`.
+  Providers that omit it retain user-scoped compatibility; the gateway never
+  accepts a client-asserted identity from JSON-RPC params.
+- One-use WS tickets preserve the verified client/user identity through the
+  upgrade and attach a transport-neutral `AuthenticatedPrincipal` to
+  `WSTransport`. Internal, loopback, and stdio links also have explicit stable
+  local principals.
+- Every newly registered live session records its action owner, revision, and
+  owner transport. Legacy live records are claimed by their first mutation.
+- One central dispatcher admission seam covers live prompt/file/attachment,
+  session-control, secure-response, and subagent mutations. Same-owner actions
+  succeed; foreign owners receive `4091`; stale optimistic revisions receive
+  `4092`. Read methods, including `session.watch`, never enter this seam.
+- `session.takeover` requires the caller's expected revision and atomically
+  changes owner, increments the revision, and rebinds the driver transport.
+  A concurrent resume cannot overwrite a foreign claim.
+- `gateway.ready` advertises `session_action_authority_v1`. Live snapshots and
+  create/resume results carry the current revision so clients do not infer it.
+- The existing iOS gateway client keeps a connection-local revision projection,
+  echoes Hermes' revision on later session actions, and explicitly calls
+  `session.takeover` before changing a watched session from observation to file/
+  prompt driving. This projection is not authorization authority; every decision
+  remains server-side.
+
+Verification evidence:
+
+- 921 tests across `tests/test_tui_gateway_server.py` and `tests/tui_gateway/`
+  pass (one unrelated skip).
+- 124 dashboard-auth tests pass; one pre-existing sidecar URL test is sensitive
+  to the developer machine's configured public dashboard URL and fails its
+  `bound_host=None` premise in that environment. The new ticket-principal test
+  passes independently.
+- The focused `ActionAuthorityClientTests` Swift 6 test target builds for testing
+  through `scripts/ios-build.sh` with the asset catalog excluded.
+- Runtime simulator execution and asset compilation remain blocked by the same
+  host CoreSimulatorService `ENOMEM` failure recorded for H1.

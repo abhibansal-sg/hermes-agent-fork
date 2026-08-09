@@ -76,6 +76,7 @@ def _(rid, params: dict) -> dict:
 
     with _sessions_lock:
         _sessions[sid] = {
+            **_initial_action_authority(),
             "agent": None,
             "agent_error": None,
             "agent_ready": ready,

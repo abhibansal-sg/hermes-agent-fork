@@ -187,15 +187,91 @@ final class ProtocolParityTests: XCTestCase {
         connection.applyGatewayReadyCapabilities(.object([
             "capabilities": .array([
                 .string("session_watch_v1"),
+                .string("session_action_authority_v1"),
                 .string("future_contract_v2"),
             ]),
         ]))
 
         XCTAssertTrue(connection.supportsGatewayCapability("session_watch_v1"))
+        XCTAssertTrue(connection.supportsGatewayCapability("session_action_authority_v1"))
         XCTAssertFalse(connection.supportsGatewayCapability("missing_contract_v1"))
 
         connection.applyGatewayReadyCapabilities(.object([:]))
         XCTAssertFalse(connection.supportsGatewayCapability("session_watch_v1"))
+    }
+
+    func testWatchedPromptExplicitlyTakesOverBeforeDriving() async throws {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        connection.applyGatewayReadyCapabilities(.object([
+            "capabilities": .array([.string("session_action_authority_v1")]),
+        ]))
+        sessions.transcriptFetch = { _ in [] }
+        sessions.watchRPC = { _ in
+            JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "messages": .array([]),
+                "action_revision": .number(4),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        var takeoverRuntime: String?
+        sessions.takeoverRPC = { runtimeID in takeoverRuntime = runtimeID }
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil, lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+
+        _ = try await sessions.beginPromptSubmission(runtimeID: "runtime-desktop")
+
+        XCTAssertEqual(takeoverRuntime, "runtime-desktop")
+        XCTAssertEqual(sessions.sessionBinding?.mode, .drive)
+    }
+
+    func testTakeoverLandingAfterNavigationCannotRebindOldSession() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        connection.applyGatewayReadyCapabilities(.object([
+            "capabilities": .array([.string("session_action_authority_v1")]),
+        ]))
+        sessions.transcriptFetch = { _ in [] }
+        sessions.watchRPC = { _ in
+            JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "messages": .array([]),
+                "action_revision": .number(4),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        sessions.takeoverRPC = { _ in try await Task.sleep(for: .milliseconds(50)) }
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil, lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+
+        let takeover = Task {
+            try await sessions.beginPromptSubmission(runtimeID: "runtime-desktop")
+        }
+        await Task.yield()
+        sessions.startDraft()
+
+        do {
+            _ = try await takeover.value
+            XCTFail("stale takeover must be cancelled after navigation")
+        } catch is CancellationError {
+            XCTAssertTrue(sessions.isDraft)
+            XCTAssertNil(sessions.activeRuntimeId)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
     }
 
     func testPassiveOpenWatchesLiveSessionWithoutResume() async {

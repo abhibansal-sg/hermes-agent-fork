@@ -192,6 +192,7 @@ struct SessionOpenResult: Decodable, Sendable {
     let inflight: SessionInflightTurn?
     /// Optional v0.19 resume snapshot. Fork main currently omits it.
     let queued: [JSONValue]
+    let actionRevision: Int?
 
     var snapshotRunning: Bool? {
         if let running { return running }
@@ -218,6 +219,7 @@ struct SessionOpenResult: Decodable, Sendable {
         case status
         case inflight
         case queued
+        case actionRevision
     }
 
     init(from decoder: Decoder) throws {
@@ -239,6 +241,7 @@ struct SessionOpenResult: Decodable, Sendable {
         self.status = try c.decodeIfPresent(String.self, forKey: .status)
         self.inflight = try c.decodeIfPresent(SessionInflightTurn.self, forKey: .inflight)
         self.queued = try c.decodeIfPresent([JSONValue].self, forKey: .queued) ?? []
+        self.actionRevision = try c.decodeIfPresent(Int.self, forKey: .actionRevision)
     }
 }
 

@@ -2734,6 +2734,13 @@ final class ChatStore {
             return false
         }
 
+        do {
+            _ = try await sessions?.beginPromptSubmission(runtimeID: sessionId)
+        } catch {
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return false
+        }
+
         // The user has committed to a local turn. Claim local ownership NOW —
         // BEFORE the (awaited) attachment upload — so any foreign frame that
         // arrives during the upload is correctly refused adoption by the explicit
@@ -2809,12 +2816,14 @@ final class ChatStore {
         remotePaths: [String]
     ) async throws -> OutboxSubmitResult {
         guard let client else { throw GatewayError.notConnected }
+        let priorBindingMode = try await sessions?.beginPromptSubmission(
+            runtimeID: runtimeSessionID
+        )
         prepareOutboxSubmission(job: job, remotePaths: remotePaths)
         pendingReconnectReconcileID = nil
         beginLocalTurn()
         setStreaming(true, reason: "outbox.submit")
         lastError = nil
-        let priorBindingMode = sessions?.beginPromptSubmission(runtimeID: runtimeSessionID)
         do {
             let result = try await client.requestRaw(
                 "prompt.submit",
@@ -3038,6 +3047,12 @@ final class ChatStore {
     ) async {
         guard let client, let sessionId = activeSessionId else {
             lastError = "No active session"
+            return
+        }
+        do {
+            _ = try await sessions?.beginPromptSubmission(runtimeID: sessionId)
+        } catch {
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return
         }
 

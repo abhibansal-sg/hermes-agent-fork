@@ -1082,6 +1082,8 @@ final class SessionStore {
     /// projection without rebinding the gateway's driver transport. Tests inject
     /// this seam directly; production calls the actor-isolated gateway client.
     var watchRPC: ((_ storedId: String) async throws -> SessionOpenResult)?
+    /// Injectable stock `session.takeover` RPC used by authority race tests.
+    var takeoverRPC: ((_ runtimeId: String) async throws -> Void)?
 
     struct WatchedLiveSession {
         let id: String
@@ -3792,23 +3794,60 @@ final class SessionStore {
     /// must never resume or submit into session B merely because B is visible.
     func runtimeForOutboxDestination(_ storedSessionID: String) async -> String? {
         guard activeStoredId == storedSessionID else { return nil }
-        return await ensureActiveRuntime()
+        guard let runtimeID = await ensureActiveRuntime() else { return nil }
+        do {
+            _ = try await beginPromptSubmission(runtimeID: runtimeID)
+            return runtimeID
+        } catch {
+            let message = errorMessage(from: error)
+            lastError = message
+            sessionActionError = SessionActionError(
+                action: "Take Over Session",
+                message: message
+            )
+            return nil
+        }
     }
 
     /// `prompt.submit` is the deliberate watch -> drive ownership edge. Claim
     /// it before awaiting the receipt so an immediate `message.start` is routed
     /// as this phone's local turn.
-    func beginPromptSubmission(runtimeID: String) -> SessionBindingMode? {
+    func beginPromptSubmission(runtimeID: String) async throws -> SessionBindingMode? {
         guard let storedID = activeStoredId,
               activeRuntimeId == runtimeID else { return nil }
         let prior = sessionBinding?.mode
+        if prior == .watch,
+           connection?.supportsGatewayCapability("session_action_authority_v1") == true {
+            if let takeoverRPC {
+                try await takeoverRPC(runtimeID)
+            } else {
+                guard let client else { throw GatewayError.notConnected }
+                _ = try await client.requestRaw(
+                    "session.takeover",
+                    params: .object(["session_id": .string(runtimeID)])
+                )
+            }
+            // The user may have opened another chat while takeover was in
+            // flight. Never bind or submit the old runtime into the new UI.
+            guard activeStoredId == storedID,
+                  activeRuntimeId == runtimeID,
+                  sessionBinding?.mode == .watch else {
+                throw CancellationError()
+            }
+        }
         bindSession(
             storedID: storedID,
             runtimeID: runtimeID,
             mode: .drive,
             generation: connection?.transportEpoch
         )
-        return prior
+        // Once stock Hermes accepted takeover, the phone is the authoritative
+        // driver even if the following prompt is refused for an unrelated
+        // reason. Only the legacy local-only transition may restore watch.
+        return prior == .watch
+            && connection?.supportsGatewayCapability("session_action_authority_v1") == true
+            ? nil
+            : prior
     }
 
     func restoreWatchAfterRejectedSubmission(

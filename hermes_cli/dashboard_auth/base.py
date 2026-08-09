@@ -10,9 +10,11 @@ from typing import Optional
 class Session:
     """A verified identity. Returned by ``complete_login`` and ``verify_session``.
 
-    All fields are mandatory. Providers that don't have a concept of orgs
-    should set ``org_id`` to an empty string. ``access_token`` and
-    ``refresh_token`` are opaque to Hermes — provider-specific.
+    Core identity fields are mandatory. Providers that don't have a concept of
+    orgs should set ``org_id`` to an empty string. ``access_token`` and
+    ``refresh_token`` are opaque to Hermes — provider-specific. ``client_id``
+    is optional and identifies one remote client/device within a user account;
+    providers that omit it retain user-scoped ownership compatibility.
     """
 
     user_id: str
@@ -23,6 +25,7 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    client_id: str = ""
 
 
 @dataclass(frozen=True)

@@ -14865,6 +14865,38 @@ def _ws_auth_mode() -> str:
     return "loopback"
 
 
+def _set_ws_authenticated_principal(
+    ws: "WebSocket",
+    *,
+    subject: str,
+    provider: str,
+    credential: str,
+) -> None:
+    """Persist accepted identity on the upgrade for the JSON-RPC transport."""
+    from tui_gateway.transport import AuthenticatedPrincipal
+
+    principal = AuthenticatedPrincipal(
+        subject=subject,
+        provider=provider,
+        credential=credential,
+    )
+    scope = getattr(ws, "scope", None)
+    if isinstance(scope, dict):
+        scope["hermes.authenticated_principal"] = principal
+    else:
+        setattr(ws, "_hermes_authenticated_principal", principal)
+
+
+def _ws_authenticated_principal(ws: "WebSocket"):
+    """Return identity captured by the successful WS auth decision."""
+    scope = getattr(ws, "scope", None)
+    if isinstance(scope, dict):
+        principal = scope.get("hermes.authenticated_principal")
+        if principal is not None:
+            return principal
+    return getattr(ws, "_hermes_authenticated_principal", None)
+
+
 def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """Validate WS-upgrade auth; return ``(reason, credential)``.
 
@@ -14914,7 +14946,13 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         internal = ws.query_params.get("internal", "")
         if internal:
             try:
-                consume_internal_credential(internal)
+                info = consume_internal_credential(internal)
+                _set_ws_authenticated_principal(
+                    ws,
+                    subject=str(info["user_id"]),
+                    provider=str(info["provider"]),
+                    credential="internal",
+                )
                 return None, "internal"
             except TicketInvalid as exc:
                 audit_log(
@@ -14930,7 +14968,18 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            user_id = str(info["user_id"])
+            client_id = str(info.get("client_id") or "")
+            _set_ws_authenticated_principal(
+                ws,
+                # A provider's device id need only be unique within its user.
+                # Namespace it here so equal ids in two accounts never collapse
+                # into one Hermes action owner.
+                subject=f"{user_id}/{client_id}" if client_id else user_id,
+                provider=str(info["provider"]),
+                credential="ticket",
+            )
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -14945,6 +14994,12 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     if not token:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        _set_ws_authenticated_principal(
+            ws,
+            subject="websocket",
+            provider="local",
+            credential="token",
+        )
         return None, "token"
     return "token_mismatch", "token"
 
@@ -16048,7 +16103,7 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    await handle_ws(ws, principal=_ws_authenticated_principal(ws))
 
 
 # ---------------------------------------------------------------------------

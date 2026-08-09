@@ -32,6 +32,7 @@ import threading
 from typing import Any
 
 from tui_gateway import server
+from tui_gateway.transport import AuthenticatedPrincipal
 
 _log = logging.getLogger(__name__)
 
@@ -89,10 +90,16 @@ class WSTransport:
         loop: asyncio.AbstractEventLoop,
         *,
         peer: str = "unknown",
+        principal: AuthenticatedPrincipal | None = None,
     ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        self.authenticated_principal = principal or AuthenticatedPrincipal(
+            subject="unattributed",
+            provider="local",
+            credential="websocket",
+        )
         self._closed = False
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
@@ -283,7 +290,11 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
+async def handle_ws(
+    ws: Any,
+    *,
+    principal: AuthenticatedPrincipal | None = None,
+) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
@@ -301,7 +312,12 @@ async def handle_ws(ws: Any) -> None:
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        transport = WSTransport(
+            ws,
+            asyncio.get_running_loop(),
+            peer=peer,
+            principal=principal,
+        )
 
         # resolve_skin() reads config + initializes the skin engine —
         # synchronous I/O + CPU work that should not block the event loop

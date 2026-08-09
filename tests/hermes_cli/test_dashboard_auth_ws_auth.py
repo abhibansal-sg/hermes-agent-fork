@@ -204,6 +204,20 @@ class TestWsAuthOkLoopback:
 class TestWsAuthOkGated:
     """Gate ON — ticket path only."""
 
+    def test_ticket_client_identity_survives_upgrade_auth(self, gated_app):
+        ticket = mint_ticket(
+            user_id="user-1",
+            provider="stub",
+            client_id="ios-device-1",
+        )
+        ws = _fake_ws(query={"ticket": ticket}, path="/api/ws")
+
+        assert web_server._ws_auth_ok(ws) is True
+        principal = web_server._ws_authenticated_principal(ws)
+        assert principal.subject == "user-1/ios-device-1"
+        assert principal.provider == "stub"
+        assert principal.credential == "ticket"
+
 
     def test_consumed_ticket_rejected(self, gated_app):
         ticket = mint_ticket(user_id="u1", provider="stub")
@@ -426,4 +440,3 @@ class TestGatewayWsUrl:
         gw_cred = gw.split("internal=")[1].split("&")[0]
         sc_cred = sc.split("internal=")[1].split("&")[0]
         assert gw_cred == sc_cred
-
