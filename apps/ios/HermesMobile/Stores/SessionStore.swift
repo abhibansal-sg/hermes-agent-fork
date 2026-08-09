@@ -2330,31 +2330,6 @@ final class SessionStore {
         guard let rest = resolvedRest else { return nil }
         return { [cacheStore] identity in
             let sessionId = identity.sessionId
-            // Cursor-bearing cached transcripts take the delta-aware path first so
-            // an unchanged background sweep pays only the cheap cursor check. Rows
-            // without a cursor keep the ABH-400 page-window prefetch behavior.
-            if let cacheStore {
-                do {
-                    if let cursor = try await cacheStore.deltaCursor(for: identity),
-                       cursor.afterId > 0 {
-                        // Profile-scoped rows use the profile endpoint. Its
-                        // current protocol lacks a delta equivalent, so prefer
-                        // correctness over the aggregate-only delta shortcut.
-                        if identity.profileId != "default" {
-                            return try await rest.messages(sessionId: sessionId, profile: identity.profileId)
-                        }
-                        return try await fetchTranscriptDeltaAware(
-                            rest: rest,
-                            cacheStore: cacheStore,
-                            sessionId: sessionId,
-                            identity: identity
-                        )
-                    }
-                } catch {
-                    // Treat a cursor read failure like "no cursor"; the fetch path
-                    // below preserves the previous best-effort prefetch semantics.
-                }
-            }
             if identity.profileId != "default" {
                 return try await rest.messages(sessionId: sessionId, profile: identity.profileId)
             }
@@ -4262,8 +4237,8 @@ final class SessionStore {
     // MARK: - Search
 
     /// React to a change in `searchQuery` from the `.searchable` field. Debounces
-    /// 300ms, then tries the plugin endpoint first with graceful fallback to the
-    /// stock `/api/sessions/search` on 404 (older gateways without the plugin).
+    /// 300ms, publishes bounded local-cache hits first, then merges the first
+    /// authoritative stock `/api/sessions/search` page.
     /// Queries under two characters clear the results immediately.
     /// Call from the view's `onChange(of:)`.
     func searchQueryChanged() {
@@ -4437,47 +4412,24 @@ final class SessionStore {
         }
     }
 
-    /// Execute the search against the best available endpoint: plugin first (richer
-    /// results + role-scoped + offset pagination), stock on 404 (older gateways).
-    /// Only falls back on a true 404/not-found — real 500/transport errors are
-    /// re-thrown so they surface as `lastError` and are not silently masked.
-    ///
-    /// `offset` is forwarded to both the plugin and stock endpoints.
-    ///
-    /// Returns `(results, rawPageFull)` where `rawPageFull` indicates whether the
-    /// underlying server page was full at the message level (for plugin) or session
-    /// level (for stock). Callers use `rawPageFull` to set `searchHasMore` — this
-    /// correctly handles plugin pages that collapse to fewer sessions than the raw
-    /// message limit but still have more messages to return.
+    /// Execute search against stock Hermes authority. The stock endpoint currently
+    /// returns one session-deduped page and does not expose an offset contract, so
+    /// `rawPageFull` is deliberately false: the UI must not offer pagination that
+    /// would only fetch and deduplicate page one again.
     ///
     /// Extracted so tests can call it directly without spinning a Task.
     func fetchSearch(
         query: String, offset: Int = 0, api: RestClient
     ) async throws -> (results: [SessionSearchResult], rawPageFull: Bool) {
-        let roles = Self.roles(for: searchScope)
-        let sort = searchSort.rawValue
-        do {
-            // Plugin path: forward offset so load-more fetches subsequent
-            // message pages. rawPageFull keys on the raw (pre-collapse) count.
-            let (results, rawPageFull) = try await api.searchSessionsPlugin(
-                query: query, limit: Self.searchPageLimit, offset: offset, sort: sort, roles: roles
-            )
-            return (results, rawPageFull)
-        } catch RestError.badStatus(404, _) {
-            // Plugin endpoint not available on this gateway — fall back to stock.
-            let results = try await api.searchSessions(
-                query: query, limit: Self.searchPageLimit, offset: offset,
-                scope: searchScope.rawValue
-            )
-            // Stock path: rawPageFull = full session page (no pre-collapse step).
-            return (results, results.count == Self.searchPageLimit)
-        }
-        // Any other error (500, transport, decode) propagates to the caller.
+        _ = offset
+        let results = try await api.searchSessions(
+            query: query, limit: Self.searchPageLimit,
+            scope: searchScope.rawValue
+        )
+        return (results, false)
     }
 
-    /// Map the UI search scope to a list of `role` values for the plugin endpoint.
-    /// `all` sends no filter (server returns every role); `messages` returns user +
-    /// assistant prose; `code` returns tool output.
+    /// Map the presentation-cache search scope to transcript roles.
     static func roles(for scope: SearchScope) -> [String] {
         switch scope {
         case .all:      return []

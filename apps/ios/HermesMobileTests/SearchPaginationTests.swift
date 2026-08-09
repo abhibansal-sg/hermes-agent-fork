@@ -1,8 +1,8 @@
 import XCTest
 @testable import HermesMobile
 
-/// Unit tests for ABH-179: offset pagination for `/api/sessions/search` (stock)
-/// and `/api/plugins/hermes-mobile/sessions/search` (plugin).
+/// Unit tests for the search store's injected paging seam and the production
+/// stock `/api/sessions/search` first-page contract.
 ///
 /// ## Success criteria
 ///
@@ -35,7 +35,6 @@ import XCTest
 ///
 /// URL-encoding contract tests use `fetchSearch()` directly via `SearchStubProtocol`.
 ///
-/// Reuses ``SearchStubProtocol`` from ``PluginSearchTests`` (same test target).
 @MainActor
 final class SearchPaginationTests: XCTestCase {
 
@@ -49,16 +48,6 @@ final class SearchPaginationTests: XCTestCase {
             baseURL: baseURL, token: token,
             session: URLSession(configuration: config),
             pathStyle: .legacy
-        )
-    }
-
-    private func pluginClient() -> RestClient {
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [SearchStubProtocol.self]
-        return RestClient(
-            baseURL: baseURL, token: token,
-            session: URLSession(configuration: config),
-            pathStyle: .plugin
         )
     }
 
@@ -418,41 +407,7 @@ final class SearchPaginationTests: XCTestCase {
                        "loadMoreSearchResults must no-op when searchOffset >= searchOffsetCap")
     }
 
-    // MARK: - Offset URL-encoding (via direct fetchSearch / searchSessionsPlugin)
-
-    /// Offset=0 must NOT appear in the plugin URL (server default).
-    func testPluginOffsetAbsentForFirstPage() async throws {
-        let pluginJSON = #"{"results":[],"count":0,"offset":0}"#
-        SearchStubProtocol.responses = [(pluginJSON.data(using: .utf8)!, 200)]
-        let client = pluginClient()
-        let store  = SessionStore()
-        store.searchScope = .all
-
-        _ = try await client.searchSessionsPlugin(query: "hello", offset: 0)
-
-        guard let url = SearchStubProtocol.capturedURLs.first else {
-            XCTFail("No URL captured"); return
-        }
-        XCTAssertFalse((url.query ?? "").contains("offset="),
-                       "Plugin first-page request must not include offset= param, got: \(url.query ?? "")")
-    }
-
-    /// Offset>0 must appear in the plugin URL.
-    func testPluginOffsetPresentForSubsequentPages() async throws {
-        let pluginJSON = #"{"results":[],"count":0,"offset":20}"#
-        SearchStubProtocol.responses = [(pluginJSON.data(using: .utf8)!, 200)]
-        let client = pluginClient()
-        let store  = SessionStore()
-        store.searchScope = .all
-
-        _ = try await client.searchSessionsPlugin(query: "hello", offset: 20)
-
-        guard let url = SearchStubProtocol.capturedURLs.first else {
-            XCTFail("No URL captured"); return
-        }
-        XCTAssertTrue((url.query ?? "").contains("offset=20"),
-                      "Plugin load-more request must carry offset=20 in URL, got: \(url.query ?? "")")
-    }
+    // MARK: - Stock request contract
 
     /// Offset=0 must NOT appear in the stock URL.
     func testStockOffsetAbsentForFirstPage() async throws {
@@ -470,8 +425,8 @@ final class SearchPaginationTests: XCTestCase {
                        "Stock first-page request must not include offset= param, got: \(url.query ?? "")")
     }
 
-    /// Offset>0 must appear in the stock URL.
-    func testStockOffsetPresentForSubsequentPages() async throws {
+    /// A stale non-zero caller offset must not invent an unsupported stock query.
+    func testStockOffsetIsNotSent() async throws {
         SearchStubProtocol.responses = [(stockEnvelope(count: pageLimit), 200)]
         let client = stockClient()
         let store  = SessionStore()
@@ -482,7 +437,31 @@ final class SearchPaginationTests: XCTestCase {
         guard let url = SearchStubProtocol.capturedURLs.first else {
             XCTFail("No URL captured"); return
         }
-        XCTAssertTrue((url.query ?? "").contains("offset=20"),
-                      "Stock load-more request must carry offset=20 in URL, got: \(url.query ?? "")")
+        XCTAssertFalse((url.query ?? "").contains("offset="),
+                       "Stock search has no offset contract, got: \(url.query ?? "")")
     }
+}
+
+final class SearchStubProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var responses: [(Data, Int)] = []
+    nonisolated(unsafe) static var capturedURLs: [URL] = []
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        if let url = request.url { Self.capturedURLs.append(url) }
+        let (body, status) = Self.responses.isEmpty
+            ? (Data(), 404)
+            : Self.responses.removeFirst()
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: status, httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

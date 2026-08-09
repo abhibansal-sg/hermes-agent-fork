@@ -13,9 +13,9 @@ import XCTest
 /// `HermesMobileUITests/ChatFlowUITests.swift`.
 final class RestClientLiveTests: XCTestCase {
 
-    func testTranscriptPageFetchUsesPluginLimitAndBeforeCursor() async {
+    func testTranscriptPageFetchUsesStockLatestWindow() async {
         TranscriptPageStubProtocol.nextResponse = (
-            #"{"messages":[{"id":41,"role":"user","content":"older"}],"page":{"oldest_id":41,"has_more_before":true}}"#.data(using: .utf8)!,
+            #"{"messages":[{"id":41,"role":"user","content":"older"}],"pagination":{"limit":50,"offset":0,"order":"latest","returned":1}}"#.data(using: .utf8)!,
             200
         )
         TranscriptPageStubProtocol.requestedPath = nil
@@ -24,21 +24,25 @@ final class RestClientLiveTests: XCTestCase {
 
         let page = await fetchTranscriptPage(rest: rest, sessionId: "s 1", limit: 50, before: 42)
 
-        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/plugins/hermes-mobile/sessions/s%201/messages")
-        XCTAssertEqual(TranscriptPageStubProtocol.requestedQuery, "limit=50&before=42")
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/sessions/s%201/messages")
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedQuery, "limit=50&offset=0&order=latest")
         XCTAssertEqual(page?.messages.map(\.wireId), [41])
         XCTAssertEqual(page?.oldestId, 41)
-        XCTAssertEqual(page?.hasMoreBefore, true)
+        XCTAssertEqual(page?.hasMoreBefore, false)
     }
 
-    func testTranscriptPageFetchIsPluginOnly() async {
+    func testTranscriptPageFetchDoesNotRequirePluginPathStyle() async {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"messages":[],"pagination":{"limit":50,"offset":0,"order":"latest","returned":0}}"#.data(using: .utf8)!,
+            200
+        )
         TranscriptPageStubProtocol.requestedPath = nil
         let rest = transcriptPageStubClient(pathStyle: .legacy)
 
         let page = await fetchTranscriptPage(rest: rest, sessionId: "s1", limit: 50)
 
-        XCTAssertNil(page)
-        XCTAssertNil(TranscriptPageStubProtocol.requestedPath)
+        XCTAssertNotNil(page)
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/sessions/s1/messages")
     }
 
     func testStockTranscriptPageUsesOffsetAndProfile() async {

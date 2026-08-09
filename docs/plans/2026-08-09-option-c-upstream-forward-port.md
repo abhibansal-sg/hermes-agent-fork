@@ -435,3 +435,27 @@ Client verification evidence:
   until that native workflow is implemented deliberately.
 - A session-switch-safe stock WebSocket remains the mutation transport; the complete Swift 6
   application and unit-test targets build for testing through the safe wrapper.
+
+## H6d stock transcript/search authority result
+
+- Recent transcript opens and reconnect backfills now use the stock bounded
+  `/api/sessions/{id}/messages?order=latest` page. Older-history loading keeps Hermes'
+  stock absolute-offset paging, anchored by the canonical session message count; no
+  plugin delta cursor, prefix-generation record, target-centered history route, or
+  transcript-shaping query participates in production.
+- The existing GRDB transcript cache remains a bounded presentation accelerator. It may
+  union settled rows for a smooth reconnect and provide local message-level search hints,
+  but stock session history always re-establishes canonical state and all post-await
+  publication remains fenced to the active session.
+- Remote search uses stock `/api/sessions/search`, which intentionally returns one result
+  per compression lineage. Because that endpoint currently exposes no offset contract,
+  iOS presents one authoritative server page and does not advertise a false load-more
+  loop. Bounded local-cache hits can still appear first and are marked partial when the
+  cache does not cover all canonical history.
+- The plugin-owned cross-session artifact gallery and its REST/model/test surface were
+  removed. Working files remain available through the H6a stock filesystem UI, images and
+  attachments remain transcript-owned by Hermes, and no iOS/plugin process scans canonical
+  transcripts into a duplicate artifact index.
+- Focused stock transcript request tests now cover latest ordering, path-style independence,
+  absolute-offset paging, and search's first-page-only contract. The complete Swift 6 app
+  and unit-test targets build for testing through the safe wrapper.

@@ -16,9 +16,8 @@ struct TranscriptAroundFetch: Sendable {
     let containsTarget: Bool
 }
 
-/// Plugin-only backward-paged transcript fetch. Kept outside RestClient.swift for
-/// ABH-400's narrow scope fence; it reuses RestClient's internal request/JSON
-/// helpers without changing the existing no-param delta handshake method.
+/// Stock Hermes recent transcript window. The UI keeps only this bounded page;
+/// canonical history remains in Hermes' session database.
 func fetchTranscriptPage(
     rest: RestClient,
     sessionId: String,
@@ -26,34 +25,16 @@ func fetchTranscriptPage(
     before: Int? = nil,
     shape: String? = nil
 ) async -> TranscriptPageFetch? {
-    guard rest.pathStyle == .plugin else { return nil }
-    let encodedId = sessionId.addingPercentEncoding(
-        withAllowedCharacters: .urlPathAllowed
-    ) ?? sessionId
-    // WS-5.1: `shape` is a PARAMETER now (was hardcoded `skeleton`, which stranded
-    // reopened chats on text-only rows with no hydrate). Default `nil` ⇒ FULL; the
-    // cold-open seed passes `skeleton` and pairs it with a background hydrate.
-    var path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages"
-        + "?limit=\(max(1, limit))"
-    if let before, before > 0 {
-        path += "&before=\(before)"
-    }
-    if let shape, !shape.isEmpty {
-        path += "&shape=\(shape)"
-    }
-    do {
-        let data = try await rest.get(path: path)
-        let root = try rest.decodeJSONValue(from: data, context: "messagesPage")
-        guard let array = root["messages"]?.arrayValue else { return nil }
-        let page = root["page"]
-        return TranscriptPageFetch(
-            messages: array.compactMap(StoredMessage.init(json:)),
-            oldestId: page?["oldest_id"]?.intValue,
-            hasMoreBefore: page?["has_more_before"]?.boolValue ?? false
-        )
-    } catch {
-        return nil
-    }
+    _ = before
+    _ = shape
+    return await fetchStockTranscriptPage(
+        rest: rest,
+        sessionId: sessionId,
+        profile: nil,
+        limit: limit,
+        offset: 0,
+        latest: true
+    )
 }
 
 /// Stock gateway transcript page used by the transparent relay path.
@@ -62,7 +43,8 @@ func fetchStockTranscriptPage(
     sessionId: String,
     profile: String?,
     limit: Int,
-    offset: Int
+    offset: Int,
+    latest: Bool = false
 ) async -> TranscriptPageFetch? {
     let encodedId = sessionId.addingPercentEncoding(
         withAllowedCharacters: .urlPathAllowed
@@ -71,6 +53,9 @@ func fetchStockTranscriptPage(
         URLQueryItem(name: "limit", value: String(max(1, limit))),
         URLQueryItem(name: "offset", value: String(max(0, offset))),
     ]
+    if latest {
+        query.append(URLQueryItem(name: "order", value: "latest"))
+    }
     if let profile, !profile.isEmpty {
         query.append(URLQueryItem(name: "profile", value: profile))
     }
@@ -89,37 +74,7 @@ func fetchStockTranscriptPage(
         return TranscriptPageFetch(
             messages: messages,
             oldestId: messages.first?.wireId,
-            hasMoreBefore: pageOffset > 0 && !messages.isEmpty
-        )
-    } catch {
-        return nil
-    }
-}
-
-/// Plugin-only target-centered transcript fetch for jump/search/artifact opens.
-/// Returns the target ± radius without forcing a full transcript load.
-func fetchTranscriptAround(
-    rest: RestClient,
-    sessionId: String,
-    around messageId: Int,
-    radius: Int
-) async -> TranscriptAroundFetch? {
-    guard rest.pathStyle == .plugin else { return nil }
-    let encodedId = sessionId.addingPercentEncoding(
-        withAllowedCharacters: .urlPathAllowed
-    ) ?? sessionId
-    let path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages/around"
-        + "?around=\(messageId)&radius=\(max(0, radius))"
-    do {
-        let data = try await rest.get(path: path)
-        let root = try rest.decodeJSONValue(from: data, context: "messagesAround")
-        guard let array = root["messages"]?.arrayValue else { return nil }
-        let page = root["page"]
-        return TranscriptAroundFetch(
-            messages: array.compactMap(StoredMessage.init(json:)),
-            oldestId: page?["oldest_id"]?.intValue,
-            hasMoreBefore: page?["has_more_before"]?.boolValue ?? false,
-            containsTarget: page?["contains_target"]?.boolValue ?? false
+            hasMoreBefore: latest ? messages.count >= max(1, limit) : pageOffset > 0 && !messages.isEmpty
         )
     } catch {
         return nil
@@ -4553,18 +4508,11 @@ final class ChatStore {
         }
     }
 
-    /// The injected target-centered jump fetch, or the plugin REST route.
+    /// Target-centered loading is test-injectable only. Production uses stock
+    /// search/session paging and never invents a second transcript endpoint.
     private var resolvedTranscriptAroundFetch: ((String, Int, Int) async -> TranscriptAroundFetch?)? {
         if let transcriptAroundFetch { return transcriptAroundFetch }
-        guard let rest = connection?.rest else { return nil }
-        return { sessionId, messageId, radius in
-            await fetchTranscriptAround(
-                rest: rest,
-                sessionId: sessionId,
-                around: messageId,
-                radius: radius
-            )
-        }
+        return nil
     }
 
     /// The injected `transcriptPageFetch` test seam, or the default that
@@ -4582,7 +4530,8 @@ final class ChatStore {
                 sessionId: sessionId,
                 profile: profile,
                 limit: limit,
-                offset: offset ?? 0
+                offset: offset ?? 0,
+                latest: false
             )
         }
     }
@@ -4593,8 +4542,6 @@ final class ChatStore {
     private var resolvedBackfillFetch: ((String) async throws -> [StoredMessage])? {
         if let backfillFetch { return backfillFetch }
         guard let rest = connection?.rest else { return nil }
-        // ABH-400: plugin gateways serve only the recent tail window on
-        // foreground/reconnect; legacy gateways keep the existing full/delta path.
         return { [cacheStore] sessionId in
             if let page = await fetchTranscriptPage(
                 rest: rest,

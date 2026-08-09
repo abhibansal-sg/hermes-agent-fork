@@ -685,7 +685,6 @@ struct SettingsView: View {
                 panelLink(.cron)
                 panelLink(.skills)
                 panelLink(.learning)
-                panelLink(.artifacts)
                 panelLink(.webhooks)
             } header: {
                 Text("Agent & Panels")
@@ -1010,7 +1009,7 @@ struct SettingsView: View {
     /// live control surface; `about` is the local version page (no control
     /// client needed) and is excluded from ``pushable``.
     private enum ControlPanel: String, Identifiable, Hashable {
-        case appearance, model, personality, usage, cron, skills, learning, gateway, artifacts, logs, webhooks, about
+        case appearance, model, personality, usage, cron, skills, learning, gateway, logs, webhooks, about
         var id: String { rawValue }
 
         var title: String {
@@ -1023,7 +1022,6 @@ struct SettingsView: View {
             case .skills: return "Skills"
             case .learning: return "Learning Journey"
             case .gateway: return "Gateway Status"
-            case .artifacts: return "Artifacts"
             case .logs: return "System Logs"
             case .webhooks: return "Webhooks"
             case .about: return "About"
@@ -1040,7 +1038,6 @@ struct SettingsView: View {
             case .skills: return "wand.and.stars"
             case .learning: return "sparkles"
             case .gateway: return "network"
-            case .artifacts: return "photo.on.rectangle.angled"
             case .logs: return "doc.text.magnifyingglass"
             // STR-338: verified present in the iOS 17 base SDK swiftinterface
             // (SF Symbols 5). Falls back conceptually to `link`/
@@ -1104,14 +1101,6 @@ struct SettingsView: View {
                     LearningJourneyView(client: connectionStore.client)
                 case .gateway:
                     GatewayStatusView(control: control, connection: connectionStore)
-                case .artifacts:
-                    ArtifactsGalleryView(
-                        control: control,
-                        serverId: connectionStore.serverURLString,
-                        profileId: sessionStore.activeProfile,
-                        activeSessionCwd: connectionStore.sessionCwd ?? "",
-                        sessions: sessionStore
-                    )
                 case .logs:
                     // ABH-368: System log viewer. Uses the REST client (not the
                     // WS control client) — /api/logs is a stock GET route. Falls

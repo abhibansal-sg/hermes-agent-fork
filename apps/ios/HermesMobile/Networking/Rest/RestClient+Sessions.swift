@@ -30,19 +30,14 @@ struct SessionSearchResult: Decodable, Identifiable, Sendable, Equatable {
     let sessionStarted: Double?
     /// ABH-192 (jump-to-exact-message): the wire `message_id` of the matched
     /// message, surfaced so a tap can scroll the open transcript to that exact
-    /// row. Only the per-message plugin endpoint (`PluginSessionSearchResult`)
-    /// emits it; the stock FTS endpoint groups by session and leaves this nil
-    /// (then a tap just opens the session, no message-level scroll). Additive:
-    /// nil on older responses → unchanged behavior.
+    /// row. The stock FTS endpoint groups by session and leaves this nil (then a
+    /// tap opens the session and uses snippet matching). Local presentation-cache
+    /// hits may still carry a wire id.
     ///
     /// NOTE: a stored `let` with an inline `= nil` default is NOT exposed as a
     /// parameter by the synthesized memberwise initializer (Swift treats it as a
-    /// fixed default), which makes passing `messageId:` from the
-    /// `PluginSessionSearchResult` and `ArtifactsGalleryView` call sites an
-    /// "Extra argument" compile error. Instead we declare it without the inline
-    /// default and provide an explicit memberwise init that defaults it to nil —
-    /// that keeps every caller working: omitting it (tests, synthesizers) yields
-    /// nil, passing it (ABH-192 taps) threads the id through.
+    /// fixed default). Declare it without an inline default and provide an explicit
+    /// initializer so local-cache hits can pass an id while stock rows omit it.
     let messageId: Int?
 
     private enum CodingKeys: String, CodingKey {
@@ -248,78 +243,32 @@ struct SessionSearchResult: Decodable, Identifiable, Sendable, Equatable {
     }
 }
 
-// MARK: - Plugin search result
-
-/// One row from `GET /api/plugins/hermes-mobile/sessions/search` (`results[]`).
-///
-/// The plugin endpoint is per-message, not per-session; the iOS call site
-/// collapses multiple rows for the same `sessionId` down to a single
-/// ``SessionSearchResult`` (first/best snippet, by server-ranking order) before
-/// handing them to the drawer UI.
-struct PluginSessionSearchResult: Decodable, Sendable {
-    let sessionId: String
-    let sessionTitle: String?
-    let sessionStartedAt: Double?
-    let messageId: Int?
-    let role: String?
-    let snippet: String?
-    let timestamp: Double?
-
-    private enum CodingKeys: String, CodingKey {
-        case sessionId       = "session_id"
-        case sessionTitle    = "session_title"
-        case sessionStartedAt = "session_started_at"
-        case messageId       = "message_id"
-        case role, snippet, timestamp
-    }
-
-    /// Convert to the existing `SessionSearchResult` shape so the drawer UI
-    /// needs no changes. `source`/`model` are not returned by the plugin endpoint;
-    /// they decode as nil and the row renders without the source glyph.
-    /// ABH-192: the per-message `messageId` is threaded through so a tap can
-    /// jump to the exact matched message in the opened transcript.
-    var asSessionSearchResult: SessionSearchResult {
-        SessionSearchResult(
-            id: sessionId,
-            snippet: snippet,
-            role: role,
-            source: nil,
-            model: nil,
-            sessionStarted: sessionStartedAt,
-            messageId: messageId
-        )
-    }
-}
-
 // MARK: - Endpoints
 
 extension RestClient {
-    /// `GET /api/sessions/search?q=&limit=&scope=` — FTS5 search over message
-    /// content.
+    /// `GET /api/sessions/search?q=&limit=` — stock Hermes FTS5 search over
+    /// message content, deduplicated to one result per logical session.
     ///
     /// Returns one result per matching session (best snippet). Queries shorter
     /// than two characters are answered locally with an empty array, matching the
     /// debounced UI contract and avoiding a pointless round-trip.
     ///
-    /// `scope` narrows by message role (a stock server before this param ignores
-    /// it and returns the `all` behavior, so it degrades safely):
-    /// `all` (every role + session-id matches), `messages` (user + assistant
-    /// prose), `code` (tool output / structured results).
+    /// `scope` remains in the signature for presentation-cache call-site
+    /// compatibility. Stock Hermes currently ignores role scope, so it is not
+    /// sent as an invented server contract.
     func searchSessions(
         query: String, limit: Int = 20, offset: Int = 0, scope: String = "all"
     ) async throws -> [SessionSearchResult] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else { return [] }
 
+        _ = offset
+        _ = scope
         var components = URLComponents()
-        var items: [URLQueryItem] = [
+        let items: [URLQueryItem] = [
             URLQueryItem(name: "q", value: trimmed),
             URLQueryItem(name: "limit", value: String(limit)),
-            URLQueryItem(name: "scope", value: scope),
         ]
-        if offset > 0 {
-            items.append(URLQueryItem(name: "offset", value: String(offset)))
-        }
         components.queryItems = items
         let encodedQuery = components.percentEncodedQuery ?? ""
         let path = encodedQuery.isEmpty
@@ -333,90 +282,6 @@ extension RestClient {
         return try decode(
             Wrapper.self, from: data, context: "search", strategy: .useDefaultKeys
         ).results
-    }
-
-    /// `GET /api/plugins/hermes-mobile/sessions/search?q=&limit=&sort=&role=&offset=` —
-    /// richer FTS5 search via the hermes-mobile plugin endpoint with offset pagination.
-    ///
-    /// The plugin endpoint returns one row per MATCHING MESSAGE (with full context
-    /// and session title). This method collapses them to one per session (first/best
-    /// snippet by server-ranking order, deterministic dedup) so the result list is
-    /// compatible with the existing `DrawerSearchResultRow` UI.
-    ///
-    /// Returns `(results, rawPageFull)` where `rawPageFull` reflects whether the RAW
-    /// message-level response was a full page (decoded row count == limit) BEFORE
-    /// session collapse. Callers must use `rawPageFull` — not the collapsed session
-    /// count — to determine whether more pages may exist, because a full message page
-    /// can collapse to far fewer unique sessions.
-    ///
-    /// Scope→role mapping:
-    /// - `.all`      → no `role` param (server returns all roles)
-    /// - `.messages` → `role=user&role=assistant`
-    /// - `.code`     → `role=tool`
-    ///
-    /// Only available when this client speaks `.plugin` path style. Callers
-    /// (``SessionStore/fetchSearch(query:offset:api:)``) try this first and fall back
-    /// to the stock ``searchSessions(query:limit:scope:)`` on 404 (older gateways
-    /// without the plugin). A real 500/transport error is re-thrown so genuine
-    /// failures surface and are NOT silently masked.
-    func searchSessionsPlugin(
-        query: String,
-        limit: Int = 25,
-        offset: Int = 0,
-        sort: String? = nil,
-        roles: [String] = []
-    ) async throws -> (results: [SessionSearchResult], rawPageFull: Bool) {
-        guard pathStyle == .plugin else {
-            throw RestError.badStatus(404, body: "plugin path style not active")
-        }
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 2 else { return ([], false) }
-
-        var items: [URLQueryItem] = [
-            URLQueryItem(name: "q", value: trimmed),
-            URLQueryItem(name: "limit", value: String(limit)),
-        ]
-        if offset > 0 {
-            items.append(URLQueryItem(name: "offset", value: String(offset)))
-        }
-        if let sort, !sort.isEmpty {
-            items.append(URLQueryItem(name: "sort", value: sort))
-        }
-        for role in roles {
-            items.append(URLQueryItem(name: "role", value: role))
-        }
-        var components = URLComponents()
-        components.queryItems = items
-        let encodedQuery = components.percentEncodedQuery ?? ""
-        let base = "\(mobileAPIPrefix)/sessions/search"
-        let path = encodedQuery.isEmpty ? base : "\(base)?\(encodedQuery)"
-
-        let data = try await get(path: path)
-
-        struct Wrapper: Decodable { let results: [PluginSessionSearchResult] }
-        // PluginSessionSearchResult has explicit snake_case CodingKeys — use
-        // .useDefaultKeys to avoid the global double-conversion.
-        let rows = try decode(
-            Wrapper.self, from: data, context: "pluginSearch", strategy: .useDefaultKeys
-        ).results
-
-        // Record raw (pre-collapse) fullness BEFORE deduplication.
-        // Has-more must key on this — a 25-message page can collapse to far
-        // fewer sessions but still means the server has more messages to return.
-        let rawPageFull = rows.count == limit
-
-        // Collapse per-message rows to one per session (first occurrence wins —
-        // the server returns them in relevance order, so the first hit for each
-        // session_id is the best snippet). Dedup is deterministic: insertion order
-        // of the first occurrence of each session_id.
-        var seen = Set<String>()
-        var collapsed: [SessionSearchResult] = []
-        for row in rows {
-            guard !row.sessionId.isEmpty, !seen.contains(row.sessionId) else { continue }
-            seen.insert(row.sessionId)
-            collapsed.append(row.asSessionSearchResult)
-        }
-        return (collapsed, rawPageFull)
     }
 
     /// `PATCH /api/sessions/{id}` with `{ "title": ... }` — rename a session.
