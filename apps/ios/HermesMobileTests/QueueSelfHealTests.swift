@@ -1,0 +1,245 @@
+import XCTest
+@testable import HermesMobile
+
+/// Queue self-heal — the "No active session" / queues-forever trap on
+/// desktop-driven sessions (ABH-155/156 family).
+///
+/// Pins three behaviors the fix adds:
+///  1. `QueueStore.restamp(from:to:)` migrates queued prompts parent → continuation
+///     when a resume follows a compression chain tip, so drain's session-affinity
+///     guard doesn't skip them forever (A3).
+///  2. The restamp makes a previously-skipped prompt drain-eligible (A3 end-to-end).
+///  3. `SessionStore.ensureActiveRuntime()` guard behavior — returns an existing
+///     runtime as-is, and `nil` (no crash) when there's nothing to resume — and
+///     `ChatStore.send` fails gracefully with "No active session" when no runtime
+///     can bind.
+///
+/// The LIVE resume-binds path (ensureActiveRuntime actually re-resuming and
+/// flushing the outbox) needs a gateway and is device-verified; these tests avoid
+/// a network call so they can never hang the suite.
+@MainActor
+final class QueueSelfHealTests: XCTestCase {
+
+    private let storedParent = "stored-parent"
+    private let storedTip = "stored-continuation"
+
+    private func makeQueue(
+        configuration: WorkRepositoryConfiguration? = nil
+    ) throws -> (QueueStore, WorkRepositoryConfiguration, URL) {
+        let directory = configuration?.databaseURL.deletingLastPathComponent()
+            ?? FileManager.default.temporaryDirectory
+                .appendingPathComponent("QueueSelfHeal-\(UUID().uuidString)", isDirectory: true)
+        let resolved = configuration ?? WorkRepositoryConfiguration(containerURL: directory)
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(configuration: resolved, observation: observation)
+        let scope = try WorkScope(serverID: "https://gateway.test", profileID: "default")
+        return (
+            QueueStore(repository: repository, observation: observation, scopeProvider: { scope }),
+            resolved,
+            directory
+        )
+    }
+
+    private func makeStores() -> (ChatStore, SessionStore) {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        return (chat, sessions)
+    }
+
+    private struct ResumeFailure: LocalizedError {
+        var errorDescription: String? { "resume exploded" }
+    }
+
+    // MARK: - A3: restamp migrates queued prompts parent → continuation
+
+    func testRestampMigratesMatchingPromptsAndPreservesOrder() async throws {
+        let (queue, configuration, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = await queue.enqueue("first", storedSessionId: storedParent)
+        _ = await queue.enqueue("unrelated", storedSessionId: "other")
+        _ = await queue.enqueue("second", storedSessionId: storedParent)
+
+        await queue.restamp(from: storedParent, to: storedTip)
+
+        XCTAssertEqual(queue.items.map(\.text), ["first", "unrelated", "second"],
+                       "FIFO order preserved")
+        XCTAssertEqual(queue.items.map(\.storedSessionId),
+                       [storedTip, "other", storedTip],
+                       "only parent-stamped prompts migrate to the continuation")
+        // The migration is persisted (survives a relaunch).
+        let (reloaded, _, _) = try makeQueue(configuration: configuration)
+        await reloaded.refresh()
+        XCTAssertEqual(reloaded.items.map(\.storedSessionId),
+                       [storedTip, "other", storedTip])
+    }
+
+    func testRestampIsNoopWhenOldEqualsNewOrNothingMatches() async throws {
+        let (queue, _, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = await queue.enqueue("p", storedSessionId: storedParent)
+        await queue.restamp(from: storedParent, to: storedParent)  // old == new → no-op
+        XCTAssertEqual(queue.items.first?.storedSessionId, storedParent)
+        await queue.restamp(from: "nonexistent", to: storedTip)    // no match → no-op
+        XCTAssertEqual(queue.items.first?.storedSessionId, storedParent)
+    }
+
+    // MARK: - A3 end-to-end: a migrated prompt becomes drain-eligible
+
+    func testRestampMakesAChainTipPromptEligibleForActiveAffinity() async {
+        let (_, sessions) = makeStores()
+        let (queue, _, directory) = try! makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // The session resumed onto its compression continuation; a prompt was
+        // queued earlier under the PARENT id (the drawer row the user tapped).
+        sessions.activeRuntimeId = "rt"   // runtime bound → send is attempted
+        sessions.activeStoredId = storedTip
+        _ = await queue.enqueue("queued under parent", storedSessionId: storedParent)
+
+        XCTAssertNotEqual(queue.items.first?.storedSessionId, sessions.activeStoredId)
+        XCTAssertEqual(queue.items.count, 1, "affinity mismatch never deletes durable work")
+
+        // After restamp: the stamp now matches the active tip → eligible → attempted
+        // (the disconnected client doesn't accept it, but the appended user bubble
+        // proves the prompt was no longer skipped).
+        await queue.restamp(from: storedParent, to: storedTip)
+        XCTAssertEqual(queue.items.first?.storedSessionId, sessions.activeStoredId,
+                       "after restamp the processor affinity matches the active chain tip")
+    }
+
+    // MARK: - ensureActiveRuntime guards (no network)
+
+    /// #210 fast-path contract: a runtime bound under the CURRENT ready transport
+    /// (matching epoch) is returned as-is, WITHOUT re-resuming. Rewritten from the
+    /// pre-#210 version that only set `activeRuntimeId` — the fast-path now also
+    /// requires `isTransportReady` + a matching `activeRuntimeEpoch`, so the old
+    /// test fell through to a live resume and hung the suite for 120s.
+    func testEnsureActiveRuntimeReturnsExistingRuntimeWithoutResuming() async {
+        let (_, sessions) = makeStores()
+        let connection = sessions.connectionForTesting!
+        // A ready transport (epoch advances to a real, accepted value).
+        connection._seedConnectedForTesting(serverURL: "https://gateway.test", token: "t")
+        // Runtime bound under THAT epoch — the fast-path precondition.
+        sessions._bindActiveRuntimeForTesting(id: "rt-live", epoch: connection.transportEpoch)
+        sessions.activeStoredId = storedParent
+        // A resume would flip this; the fast-path must never invoke it.
+        var resumed = false
+        sessions.resumeRPC = { storedId, _ in
+            resumed = true
+            return self.stagedResult(sessionId: "rt-new", resumed: storedId)
+        }
+
+        let rid = await sessions.ensureActiveRuntime()
+
+        XCTAssertEqual(rid, "rt-live",
+            "a ready transport with a matching epoch returns the bound runtime as-is")
+        XCTAssertFalse(resumed,
+            "the fast-path must not resume when the transport is ready and the epoch matches")
+    }
+
+    /// #210 companion: a runtime bound under a STALE epoch (an older transport than
+    /// the current ready one) must NOT short-circuit — it falls through to a resume
+    /// so the caller re-binds against the live socket.
+    func testEnsureActiveRuntimeResumesWhenEpochIsStale() async {
+        let (_, sessions) = makeStores()
+        let connection = sessions.connectionForTesting!
+        connection._seedConnectedForTesting(serverURL: "https://gateway.test", token: "t")
+        // Bound under the PREVIOUS transport generation — the fast-path must reject it.
+        sessions._bindActiveRuntimeForTesting(
+            id: "rt-stale", epoch: connection.transportEpoch &- 1)
+        sessions.activeStoredId = storedParent
+        var resumed = false
+        sessions.resumeRPC = { storedId, _ in
+            resumed = true
+            return self.stagedResult(sessionId: "rt-fresh", resumed: storedId)
+        }
+
+        let rid = await sessions.ensureActiveRuntime()
+
+        XCTAssertTrue(resumed,
+            "a stale-epoch runtime must fall through to a resume (#210)")
+        XCTAssertEqual(rid, "rt-fresh",
+            "the resume re-binds the runtime against the current transport")
+    }
+
+    func testEnsureActiveRuntimeReturnsNilWithNothingToResume() async {
+        let (_, sessions) = makeStores()
+        sessions.activeRuntimeId = nil
+        sessions.activeStoredId = nil
+        let rid = await sessions.ensureActiveRuntime()
+        XCTAssertNil(rid, "nothing to resume → nil, no crash")
+    }
+
+    // MARK: - ChatStore.send graceful failure when no runtime can bind
+
+    func testSendSurfacesNoActiveSessionWhenNothingToResume() async {
+        let (chat, sessions) = makeStores()
+        sessions.activeRuntimeId = nil   // forces the self-heal path
+        sessions.activeStoredId = nil    // …which has nothing to resume (no network)
+        let accepted = await chat.send(text: "hello")
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(chat.lastError, "No active session",
+                       "a self-heal that can't bind still fails gracefully")
+    }
+
+    // MARK: - Supersession: a stale on-demand resume must not clobber a switch
+
+    private func stagedResult(sessionId: String, resumed: String) -> SessionOpenResult {
+        JSONValue.object([
+            "session_id": .string(sessionId),
+            "resumed": .string(resumed),
+        ]).decoded(as: SessionOpenResult.self)!
+    }
+
+    func testResumeDoesNotClobberWhenUserSwitchedSessionsMidResume() async {
+        let (_, sessions) = makeStores()
+        sessions.activeStoredId = "A"
+        sessions.activeRuntimeId = nil
+        // While A's resume is "in flight", the user taps session B (open(B) sets
+        // activeStoredId = B). A's result then comes back stale.
+        sessions.resumeRPC = { storedId, _ in
+            XCTAssertEqual(storedId, "A", "resume targets the session active at call time")
+            sessions.activeStoredId = "B"          // simulate the switch during the await
+            return self.stagedResult(sessionId: "rt-A", resumed: "A")
+        }
+
+        let rid = await sessions.resumeActiveAfterReconnect()
+
+        XCTAssertNil(rid, "a stale resume for A self-aborts once the user moved to B")
+        XCTAssertEqual(sessions.activeStoredId, "B",
+                       "B's stored pointer is NOT clobbered back to A")
+        XCTAssertNil(sessions.activeRuntimeId,
+                     "A's runtime is NOT bound while B is the active session")
+    }
+
+    func testResumeBindsWhenSessionUnchanged() async {
+        let (_, sessions) = makeStores()
+        sessions.activeStoredId = "A"
+        sessions.activeRuntimeId = nil
+        sessions.resumeRPC = { _, _ in self.stagedResult(sessionId: "rt-A", resumed: "A") }
+
+        let rid = await sessions.resumeActiveAfterReconnect()
+
+        XCTAssertEqual(rid, "rt-A", "an un-superseded resume binds the runtime")
+        XCTAssertEqual(sessions.activeRuntimeId, "rt-A")
+        XCTAssertEqual(sessions.activeStoredId, "A")
+    }
+
+    func testResumeFailureSurfacesObservedSessionActionError() async {
+        let (_, sessions) = makeStores()
+        sessions.activeStoredId = "A"
+        sessions.activeRuntimeId = nil
+        sessions.resumeRPC = { _, _ in throw ResumeFailure() }
+
+        let rid = await sessions.resumeActiveAfterReconnect()
+
+        XCTAssertNil(rid, "a failed reconnect resume leaves the runtime unbound")
+        XCTAssertEqual(sessions.lastError, "resume exploded")
+        XCTAssertEqual(sessions.sessionActionError?.action, "Resume Session")
+        XCTAssertEqual(sessions.sessionActionError?.message, "resume exploded",
+                       "resume failures must route to the drawer-observed alert channel, not only lastError")
+    }
+}
