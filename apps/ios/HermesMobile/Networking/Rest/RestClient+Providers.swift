@@ -263,9 +263,8 @@ extension RestClient {
     func probeProvidersEndpoint() async -> UploadProbeResult {
         let request = makeRequest(path: "\(mobileAPIPrefix)/providers", method: "GET")
         do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return .inconclusive }
-            switch http.statusCode {
+            let (data, response) = try await authorizedDataResponse(for: request)
+            switch response.statusCode {
             case 200:
                 if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    object["providers"] is [Any] {

@@ -52,10 +52,10 @@ enum APIPathStyle: String, Sendable, Codable {
 
 /// Stateless HTTP client for the hermes gateway's REST surface.
 ///
-/// Every request overrides the `Host` header to `127.0.0.1` (the server validates
-/// Host against its loopback bind; Tailscale Serve preserves the public hostname
-/// otherwise) and carries the `X-Hermes-Session-Token` auth header. All requests
-/// use a 15-second timeout and throw ``RestError`` on failure.
+/// Every request applies the gateway's loopback Host override and uses either
+/// the legacy `X-Hermes-Session-Token` credential or a stock native-session
+/// Bearer credential. Provider-authenticated requests resolve the live access
+/// token through one shared refresh actor and retry one rejected request.
 ///
 /// The core endpoint groups live in `extension RestClient` files
 /// (`RestClient+Sessions.swift`, `RestClient+Control.swift`, `RestClient+Audio.swift`).
@@ -64,8 +64,11 @@ enum APIPathStyle: String, Sendable, Codable {
 /// those same-module extensions reuse one implementation instead of cloning it.
 struct RestClient: Sendable {
     let baseURL: URL
+    /// Compatibility/debug snapshot. Provider-authenticated requests resolve
+    /// the live access token through ``providerCredentials`` before sending.
     let token: String
     let session: URLSession
+    private let providerCredentials: NativeCredentialController?
     /// The injected-session initializer is used by tests to keep uploads on the
     /// same URLProtocol-backed transport as the other REST calls. Production
     /// clients always use the durable background transfer path below.
@@ -74,12 +77,16 @@ struct RestClient: Sendable {
     /// Defaults to `.legacy` so an un-migrated construction site keeps today's
     /// behavior; ``ConnectionStore`` passes the probed style.
     let pathStyle: APIPathStyle
+    let connectionMode: ConnectionMode
     /// - Parameters:
     ///   - baseURL: The gateway base, e.g. `https://host[:port]`.
     ///   - token: The session token sent as `X-Hermes-Session-Token`.
     ///   - pathStyle: Path family for the mobile endpoint group.
     init(
-        baseURL: URL, token: String, pathStyle: APIPathStyle = .legacy
+        baseURL: URL,
+        token: String,
+        pathStyle: APIPathStyle = .legacy,
+        connectionMode: ConnectionMode = .sharedDashboard
     ) {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = Self.timeout
@@ -89,6 +96,29 @@ struct RestClient: Sendable {
             token: token,
             session: URLSession(configuration: config),
             pathStyle: pathStyle,
+            connectionMode: connectionMode,
+            providerCredentials: nil,
+            usesInjectedUploadSession: false
+        )
+    }
+
+    init(
+        baseURL: URL,
+        providerCredential: ProviderCredentialBundle,
+        controller: NativeCredentialController,
+        pathStyle: APIPathStyle = .legacy,
+        connectionMode: ConnectionMode = .remoteURL
+    ) {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = Self.timeout
+        config.waitsForConnectivity = false
+        self.init(
+            baseURL: baseURL,
+            token: providerCredential.accessToken,
+            session: URLSession(configuration: config),
+            pathStyle: pathStyle,
+            connectionMode: connectionMode,
+            providerCredentials: controller,
             usesInjectedUploadSession: false
         )
     }
@@ -100,13 +130,36 @@ struct RestClient: Sendable {
         baseURL: URL,
         token: String,
         session: URLSession,
-        pathStyle: APIPathStyle = .legacy
+        pathStyle: APIPathStyle = .legacy,
+        connectionMode: ConnectionMode = .sharedDashboard
     ) {
         self.init(
             baseURL: baseURL,
             token: token,
             session: session,
             pathStyle: pathStyle,
+            connectionMode: connectionMode,
+            providerCredentials: nil,
+            usesInjectedUploadSession: true
+        )
+    }
+
+    /// Testable provider-session initializer using an injected URLSession.
+    init(
+        baseURL: URL,
+        providerCredential: ProviderCredentialBundle,
+        controller: NativeCredentialController,
+        session: URLSession,
+        pathStyle: APIPathStyle = .legacy,
+        connectionMode: ConnectionMode = .remoteURL
+    ) {
+        self.init(
+            baseURL: baseURL,
+            token: providerCredential.accessToken,
+            session: session,
+            pathStyle: pathStyle,
+            connectionMode: connectionMode,
+            providerCredentials: controller,
             usesInjectedUploadSession: true
         )
     }
@@ -116,12 +169,16 @@ struct RestClient: Sendable {
         token: String,
         session: URLSession,
         pathStyle: APIPathStyle,
+        connectionMode: ConnectionMode,
+        providerCredentials: NativeCredentialController?,
         usesInjectedUploadSession: Bool
     ) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
         self.pathStyle = pathStyle
+        self.connectionMode = connectionMode
+        self.providerCredentials = providerCredentials
         self.usesInjectedUploadSession = usesInjectedUploadSession
     }
 
@@ -132,6 +189,8 @@ struct RestClient: Sendable {
             token: token,
             session: session,
             pathStyle: style,
+            connectionMode: connectionMode,
+            providerCredentials: providerCredentials,
             usesInjectedUploadSession: usesInjectedUploadSession
         )
     }
@@ -343,8 +402,7 @@ struct RestClient: Sendable {
             path: "/api/plugins/hermes-mobile/devices", method: "GET"
         )
         do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return .inconclusive }
+            let (data, http) = try await authorizedDataResponse(for: request)
             switch http.statusCode {
             case 200:
                 if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -383,7 +441,9 @@ struct RestClient: Sendable {
         mimeType: String,
         ownerJobID: String?
     ) async throws -> DurableUploadResult {
-        let request = makeRequest(path: "\(mobileAPIPrefix)/upload", method: "POST")
+        let request = try await authorizedRequest(
+            makeRequest(path: "\(mobileAPIPrefix)/upload", method: "POST")
+        )
         guard let url = request.url else { throw RestError.network("Invalid upload URL") }
 
         if usesInjectedUploadSession {
@@ -393,15 +453,15 @@ struct RestClient: Sendable {
             let body = multipartBody(
                 data: data, filename: filename, mimeType: mimeType, boundary: boundary
             )
-            let response: URLResponse
-            let responseData: Data
-            do {
-                (responseData, response) = try await session.upload(for: request, from: body)
-            } catch {
-                throw RestError.network(error.localizedDescription)
-            }
-            guard let http = response as? HTTPURLResponse else {
-                throw RestError.network("Non-HTTP response")
+            var (responseData, http) = try await uploadResponse(for: request, body: body)
+            if http.statusCode == 401,
+               let providerCredentials,
+               let rejected = Self.bearerToken(in: request) {
+                let retry = try await providerCredentials.retryAuthorization(
+                    request,
+                    rejectedAccessToken: rejected
+                )
+                (responseData, http) = try await uploadResponse(for: retry, body: body)
             }
             guard (200..<300).contains(http.statusCode) else {
                 let responseBody = String(data: responseData, encoding: .utf8) ?? ""
@@ -415,7 +475,7 @@ struct RestClient: Sendable {
             )
         }
 
-        let transfer = try await TransferManager.shared.uploadMultipart(
+        var transfer = try await TransferManager.shared.uploadMultipart(
             data: data,
             filename: filename,
             mimeType: mimeType,
@@ -423,6 +483,22 @@ struct RestClient: Sendable {
             headers: request.allHTTPHeaderFields ?? [:],
             ownerJobId: ownerJobID
         )
+        if transfer.httpStatus == 401,
+           let providerCredentials,
+           let rejected = Self.bearerToken(in: request) {
+            let retry = try await providerCredentials.retryAuthorization(
+                request,
+                rejectedAccessToken: rejected
+            )
+            transfer = try await TransferManager.shared.uploadMultipart(
+                data: data,
+                filename: filename,
+                mimeType: mimeType,
+                to: url,
+                headers: retry.allHTTPHeaderFields ?? [:],
+                ownerJobId: ownerJobID
+            )
+        }
         guard let status = transfer.httpStatus, (200...299).contains(status) else {
             throw RestError.badStatus(transfer.httpStatus ?? 0, body: "Background upload failed")
         }
@@ -479,9 +555,16 @@ struct RestClient: Sendable {
             timeoutInterval: Self.timeout
         )
         request.httpMethod = method
-        // Loopback Host override — the gateway validates Host against its bind.
-        request.setValue("127.0.0.1", forHTTPHeaderField: "Host")
-        request.setValue(token, forHTTPHeaderField: "X-Hermes-Session-Token")
+        // Preserve the real host for native remote/relay paths; only Serve and
+        // loopback modes require the gateway's loopback Host override.
+        if let host = WSURLBuilder.effectiveHost(for: baseURL, mode: connectionMode) {
+            request.setValue(host, forHTTPHeaderField: "Host")
+        }
+        if providerCredentials != nil {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        } else {
+            request.setValue(token, forHTTPHeaderField: "X-Hermes-Session-Token")
+        }
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         return request
     }
@@ -501,6 +584,38 @@ struct RestClient: Sendable {
 
     /// Execute a request and validate the HTTP status, mapping failures to ``RestError``.
     func perform(_ request: URLRequest) async throws -> Data {
+        let response = try await authorizedDataResponse(for: request)
+        return try validatedData(response.data, response: response.response)
+    }
+
+    func authorizedRequest(_ request: URLRequest) async throws -> URLRequest {
+        guard let providerCredentials else { return request }
+        return try await providerCredentials.authorize(request)
+    }
+
+    /// Execute through the active credential authority and return the raw HTTP
+    /// response. Capability probes use this to inspect 404/405 without cloning
+    /// or bypassing provider refresh behavior.
+    func authorizedDataResponse(
+        for request: URLRequest
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let authorized = try await authorizedRequest(request)
+        let first = try await dataResponse(for: authorized)
+        if first.response.statusCode == 401,
+           let providerCredentials,
+           let rejected = Self.bearerToken(in: authorized) {
+            let retry = try await providerCredentials.retryAuthorization(
+                authorized,
+                rejectedAccessToken: rejected
+            )
+            return try await dataResponse(for: retry)
+        }
+        return first
+    }
+
+    private func dataResponse(
+        for request: URLRequest
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
         let data: Data
         let response: URLResponse
         do {
@@ -511,11 +626,40 @@ struct RestClient: Sendable {
         guard let http = response as? HTTPURLResponse else {
             throw RestError.network("Non-HTTP response")
         }
+        return (data, http)
+    }
+
+    private func uploadResponse(
+        for request: URLRequest,
+        body: Data
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.upload(for: request, from: body)
+        } catch {
+            throw RestError.network(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw RestError.network("Non-HTTP response")
+        }
+        return (data, http)
+    }
+
+    private func validatedData(_ data: Data, response http: HTTPURLResponse) throws -> Data {
         guard (200..<300).contains(http.statusCode) else {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw RestError.badStatus(http.statusCode, body: String(body.prefix(512)))
         }
         return data
+    }
+
+    private static func bearerToken(in request: URLRequest) -> String? {
+        guard let value = request.value(forHTTPHeaderField: "Authorization"),
+              value.lowercased().hasPrefix("bearer ") else { return nil }
+        let token = String(value.dropFirst("Bearer ".count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
     }
 
     /// Decode `data` into `T`, applying the requested key strategy.

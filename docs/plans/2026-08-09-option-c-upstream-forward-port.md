@@ -1,6 +1,6 @@
 # Option C upstream-first forward-port ledger
 
-Status: P-1 through H3 complete; H4 backend provider implemented and under review
+Status: P-1 through H3 complete; H4 backend and existing-iOS client integration implemented
 
 Upstream baseline: `31cedb4830191da7f8c3ea4b962d40997cd85b21`
 
@@ -318,12 +318,40 @@ Backend verification evidence:
   dashboard-auth provider suites.
 - Ruff, Python compilation, and `git diff --check` pass.
 
-Remaining H4 client work:
+Existing-iOS client result:
 
-- Store the provider access/refresh bundle atomically in Keychain with non-secret
-  provider/client metadata scoped to the existing server identity.
-- Use Bearer REST, mint a one-use WS ticket immediately before every socket connect,
-  rotate refresh single-flight on 401, and keep every completion guarded by the current
-  connection generation.
-- Preserve the current shared-token path for old/loopback gateways and remove no device
-  settings or compatibility flow until migration tests prove the replacement.
+- The current SwiftUI application remains the product foundation. Pair parsing adds
+  `kind=provider&bootstrap=…` without changing the legacy shared/device/manual-token
+  payloads; provider pairing requires HTTPS and stores no bootstrap value.
+- The access/refresh pair and stable provider/user/client metadata are committed as one
+  server-scoped Keychain value. A successful provider commit removes the legacy shared
+  token only afterwards; cold launch prefers the provider bundle and retains the legacy
+  fallback when no bundle exists.
+- One `NativeCredentialController` actor owns the live credential for the active server.
+  REST requests, capability probes, uploads, ticket minting, and reconnects share its
+  single refresh flight. A rotated pair is usable only after its atomic Keychain commit;
+  commit failure poisons the actor and routes the app to re-pair instead of replaying the
+  consumed refresh token.
+- Remote REST uses stock Bearer auth and preserves the URL's real Host. Legacy
+  loopback/Serve requests keep `X-Hermes-Session-Token` and the loopback Host override.
+  Direct extension-level URLSession calls were folded into the common authorized
+  response path, including one 401 retry.
+- Every provider WebSocket attempt mints a fresh stock ticket immediately before
+  connect and uses `/api/ws?ticket=…`; provider access and refresh tokens never enter a
+  WebSocket URL. Every post-ticket and post-connect state mutation remains fenced by the
+  existing connection generation.
+- Provider mode skips the old plugin device-token auto-upgrade, so no second credential
+  owner is created. Forget removes both credential formats. Optional APNs/Live Activity
+  delivery remains a later thin-provider milestone.
+
+Client verification evidence:
+
+- Swift 6 complete-concurrency application and unit-test targets build for testing
+  through `scripts/ios-build.sh` when the asset catalog is excluded.
+- Focused tests cover additive provider/legacy payload parsing, Bearer-vs-legacy headers,
+  single-flight refresh, terminal rotated-persistence failure, ticket refresh/freshness,
+  and provider Keychain round-trip/preference/deletion.
+- Runtime execution is still environment-blocked: CoreSimulator cannot initialize its
+  device set (`ENOMEM`), and the connected physical iPhone test launch reached signed
+  device preflight but required the locked phone to be unlocked. No raw `xcodebuild`
+  invocation was used.

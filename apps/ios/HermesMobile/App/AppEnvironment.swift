@@ -366,7 +366,13 @@ final class AppEnvironment {
                 let defaults = UserDefaults.standard
                 guard let url = defaults.string(forKey: DefaultsKeys.serverURL)?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !url.isEmpty,
-                      let token = KeychainService.loadToken(server: url), !token.isEmpty else { return nil }
+                      let credential = KeychainService.loadCredential(server: url) else { return nil }
+                let token: String
+                switch credential {
+                case .sharedToken(let value): token = value
+                case .provider(let bundle): token = bundle.accessToken
+                }
+                guard !token.isEmpty else { return nil }
                 let profile = defaults.string(forKey: DefaultsKeys.activeProfile) ?? DefaultsKeys.allProfilesScope
                 return BackgroundManifestScope(gatewayURL: url, scope: profile, token: token)
             },

@@ -107,14 +107,13 @@ extension RestClient {
         request.httpBody = payload
 
         let data: Data
-        let response: URLResponse
+        let response: HTTPURLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await authorizedDataResponse(for: request)
         } catch {
             return .outcome(.failed)
         }
-        guard let http = response as? HTTPURLResponse else { return .outcome(.failed) }
-        switch http.statusCode {
+        switch response.statusCode {
         case 200, 201:
             // Decode `{"resolved": bool}`. A missing/odd body on a 2xx is treated
             // as "already handled" rather than a hard failure — the server
@@ -175,14 +174,13 @@ extension RestClient {
         request.httpBody = payload
 
         let data: Data
-        let response: URLResponse
+        let response: HTTPURLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await authorizedDataResponse(for: request)
         } catch {
             return .outcome(.failed)
         }
-        guard let http = response as? HTTPURLResponse else { return .outcome(.failed) }
-        switch http.statusCode {
+        switch response.statusCode {
         case 200, 201:
             let root = try? decodeJSONValue(from: data, context: "approvals/reply")
             let resolved = root?["resolved"]?.boolValue ?? false
@@ -269,10 +267,9 @@ extension RestClient {
         }
         request.httpBody = payload
         do {
-            let (_, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return .failed }
-            if (200..<300).contains(http.statusCode) { return .success }
-            if http.statusCode == 404 { return .notDeployed }
+            let (_, response) = try await authorizedDataResponse(for: request)
+            if (200..<300).contains(response.statusCode) { return .success }
+            if response.statusCode == 404 { return .notDeployed }
             return .failed
         } catch {
             return .failed

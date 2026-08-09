@@ -45,9 +45,8 @@ extension RestClient {
     func probeProfilesEndpoint() async -> UploadProbeResult {
         let request = makeRequest(path: "/api/profiles/sessions", method: "GET")
         do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return .inconclusive }
-            switch http.statusCode {
+            let (data, response) = try await authorizedDataResponse(for: request)
+            switch response.statusCode {
             case 200:
                 // Confirm the body really is the aggregate wrapper before trusting
                 // the route. `JSONSerialization` (not a typed decode) so a missing

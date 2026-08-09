@@ -134,18 +134,25 @@ enum HermesURLRouter {
         ///
         /// (Inc-3b: wires the plugin's `manual_token=True` signal into the iOS UX.)
         let manualToken: Bool
+        /// One-use bootstrap secret for `kind=provider` pairing. It is exchanged
+        /// for a stock Hermes native-session credential bundle and is never
+        /// persisted by the app.
+        let providerBootstrap: String?
+        var isProviderPair: Bool { providerBootstrap?.isEmpty == false }
         init(
             url: String,
             token: String,
             isDeviceToken: Bool,
             deviceId: String?,
-            manualToken: Bool
+            manualToken: Bool,
+            providerBootstrap: String? = nil
         ) {
             self.url = url
             self.token = token
             self.isDeviceToken = isDeviceToken
             self.deviceId = deviceId
             self.manualToken = manualToken
+            self.providerBootstrap = providerBootstrap
         }
     }
 
@@ -188,9 +195,14 @@ enum HermesURLRouter {
         // empty `token` param when this flag is present; set manualToken = true.
         let manualTokenFlag = value("manual_token")?.lowercased() == "true"
         let tokenValue = value("token") ?? ""
+        let providerBootstrap = value("bootstrap")
+        let isProvider = kind == "provider"
 
-        // For standard payloads (no manual_token flag), token is still required.
-        if !manualTokenFlag && tokenValue.isEmpty { return nil }
+        // Provider pairing carries a one-use bootstrap instead of a reusable
+        // shared token. Every other payload retains the existing token contract.
+        if isProvider && manualTokenFlag { return nil }
+        if isProvider && providerBootstrap?.isEmpty != false { return nil }
+        if !isProvider && !manualTokenFlag && tokenValue.isEmpty { return nil }
 
         // v2 additive keys (a v1 payload simply has neither).
         let deviceId = value("device_id")
@@ -198,10 +210,11 @@ enum HermesURLRouter {
 
         return PairPayload(
             url: urlValue,
-            token: manualTokenFlag ? "" : tokenValue,
+            token: (manualTokenFlag || isProvider) ? "" : tokenValue,
             isDeviceToken: isDevice,
             deviceId: isDevice ? deviceId : nil,
-            manualToken: manualTokenFlag
+            manualToken: manualTokenFlag,
+            providerBootstrap: isProvider ? providerBootstrap : nil
         )
     }
 
@@ -545,6 +558,19 @@ enum HermesURLRouter {
     /// mode the picker last persisted (a stale `.remoteURL` would then emit the
     /// wrong Host header once Inc 2 transport-branches on the mode).
     static func applyPair(_ payload: PairPayload, connection: ConnectionStore) {
+        if let bootstrap = payload.providerBootstrap {
+            // Provider-backed gateways are native remote URLs. Hermes remains
+            // the session authority; the bootstrap only establishes a stock
+            // native-session credential and is never used as a transport token.
+            connection.connectionMode = .remoteURL
+            Task {
+                _ = await connection.configureProvider(
+                    urlString: payload.url,
+                    bootstrap: bootstrap
+                )
+            }
+            return
+        }
         // All QR / deep-link pair payloads come from the shared-dashboard flow —
         // tag the mode so the picker reflects the action AND so the transport
         // derives the correct loopback Host header (Tailscale Serve path).

@@ -32,11 +32,31 @@ enum WSURLBuilder {
         token: String,
         mode: ConnectionMode = .remoteURL
     ) -> URLRequest {
+        wsRequest(baseURL: baseURL, credentialQuery: "token", credential: token, mode: mode)
+    }
+
+    /// Build the stock native-session WebSocket upgrade request for
+    /// `{base}/api/ws?ticket={ticket}`. Tickets are short-lived and one-use;
+    /// callers must mint a new value immediately before every connection attempt.
+    static func wsRequest(
+        baseURL: URL,
+        ticket: String,
+        mode: ConnectionMode = .remoteURL
+    ) -> URLRequest {
+        wsRequest(baseURL: baseURL, credentialQuery: "ticket", credential: ticket, mode: mode)
+    }
+
+    private static func wsRequest(
+        baseURL: URL,
+        credentialQuery: String,
+        credential: String,
+        mode: ConnectionMode
+    ) -> URLRequest {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
             ?? URLComponents()
         components.scheme = webSocketScheme(for: baseURL.scheme)
         components.path = joinedPath(base: baseURL.path, suffix: "/api/ws")
-        components.queryItems = [URLQueryItem(name: "token", value: token)]
+        components.queryItems = [URLQueryItem(name: credentialQuery, value: credential)]
 
         // Fall back to a string-built URL if components somehow can't resolve;
         // in practice `components.url` is always non-nil for a valid base.

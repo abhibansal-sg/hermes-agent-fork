@@ -202,13 +202,27 @@ actor HermesGatewayClient {
     ///   non-loopback remoteURL target). Defaults to `.remoteURL` so callers that
     ///   do not supply a mode keep the conservative real-host behaviour.
     func connect(baseURL: URL, token: String, mode: ConnectionMode = .remoteURL) async throws {
+        try await connect(
+            request: WSURLBuilder.wsRequest(baseURL: baseURL, token: token, mode: mode)
+        )
+    }
+
+    /// Connect with a stock native-session one-use WebSocket ticket. Keeping
+    /// this separate from the legacy token overload prevents provider access or
+    /// refresh tokens from ever entering a WebSocket URL.
+    func connect(baseURL: URL, ticket: String, mode: ConnectionMode = .remoteURL) async throws {
+        try await connect(
+            request: WSURLBuilder.wsRequest(baseURL: baseURL, ticket: ticket, mode: mode)
+        )
+    }
+
+    private func connect(request: URLRequest) async throws {
         // Drop any prior connection (and its receive loop) cleanly.
         teardown(state: .connecting, failPendingWith: GatewayError.notConnected)
 
         generation &+= 1
         let myGeneration = generation
 
-        let request = WSURLBuilder.wsRequest(baseURL: baseURL, token: token, mode: mode)
         let task = transportFactory(request)
         self.task = task
         task.resume()
