@@ -539,12 +539,11 @@ final class ToolsetCredentialRestTests: XCTestCase {
         """#.utf8)
 
         for style in [APIPathStyle.legacy, .plugin] {
-            let prefix = style.mobileAPIPrefix
             let client = makeClient(style: style, script: [(body, 200)])
 
             let config = try await client.getToolsetConfig(name: "web")
 
-            XCTAssertEqual(recordedPaths, ["\(prefix)/toolsets/web/config"])
+            XCTAssertEqual(recordedPaths, ["/api/tools/toolsets/web/config"])
             XCTAssertEqual(recordedMethods, ["GET"])
             XCTAssertEqual(config.name, "web")
             XCTAssertEqual(config.displayName, "Web Search")
@@ -566,10 +565,10 @@ final class ToolsetCredentialRestTests: XCTestCase {
 
     func testSetToolsetCredentialPutsKeyAndTrimmedValueInBody() async throws {
         let response = Data(#"{"name":"web","providers":[]}"#.utf8)
+        let mutation = Data(#"{"ok":true,"saved":["TAVILY_API_KEY"]}"#.utf8)
 
         for style in [APIPathStyle.legacy, .plugin] {
-            let prefix = style.mobileAPIPrefix
-            let client = makeClient(style: style, script: [(response, 200)])
+            let client = makeClient(style: style, script: [(mutation, 200), (response, 200)])
 
             _ = try await client.setToolsetCredential(
                 name: "web",
@@ -577,14 +576,17 @@ final class ToolsetCredentialRestTests: XCTestCase {
                 value: "  tvly-test-token  "
             )
 
-            XCTAssertEqual(recordedPaths, ["\(prefix)/toolsets/web/config"])
-            XCTAssertEqual(recordedMethods, ["PUT"])
+            XCTAssertEqual(recordedPaths, [
+                "/api/tools/toolsets/web/env",
+                "/api/tools/toolsets/web/config",
+            ])
+            XCTAssertEqual(recordedMethods, ["PUT", "GET"])
             let request = try XCTUnwrap(RecordingProtocol.requests.first)
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
             XCTAssertFalse(request.url?.absoluteString.contains("tvly-test-token") ?? true, "credential must not leak into URL")
             let object = try XCTUnwrap(jsonBody(for: request))
-            XCTAssertEqual(object["key"] as? String, "TAVILY_API_KEY")
-            XCTAssertEqual(object["value"] as? String, "tvly-test-token")
+            let env = try XCTUnwrap(object["env"] as? [String: Any])
+            XCTAssertEqual(env["TAVILY_API_KEY"] as? String, "tvly-test-token")
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-Hermes-Session-Token"), "tok")
         }
     }
@@ -593,7 +595,10 @@ final class ToolsetCredentialRestTests: XCTestCase {
         let response = Data(#"""
         {"name":"image_gen","providers":[{"name":"FAL","env_vars":[{"key":"FAL_KEY","prompt":"FAL Key","is_set":false}]}]}
         """#.utf8)
-        let client = makeClient(style: .plugin, script: [(response, 200)])
+        let client = makeClient(
+            style: .plugin,
+            script: [(Data(#"{"found":true}"#.utf8), 200), (response, 200)]
+        )
 
         let config = try await client.setToolsetCredential(
             name: "image_gen",
@@ -601,12 +606,14 @@ final class ToolsetCredentialRestTests: XCTestCase {
             value: nil
         )
 
-        XCTAssertEqual(recordedPaths, ["/api/plugins/hermes-mobile/toolsets/image_gen/config"])
-        XCTAssertEqual(recordedMethods, ["PUT"])
+        XCTAssertEqual(recordedPaths, [
+            "/api/env",
+            "/api/tools/toolsets/image_gen/config",
+        ])
+        XCTAssertEqual(recordedMethods, ["DELETE", "GET"])
         let request = try XCTUnwrap(RecordingProtocol.requests.first)
         let object = try XCTUnwrap(jsonBody(for: request))
         XCTAssertEqual(object["key"] as? String, "FAL_KEY")
-        XCTAssertEqual(object["value"] as? String, "", "nil clear must be sent as an empty value")
         XCTAssertFalse(try XCTUnwrap(config.providers.first?.envVars.first).isSet)
     }
 
@@ -651,22 +658,27 @@ final class ToolsetCredentialRestTests: XCTestCase {
         """#.utf8)
 
         for style in [APIPathStyle.legacy, .plugin] {
-            let prefix = style.mobileAPIPrefix
-            let client = makeClient(style: style, script: [(body, 200)])
+            let client = makeClient(
+                style: style,
+                script: [(Data(#"{"ok":true}"#.utf8), 200), (body, 200)]
+            )
 
-            let config = try await client.selectToolsetProvider(name: "web", provider: "tavily")
+            let config = try await client.selectToolsetProvider(name: "web", provider: "Tavily")
 
-            XCTAssertEqual(recordedPaths, ["\(prefix)/toolsets/web/provider"])
-            XCTAssertEqual(recordedMethods, ["PUT"])
+            XCTAssertEqual(recordedPaths, [
+                "/api/tools/toolsets/web/provider",
+                "/api/tools/toolsets/web/config",
+            ])
+            XCTAssertEqual(recordedMethods, ["PUT", "GET"])
             XCTAssertEqual(config.name, "web")
             XCTAssertEqual(config.activeProvider, "tavily")
             XCTAssertTrue(config.providers[0].isActive)
 
             let request = try XCTUnwrap(RecordingProtocol.requests.first)
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
-            XCTAssertFalse(request.url?.absoluteString.contains("tavily") ?? true, "provider must not leak into URL")
+            XCTAssertFalse(request.url?.absoluteString.contains("Tavily") ?? true, "provider must not leak into URL")
             let object = try XCTUnwrap(jsonBody(for: request))
-            XCTAssertEqual(object["provider"] as? String, "tavily")
+            XCTAssertEqual(object["provider"] as? String, "Tavily")
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-Hermes-Session-Token"), "tok")
         }
     }

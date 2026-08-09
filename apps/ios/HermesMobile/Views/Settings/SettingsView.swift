@@ -913,16 +913,11 @@ struct SettingsView: View {
     }
     #endif
 
-    /// The ABH-262 Toolset keys row — a single push to ``ToolsetConfigView``
-    /// (web + image_gen credential state, set, and clear). Rendered ONLY when
-    /// the connected gateway advertises the plugin mount because the routes
-    /// live at `/api/plugins/hermes-mobile/toolsets/{name}/config`. Stored key
-    /// values are never returned by the gateway; the pushed form always
-    /// starts blank.
+    /// Stock Hermes toolset credentials. The panel uses the same redacted
+    /// `/api/tools/toolsets/*` and `/api/env` routes as Desktop.
     @ViewBuilder
     private var toolsetKeysRow: some View {
-        if connectionStore.capabilities.pluginMount == .available,
-           let rest = connectionStore.rest {
+        if let rest = connectionStore.rest {
             NavigationLink {
                 ToolsetConfigView(rest: rest)
                     .background(theme.bg)
@@ -2138,7 +2133,9 @@ struct ToolsetConfigView: View {
                             toolsetName: config.name,
                             toolsetDisplayName: config.displayName,
                             providerName: provider.name.isEmpty ? config.displayName : provider.name,
-                            providerTag: provider.tag,
+                            // Stock Hermes selects by the canonical provider
+                            // display name returned in this same matrix.
+                            providerTag: provider.name,
                             envVar: envVar
                         )
                     )
@@ -2305,7 +2302,7 @@ struct ToolsetConfigView: View {
         do {
             let refreshed = try await rest.selectToolsetProvider(
                 name: config.name,
-                provider: provider.tag
+                provider: provider.name
             )
             replaceConfig(refreshed)
             let providerName = provider.name.isEmpty ? config.displayName : provider.name

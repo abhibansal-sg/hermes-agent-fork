@@ -410,13 +410,14 @@ extension RestClient {
 }
 
 
-// MARK: - ABH-262 toolset credential REST surface (plugin-mount)
+// MARK: - Stock Hermes toolset credential REST surface
 //
-// The mobile plugin exposes desktop-parity toolset credential config at:
+// iOS consumes the same native routes as the Hermes desktop dashboard:
 //
-//   GET <prefix>/toolsets/{name}/config
-//   PUT <prefix>/toolsets/{name}/config {"key":"ENV_VAR", "value":"..."}
-//   PUT <prefix>/toolsets/{name}/provider {"provider":"tag"}
+//   GET    /api/tools/toolsets/{name}/config
+//   PUT    /api/tools/toolsets/{name}/env {"env":{"ENV_VAR":"..."}}
+//   DELETE /api/env {"key":"ENV_VAR"}
+//   PUT    /api/tools/toolsets/{name}/provider {"provider":"tag"}
 //
 // The GET response is explicitly redacted: env vars carry `is_set` only, never
 // the stored value. PUT with an empty value clears the env var. This extension
@@ -570,40 +571,40 @@ enum ToolsetConfigCatalog {
 
 extension RestClient {
 
-    /// `GET <prefix>/toolsets/{name}/config` — returns provider/env-var status
+    /// Stock toolset config — returns provider/env-var status
     /// for one toolset. The response never includes a stored secret value.
     func getToolsetConfig(name: String) async throws -> ToolsetConfig {
         let encodedName = name.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? name
-        let data = try await get(path: "\(mobileAPIPrefix)/toolsets/\(encodedName)/config")
+        let data = try await get(path: "/api/tools/toolsets/\(encodedName)/config")
         let root = try decodeJSONValue(from: data, context: "toolsets.config")
         return ToolsetConfig(json: root)
     }
 
-    /// `PUT <prefix>/toolsets/{name}/config` — set or clear an env-var credential.
-    /// Passing `nil` or an empty string clears the key. The refreshed config is
-    /// returned and remains redacted (`is_set` booleans only).
+    /// Set through stock `/env`, clear through stock `DELETE /api/env`, then
+    /// re-read the canonical redacted toolset config.
     @discardableResult
     func setToolsetCredential(name: String, key: String, value: String?) async throws -> ToolsetConfig {
         let encodedName = name.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? name
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         var request = makeRequest(
-            path: "\(mobileAPIPrefix)/toolsets/\(encodedName)/config", method: "PUT"
+            path: trimmed.isEmpty ? "/api/env" : "/api/tools/toolsets/\(encodedName)/env",
+            method: trimmed.isEmpty ? "DELETE" : "PUT"
         )
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: JSONValue = .object([
-            "key": .string(key),
-            "value": .string(value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""),
-        ])
+        let body: JSONValue = trimmed.isEmpty
+            ? .object(["key": .string(key)])
+            : .object(["env": .object([key: .string(trimmed)])])
         request.httpBody = try encodeBody(body, context: "toolsets.setConfig")
-        let data = try await perform(request)
-        let root = try decodeJSONValue(from: data, context: "toolsets.setConfig")
-        return ToolsetConfig(json: root)
+        _ = try await perform(request)
+        return try await getToolsetConfig(name: name)
     }
 
-    /// `PUT <prefix>/toolsets/{name}/provider` — select the active provider for
+    /// Stock provider selection. Re-read after mutation because the native route
+    /// returns mutation status, while the UI needs the canonical provider matrix.
     /// a configurable toolset. The refreshed config is returned so callers can
     /// update the active row from the server's canonical state.
     @discardableResult
@@ -612,13 +613,12 @@ extension RestClient {
             withAllowedCharacters: .urlPathAllowed
         ) ?? name
         var request = makeRequest(
-            path: "\(mobileAPIPrefix)/toolsets/\(encodedName)/provider", method: "PUT"
+            path: "/api/tools/toolsets/\(encodedName)/provider", method: "PUT"
         )
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: JSONValue = .object(["provider": .string(provider)])
         request.httpBody = try encodeBody(body, context: "toolsets.selectProvider")
-        let data = try await perform(request)
-        let root = try decodeJSONValue(from: data, context: "toolsets.selectProvider")
-        return ToolsetConfig(json: root)
+        _ = try await perform(request)
+        return try await getToolsetConfig(name: name)
     }
 }

@@ -401,3 +401,21 @@ Client verification evidence:
   of plugin availability. The complete Swift 6 app and unit-test targets build for testing
   through `scripts/ios-build.sh` with asset compilation excluded. Runtime execution remains
   subject to the previously recorded CoreSimulator `ENOMEM` host failure.
+
+## H6b stock toolset-settings authority result
+
+- The existing iOS Toolset Keys panel now uses the stock Desktop/dashboard contract:
+  `/api/tools/toolsets/{name}/config`, `/env`, `/api/env`, and
+  `/api/tools/toolsets/{name}/provider`. The former mobile-plugin
+  `/toolsets/{name}/*` calls are gone; the panel no longer gates on plugin presence.
+- Credential values are still write-only on iOS. Stock Hermes validates the toolset/env
+  allowlist, persists or clears the credential through its unified lifecycle, and returns
+  only redacted `is_set` state. After every mutation iOS re-reads the canonical provider
+  matrix rather than treating the mutation response as settings authority.
+- Provider selection now sends the canonical provider name from Hermes' matrix (the stock
+  configurator contract), not the old plugin tag. No duplicate toolset registry, provider
+  mapping, config writer, or credential store exists on mobile.
+- Focused URLProtocol tests cover both legacy/plugin connection path styles resolving to
+  the same stock routes, redacted config decoding, trimmed secret writes, stock credential
+  deletion, provider selection, canonical refresh, auth headers, and non-2xx propagation.
+  The complete Swift 6 app and unit-test targets build for testing through the safe wrapper.
