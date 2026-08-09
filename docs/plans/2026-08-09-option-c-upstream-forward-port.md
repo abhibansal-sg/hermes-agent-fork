@@ -1,6 +1,6 @@
 # Option C upstream-first forward-port ledger
 
-Status: implementation gate P-1
+Status: P-1 complete; H1 implemented and awaiting review gate
 
 Upstream baseline: `31cedb4830191da7f8c3ea4b962d40997cd85b21`
 
@@ -154,3 +154,28 @@ versioned read-only shim. Conditions:
 
 H1/H2/H3 work may begin only after the final two unchecked items are resolved or formally
 waived with evidence.
+
+## H1 implementation result
+
+- Stock `tui_gateway` now exposes `session.watch`, addressable by runtime
+  `session_id` or canonical stored `session_key`.
+- The watch response reuses the stock bounded live-session projection, including
+  canonical visible messages, `inflight`, queued prompt, runtime info, and status.
+- The method never changes the driver transport, renderer columns, or activity
+  timestamp. `session.activate` remains the explicit rebinding/handoff operation.
+- Both stdio and WebSocket `gateway.ready` frames advertise the versioned
+  `session_watch_v1` capability through one shared payload builder.
+- The existing iOS app records versioned gateway capabilities per accepted
+  connection generation, prefers `session.watch`, and keeps `session.active_list`
+  as an older-stock fallback.
+- A watched running snapshot hydrates as a foreign mirrored turn on iOS: partial
+  output is visible, `localTurnInFlight` stays false, and prompt submission remains
+  the deliberate watch-to-drive transition.
+
+Verification evidence:
+
+- 912 tests across `tests/test_tui_gateway_server.py` and `tests/tui_gateway/` pass.
+- Focused `ProtocolParityTests` test target builds successfully in Swift 6 complete
+  concurrency mode through `scripts/ios-build.sh` with the asset catalog excluded.
+- Runtime simulator execution remains blocked by the host CoreSimulatorService
+  `ENOMEM` failure confirmed independently through `simctl`.

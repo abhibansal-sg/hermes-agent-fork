@@ -270,6 +270,7 @@ _LONG_HANDLERS = frozenset(
         # so a delayed status rehydrate cannot block runtime readiness, prompt
         # submission, or interrupts queued behind it on the same socket.
         "session.active_list",
+        "session.watch",
         "session.branch",
         "session.compress",
         "session.list",
@@ -5086,6 +5087,20 @@ def _current_profile_name() -> str:
 # v4: session.create fast=false is an explicit per-session normal-tier override.
 # v5: uvicorn ws_max_size raised for one-shot base64 file.attach frames (>16 MiB).
 DESKTOP_BACKEND_CONTRACT = 5
+
+# Versioned JSON-RPC capabilities shared by every gateway transport. These are
+# client protocol features, not model tools; advertising them in gateway.ready
+# lets remote clients select stock behavior without probing plugin routes.
+GATEWAY_CAPABILITIES = ("session_watch_v1",)
+
+
+def gateway_ready_payload(skin: dict) -> dict:
+    """Build the transport-neutral gateway.ready capability envelope."""
+    return {
+        "skin": skin,
+        "change_events": True,
+        "capabilities": list(GATEWAY_CAPABILITIES),
+    }
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:

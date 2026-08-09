@@ -437,7 +437,7 @@ def main():
         "params": {
             "type": "gateway.ready",
             # change_events: see tui_gateway/ws.py — clients demote legacy polls.
-            "payload": {"skin": resolve_skin(), "change_events": True},
+            "payload": server.gateway_ready_payload(resolve_skin()),
         },
     }):
         _log_exit("startup write failed (broken stdout pipe before first event)")

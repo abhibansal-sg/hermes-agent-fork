@@ -1071,13 +1071,70 @@ final class SessionStore {
     /// version guard for older gateways and falls back to the legacy resume.
     var activeListRPC: (() async throws -> SessionActiveListResult)?
 
+    /// Versioned stock `session.watch` snapshot. The RPC returns the live
+    /// projection without rebinding the gateway's driver transport. Tests inject
+    /// this seam directly; production calls the actor-isolated gateway client.
+    var watchRPC: ((_ storedId: String) async throws -> SessionOpenResult)?
+
+    struct WatchedLiveSession {
+        let id: String
+        let sessionKey: String
+        let status: SessionActiveItem.Status
+        let model: String?
+        let snapshot: SessionOpenResult?
+
+        init(activeItem: SessionActiveItem) {
+            id = activeItem.id
+            sessionKey = activeItem.sessionKey
+            status = activeItem.status
+            model = activeItem.model
+            snapshot = nil
+        }
+
+        init(snapshot: SessionOpenResult, requestedStoredID: String) {
+            id = snapshot.sessionId
+            sessionKey = snapshot.storedSessionId ?? requestedStoredID
+            status = SessionActiveItem.Status(rawValue: snapshot.status ?? "")
+                ?? (snapshot.snapshotRunning == true ? .working : .idle)
+            model = snapshot.info?.model
+            self.snapshot = snapshot
+        }
+    }
+
     enum LiveSessionInspection {
-        case found(SessionActiveItem)
+        case found(WatchedLiveSession)
         case absent
         case unsupported
     }
 
     func inspectLiveSession(storedID: String) async throws -> LiveSessionInspection {
+        // Prefer the versioned stock snapshot. Test graphs that install only the
+        // legacy active-list seam deliberately exercise the compatibility path.
+        let stockWatchAvailable = connection?.supportsGatewayCapability(
+            "session_watch_v1"
+        ) == true
+        if watchRPC != nil || (resumeRPC == nil && client != nil && stockWatchAvailable) {
+            do {
+                let snapshot: SessionOpenResult
+                if let watchRPC {
+                    snapshot = try await watchRPC(storedID)
+                } else {
+                    guard let client else { throw GatewayError.notConnected }
+                    snapshot = try await client.request(
+                        "session.watch",
+                        params: .object(["session_key": .string(storedID)])
+                    )
+                }
+                return .found(WatchedLiveSession(
+                    snapshot: snapshot, requestedStoredID: storedID
+                ))
+            } catch let GatewayError.rpc(code, _) where code == 4001 {
+                return .absent
+            } catch let GatewayError.rpc(code, _) where code == -32601 {
+                // Older stock gateways: retain the existing active-list probe.
+            }
+        }
+
         let result: SessionActiveListResult
         do {
             if let activeListRPC {
@@ -1097,7 +1154,7 @@ final class SessionStore {
         guard let live = result.sessions.first(where: { $0.sessionKey == storedID }) else {
             return .absent
         }
-        return .found(live)
+        return .found(WatchedLiveSession(activeItem: live))
     }
 
     /// Identity of the one raw `session.resume` permitted for a selected session
@@ -3257,6 +3314,16 @@ final class SessionStore {
                     guard self.openToken == token,
                           self.activeStoredId == summary.id,
                           self.activeRuntimeId == live.id else { return }
+                    if let snapshot = live.snapshot {
+                        if let info = snapshot.info {
+                            self.connection?.applyRuntimeInfo(info)
+                        }
+                        self.chat?.reconcileWatchedTurnStatus(
+                            runtimeId: live.id,
+                            snapshotRunning: snapshot.snapshotRunning,
+                            inflight: snapshot.inflight
+                        )
+                    }
                     self.ensureRuntimeAttempts = 0
                     self.onActiveRuntimeBound?()
                     self.lastError = nil
@@ -3904,6 +3971,15 @@ final class SessionStore {
                     mode: .watch,
                     generation: nil
                 )
+                connection?.applySessionModel(live.model)
+                if let snapshot = live.snapshot {
+                    if let info = snapshot.info { connection?.applyRuntimeInfo(info) }
+                    chat?.reconcileWatchedTurnStatus(
+                        runtimeId: live.id,
+                        snapshotRunning: snapshot.snapshotRunning,
+                        inflight: snapshot.inflight
+                    )
+                }
                 lastError = nil
                 sessionActionError = nil
                 return live.id

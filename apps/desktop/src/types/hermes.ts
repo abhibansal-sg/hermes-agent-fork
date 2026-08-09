@@ -318,6 +318,8 @@ export interface WebhookEnableResponse {
 }
 
 export interface GatewayReadyPayload {
+  capabilities?: string[]
+  change_events?: boolean
   skin?: unknown
 }
 

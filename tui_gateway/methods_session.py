@@ -944,6 +944,50 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"sessions": rows})
 
 
+@method("session.watch")
+def _(rid, params: dict) -> dict:
+    """Return a live-session snapshot without claiming its driver transport.
+
+    ``session.activate`` is a handoff: it touches recency and rebinds future
+    events to the caller. Observers need the same bounded projection without
+    either side effect. A caller may address the runtime directly with
+    ``session_id`` or resolve it from the canonical stored ``session_key``.
+    """
+    runtime_id = str(params.get("session_id") or "").strip()
+    session_key = str(params.get("session_key") or "").strip()
+    if not runtime_id and not session_key:
+        return _err(rid, 4006, "session_id or session_key required")
+
+    try:
+        with _sessions_lock:
+            if runtime_id:
+                session = _sessions.get(runtime_id)
+                found = (runtime_id, session) if session is not None else None
+            else:
+                found = next(
+                    (
+                        (sid, session)
+                        for sid, session in _sessions.items()
+                        if _session_lookup_key(session, fallback=sid) == session_key
+                    ),
+                    None,
+                )
+            if found is None or found[1].get("_finalized"):
+                return _err(rid, 4001, "session not found")
+            sid, session = found
+    except Exception as e:
+        return _err(rid, 5036, f"could not inspect active sessions: {e}")
+
+    return _ok(
+        rid,
+        _live_session_payload(
+            sid,
+            session,
+            omit_messages=is_truthy_value(params.get("omit_messages", False)),
+        ),
+    )
+
+
 @method("session.activate")
 def _(rid, params: dict) -> dict:
     """Attach the frontend to an already-live TUI session.

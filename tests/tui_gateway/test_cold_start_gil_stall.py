@@ -141,7 +141,7 @@ def test_handle_ws_ready_payload_wires_skin_through_to_thread():
                     "method": "event",
                     "params": {
                         "type": "gateway.ready",
-                        "payload": {"skin": skin_payload, "change_events": True},
+                        "payload": server_mod.gateway_ready_payload(skin_payload),
                     },
                 }
             )
@@ -150,6 +150,7 @@ def test_handle_ws_ready_payload_wires_skin_through_to_thread():
 
     assert frames[0]["params"]["payload"]["skin"] == {"palette": "wired"}
     assert frames[0]["params"]["payload"]["change_events"] is True
+    assert "session_watch_v1" in frames[0]["params"]["payload"]["capabilities"]
     assert idents["skin_thread"] != idents["loop_thread"]
     # Belt and braces: the production site must still route through
     # to_thread — assert against the live source so a revert to inline

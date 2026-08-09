@@ -179,6 +179,25 @@ final class ProtocolParityTests: XCTestCase {
         ])
     }
 
+    func testGatewayReadyAdvertisesStockWatchCapability() {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+
+        connection.applyGatewayReadyCapabilities(.object([
+            "capabilities": .array([
+                .string("session_watch_v1"),
+                .string("future_contract_v2"),
+            ]),
+        ]))
+
+        XCTAssertTrue(connection.supportsGatewayCapability("session_watch_v1"))
+        XCTAssertFalse(connection.supportsGatewayCapability("missing_contract_v1"))
+
+        connection.applyGatewayReadyCapabilities(.object([:]))
+        XCTAssertFalse(connection.supportsGatewayCapability("session_watch_v1"))
+    }
+
     func testPassiveOpenWatchesLiveSessionWithoutResume() async {
         let chat = ChatStore()
         let sessions = SessionStore()
@@ -224,6 +243,60 @@ final class ProtocolParityTests: XCTestCase {
         ]))!)
         XCTAssertEqual(chat.foreignMirrorTelemetry.foreignAdopted, 1)
         XCTAssertFalse(chat.localTurnInFlight)
+    }
+
+    func testPassiveOpenUsesStockWatchSnapshotWithoutResume() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        sessions.watchRPC = { storedID in
+            XCTAssertEqual(storedID, "stored-desktop")
+            return JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "running": .bool(true),
+                "status": .string("working"),
+                "inflight": .object([
+                    "user": .string("build the feature"),
+                    "assistant": .string("working on it"),
+                    "streaming": .bool(true),
+                ]),
+                "messages": .array([]),
+                "info": .object(["model": .string("watch-model")]),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        sessions.activeListRPC = {
+            XCTFail("versioned stock watch must avoid the legacy inventory probe")
+            return SessionActiveListResult(sessions: [])
+        }
+        var resumeCalls = 0
+        sessions.resumeRPC = { _, _ in
+            resumeCalls += 1
+            return JSONValue.object([
+                "session_id": .string("must-not-resume"),
+                "resumed": .string("stored-desktop"),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(resumeCalls, 0)
+        XCTAssertEqual(sessions.sessionBinding?.runtimeID, "runtime-desktop")
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertEqual(connection.sessionModelRaw, "watch-model")
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertFalse(chat.localTurnInFlight)
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant])
+        XCTAssertEqual(chat.messages.first?.text, "build the feature")
+        XCTAssertEqual(chat.messages.last?.text, "working on it")
     }
 
     func testOpenResumesOnceWhenSessionIsNotLive() async {

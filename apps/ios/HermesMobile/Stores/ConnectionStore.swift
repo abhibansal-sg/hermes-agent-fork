@@ -564,6 +564,21 @@ final class ConnectionStore {
     /// signals into.
     let capabilities = ServerCapabilities()
 
+    /// Versioned stock JSON-RPC features advertised by `gateway.ready`.
+    /// Unlike the legacy REST endpoint probes above, these identify native
+    /// transport contracts and are reset for every connection generation.
+    private(set) var gatewayProtocolCapabilities: Set<String> = []
+
+    func supportsGatewayCapability(_ capability: String) -> Bool {
+        gatewayProtocolCapabilities.contains(capability)
+    }
+
+    func applyGatewayReadyCapabilities(_ payload: JSONValue) {
+        gatewayProtocolCapabilities = Set(
+            payload["capabilities"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        )
+    }
+
     /// A REST client built from the saved URL + token, or `nil` if unconfigured.
     /// Speaks the path family the capability probe resolved (ABH-88) — `.legacy`
     /// until/unless the plugin-mount probe concludes `.available`.
@@ -714,6 +729,7 @@ final class ConnectionStore {
     @discardableResult
     private func advanceConnectionGeneration() -> UInt64 {
         connectionGeneration &+= 1
+        gatewayProtocolCapabilities.removeAll()
         setTransportReadiness(.unconfigured, resolveWaiters: true)
         sessionStore.transportDidBecomeUnavailable()
         sessionStore.invalidateConnectionWork()
@@ -2034,6 +2050,7 @@ final class ConnectionStore {
         }
         switch event.type {
         case .gatewayReady:
+            applyGatewayReadyCapabilities(event.payload)
             Task {
                 guard self.isActiveGeneration(generation) else { return }
                 await self.sessionStore.refresh()

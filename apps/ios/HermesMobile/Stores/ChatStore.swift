@@ -1468,6 +1468,44 @@ final class ChatStore {
         restoreInflightTurn(inflight)
     }
 
+    /// Hydrate a turn driven by another stock gateway client without claiming
+    /// local ownership. `session.watch` is a snapshot rather than a stream
+    /// subscription, so subsequent broadcast frames continue through the normal
+    /// foreign-mirror router while the original driver transport stays bound.
+    func reconcileWatchedTurnStatus(
+        runtimeId: String,
+        snapshotRunning: Bool? = nil,
+        inflight: SessionInflightTurn? = nil
+    ) {
+        guard runtimeId == activeSessionId,
+              sessions?.sessionBinding?.mode == .watch,
+              snapshotRunning == true,
+              !localTurnInFlight else { return }
+        if let mirrored = mirroringRuntimeId, mirrored != runtimeId { return }
+
+        if mirroringRuntimeId == nil {
+            mirroringRuntimeId = runtimeId
+            streamingIsForeign = true
+            #if DEBUG
+            foreignMirrorTelemetry.foreignAdopted += 1
+            #endif
+        }
+
+        let user = inflight?.user.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trailingUserMatches = messages.last?.role == .user && messages.last?.text == user
+        if !user.isEmpty,
+           !trailingUserMatches,
+           !inflightUserPromptAlreadyRestored(user) {
+            messages.append(ChatMessage(role: .user, text: user))
+            rebuildUserOrdinals()
+        }
+        beginStreamingMessage(foreign: true)
+        if let assistant = inflight?.assistant, !assistant.isEmpty {
+            mutateStreaming { $0.applyFinalText(assistant) }
+        }
+        armForeignMirrorWatchdog()
+    }
+
     private func restoreInflightTurn(_ inflight: SessionInflightTurn?) {
         let user = inflight?.user.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !user.isEmpty, !inflightUserPromptAlreadyRestored(user) {
