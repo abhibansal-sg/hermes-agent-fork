@@ -171,6 +171,10 @@ waived with evidence.
 - A watched running snapshot hydrates as a foreign mirrored turn on iOS: partial
   output is visible, `localTurnInFlight` stays false, and prompt submission remains
   the deliberate watch-to-drive transition.
+- Because stock session events remain driver-routed, iOS refreshes the bounded
+  watch snapshot only while selected: 250 ms while working, 2 s while idle. An
+  observed settle uses the existing canonical transcript backfill; no broadcast,
+  replay, or observer authority is added to the gateway.
 
 Verification evidence:
 

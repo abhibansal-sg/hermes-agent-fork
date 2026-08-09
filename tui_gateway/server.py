@@ -8105,6 +8105,7 @@ def _live_session_payload(
     touch: bool = False,
     transport: Transport | None = None,
     omit_messages: bool = False,
+    omit_info: bool = False,
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
@@ -8128,7 +8129,6 @@ def _live_session_payload(
         else _live_visible_history(session, _get_db(), in_memory_history)
     )
     payload = {
-        "info": _fallback_session_info(session),
         "message_count": len(history),
         "messages": [] if omit_messages else _history_to_messages(history),
         "messages_omitted": omit_messages,
@@ -8138,6 +8138,8 @@ def _live_session_payload(
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
     }
+    if not omit_info:
+        payload["info"] = _fallback_session_info(session)
     if inflight:
         payload["inflight"] = inflight
     if queued:

@@ -12560,7 +12560,11 @@ def test_session_watch_by_runtime_id_can_omit_messages(monkeypatch):
             {
                 "id": "watch",
                 "method": "session.watch",
-                "params": {"session_id": "sid-live", "omit_messages": True},
+                "params": {
+                    "session_id": "sid-live",
+                    "omit_messages": True,
+                    "omit_info": True,
+                },
             }
         )
     finally:
@@ -12569,6 +12573,7 @@ def test_session_watch_by_runtime_id_can_omit_messages(monkeypatch):
     assert resp["result"]["messages"] == []
     assert resp["result"]["message_count"] == 2
     assert resp["result"]["messages_omitted"] is True
+    assert "info" not in resp["result"]
 
 
 def test_session_watch_rejects_missing_or_finalized_session():

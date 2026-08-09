@@ -1470,18 +1470,26 @@ final class ChatStore {
 
     /// Hydrate a turn driven by another stock gateway client without claiming
     /// local ownership. `session.watch` is a snapshot rather than a stream
-    /// subscription, so subsequent broadcast frames continue through the normal
-    /// foreign-mirror router while the original driver transport stays bound.
+    /// subscription, so SessionStore refreshes it while this client stays in
+    /// watch mode. A transition to idle tears down the foreign placeholder and
+    /// reconciles the canonical transcript through the existing REST owner.
     func reconcileWatchedTurnStatus(
         runtimeId: String,
         snapshotRunning: Bool? = nil,
         inflight: SessionInflightTurn? = nil
-    ) {
+    ) async {
         guard runtimeId == activeSessionId,
               sessions?.sessionBinding?.mode == .watch,
-              snapshotRunning == true,
               !localTurnInFlight else { return }
         if let mirrored = mirroringRuntimeId, mirrored != runtimeId { return }
+
+        guard snapshotRunning == true else {
+            guard mirroringRuntimeId == runtimeId else { return }
+            teardownForeignStream(preservePlaceholderForReconcile: true)
+            await backfill()
+            onTurnComplete?()
+            return
+        }
 
         if mirroringRuntimeId == nil {
             mirroringRuntimeId = runtimeId

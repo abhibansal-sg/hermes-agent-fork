@@ -984,6 +984,7 @@ def _(rid, params: dict) -> dict:
             sid,
             session,
             omit_messages=is_truthy_value(params.get("omit_messages", False)),
+            omit_info=is_truthy_value(params.get("omit_info", False)),
         ),
     )
 

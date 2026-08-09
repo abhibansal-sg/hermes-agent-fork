@@ -144,6 +144,7 @@ final class SessionStore {
         refreshToken &+= 1
         cancelEnsureRuntime()
         cancelRuntimeBinding()
+        cancelWatchPolling()
     }
 
     /// A runtime id belongs to one WebSocket generation only. Keep the durable
@@ -155,6 +156,7 @@ final class SessionStore {
         activeRuntimeEpoch = nil
         cancelEnsureRuntime()
         cancelRuntimeBinding()
+        cancelWatchPolling()
     }
 
     /// A different gateway is a different cache and runtime namespace. Do not
@@ -1054,6 +1056,11 @@ final class SessionStore {
     /// Coalesces concurrent on-demand re-resumes (a live send and a queue drain
     /// racing) onto a single `session.resume` RPC.
     private var ensureRuntimeTask: Task<String?, Never>?
+    /// Stock `session.watch` is a non-rebinding snapshot, not a subscription.
+    /// This single task refreshes it only while the selected binding is `.watch`.
+    private var watchPollTask: Task<Void, Never>?
+    private static let watchWorkingPollInterval: Duration = .milliseconds(250)
+    private static let watchIdlePollInterval: Duration = .seconds(2)
     /// Per-session attempt budget for ``ensureActiveRuntime()`` so a genuinely
     /// unresumable session can't spin. Reset on a fresh ``open(_:revealOnFirstPaint:)``
     /// (new user intent) or a successful bind.
@@ -1107,7 +1114,10 @@ final class SessionStore {
         case unsupported
     }
 
-    func inspectLiveSession(storedID: String) async throws -> LiveSessionInspection {
+    func inspectLiveSession(
+        storedID: String,
+        compactSnapshot: Bool = false
+    ) async throws -> LiveSessionInspection {
         // Prefer the versioned stock snapshot. Test graphs that install only the
         // legacy active-list seam deliberately exercise the compatibility path.
         let stockWatchAvailable = connection?.supportsGatewayCapability(
@@ -1122,7 +1132,11 @@ final class SessionStore {
                     guard let client else { throw GatewayError.notConnected }
                     snapshot = try await client.request(
                         "session.watch",
-                        params: .object(["session_key": .string(storedID)])
+                        params: .object([
+                            "session_key": .string(storedID),
+                            "omit_messages": .bool(true),
+                            "omit_info": .bool(compactSnapshot),
+                        ])
                     )
                 }
                 return .found(WatchedLiveSession(
@@ -1276,6 +1290,77 @@ final class SessionStore {
     private func cancelEnsureRuntime() {
         ensureRuntimeTask?.cancel()
         ensureRuntimeTask = nil
+    }
+
+    private func cancelWatchPolling() {
+        watchPollTask?.cancel()
+        watchPollTask = nil
+    }
+
+    private func startWatchPolling() {
+        cancelWatchPolling()
+        guard watchRPC != nil
+                || connection?.supportsGatewayCapability("session_watch_v1") == true,
+              sessionBinding?.mode == .watch else { return }
+        watchPollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self,
+                      self.connection?.isTransportReady == true,
+                      self.sessionBinding?.mode == .watch,
+                      let storedID = self.activeStoredId,
+                      let runtimeID = self.activeRuntimeId else { return }
+                let delay = self.chat?.isStreaming == true
+                    ? Self.watchWorkingPollInterval
+                    : Self.watchIdlePollInterval
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled else { return }
+                if !(await self.refreshWatchedSessionOnce(
+                    storedID: storedID, runtimeID: runtimeID
+                )) { return }
+            }
+        }
+    }
+
+    /// Refresh one stock watch snapshot. Internal for deterministic protocol
+    /// tests; the production poll task is the sole recurring caller.
+    @discardableResult
+    func refreshWatchedSessionOnce(storedID: String, runtimeID: String) async -> Bool {
+        guard watchRPC != nil || connection?.isTransportReady == true,
+              sessionBinding?.mode == .watch,
+              activeStoredId == storedID,
+              activeRuntimeId == runtimeID else { return false }
+        do {
+            guard case .found(let live) = try await inspectLiveSession(
+                storedID: storedID, compactSnapshot: true
+            )
+            else { return false }
+            guard sessionBinding?.mode == .watch,
+                  activeStoredId == storedID,
+                  activeRuntimeId == runtimeID else { return false }
+            if live.id != runtimeID {
+                bindSession(
+                    storedID: storedID, runtimeID: live.id,
+                    mode: .watch, generation: nil
+                )
+            }
+            connection?.applySessionModel(live.model)
+            guard let snapshot = live.snapshot else { return false }
+            if let info = snapshot.info { connection?.applyRuntimeInfo(info) }
+            await chat?.reconcileWatchedTurnStatus(
+                runtimeId: live.id,
+                snapshotRunning: snapshot.snapshotRunning,
+                inflight: snapshot.inflight
+            )
+            return true
+        } catch {
+            // A transient timeout must not permanently stop observation. The
+            // loop is already cadence-limited; reconnect/scope teardown cancels
+            // it through the guards above.
+            return sessionBinding?.mode == .watch
+                && activeStoredId == storedID
+                && activeRuntimeId == runtimeID
+                && (watchRPC != nil || connection?.isTransportReady == true)
+        }
     }
 
     // MARK: - Offline cache (P3 read-through / write-through)
@@ -2810,6 +2895,7 @@ final class SessionStore {
             mode: mode,
             generation: generation
         )
+        if mode == .drive { cancelWatchPolling() }
         if previous != storedID {
             chat?.pendingGateOwnerMoved(toStoredSession: storedID)
         }
@@ -3318,12 +3404,13 @@ final class SessionStore {
                         if let info = snapshot.info {
                             self.connection?.applyRuntimeInfo(info)
                         }
-                        self.chat?.reconcileWatchedTurnStatus(
+                        await self.chat?.reconcileWatchedTurnStatus(
                             runtimeId: live.id,
                             snapshotRunning: snapshot.snapshotRunning,
                             inflight: snapshot.inflight
                         )
                     }
+                    self.startWatchPolling()
                     self.ensureRuntimeAttempts = 0
                     self.onActiveRuntimeBound?()
                     self.lastError = nil
@@ -3737,6 +3824,7 @@ final class SessionStore {
             mode: .watch,
             generation: nil
         )
+        startWatchPolling()
     }
 
     /// Branch-in-new-chat (F4A-A2): create a brand-new session SEEDED with the
@@ -3974,12 +4062,13 @@ final class SessionStore {
                 connection?.applySessionModel(live.model)
                 if let snapshot = live.snapshot {
                     if let info = snapshot.info { connection?.applyRuntimeInfo(info) }
-                    chat?.reconcileWatchedTurnStatus(
+                    await chat?.reconcileWatchedTurnStatus(
                         runtimeId: live.id,
                         snapshotRunning: snapshot.snapshotRunning,
                         inflight: snapshot.inflight
                     )
                 }
+                startWatchPolling()
                 lastError = nil
                 sessionActionError = nil
                 return live.id
@@ -4778,6 +4867,7 @@ final class SessionStore {
         // into a session we're detaching from.
         cancelEnsureRuntime()
         cancelRuntimeBinding()
+        cancelWatchPolling()
         isDraft = false
         activeRuntimeId = nil
         activeRuntimeEpoch = nil

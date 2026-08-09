@@ -299,6 +299,59 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(chat.messages.last?.text, "working on it")
     }
 
+    func testStockWatchRefreshSettlesFromCanonicalTranscriptWithoutTakeover() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        chat.backfillFetch = { _ in [
+            StoredMessage(role: "user", content: .string("build the feature")),
+            StoredMessage(role: "assistant", content: .string("finished")),
+        ] }
+        var watchCalls = 0
+        sessions.watchRPC = { _ in
+            watchCalls += 1
+            let running = watchCalls == 1
+            return JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "running": .bool(running),
+                "status": .string(running ? "working" : "idle"),
+                "inflight": running ? .object([
+                    "user": .string("build the feature"),
+                    "assistant": .string("working on it"),
+                    "streaming": .bool(true),
+                ]) : .null,
+                "messages": .array([]),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("watch refresh must not resume or rebind the session")
+            throw GatewayError.notConnected
+        }
+
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertTrue(chat.isStreaming)
+
+        let continued = await sessions.refreshWatchedSessionOnce(
+            storedID: "stored-desktop", runtimeID: "runtime-desktop"
+        )
+
+        XCTAssertTrue(continued)
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertFalse(chat.localTurnInFlight)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertEqual(chat.messages.last?.text, "finished")
+        await sessions.closeActive()
+    }
+
     func testOpenResumesOnceWhenSessionIsNotLive() async {
         let chat = ChatStore()
         let sessions = SessionStore()
