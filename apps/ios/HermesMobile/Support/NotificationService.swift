@@ -1,6 +1,5 @@
 import Foundation
 import CryptoKit
-import LocalAuthentication
 import UIKit
 import UserNotifications
 
@@ -244,13 +243,6 @@ enum NotificationService {
     /// Remote APNs category id for a long-turn completion (open-app only).
     nonisolated static let remoteTurnCategory = "HERMES_TURN"
 
-    /// Action id for the inline "Approve" button on a `HERMES_APPROVAL` push.
-    nonisolated static let approveActionIdentifier = "APPROVE"
-    /// Action id for the inline "Deny" button on a `HERMES_APPROVAL` push.
-    nonisolated static let denyActionIdentifier = "DENY"
-    /// Action id for the inline text reply on a `HERMES_CLARIFY` push.
-    nonisolated static let replyActionIdentifier = "REPLY"
-
     // MARK: - Tap routing (B5)
 
     /// What a tapped notification asks the app to do, decoded from the push
@@ -278,266 +270,6 @@ enum NotificationService {
     /// Install the app's tap router. Idempotent; safe to call at launch.
     static func setTapHandler(_ handler: @escaping @MainActor @Sendable (Tap) -> Void) {
         tapHandler = handler
-    }
-
-    // MARK: - Action backend resolution (A2)
-
-    /// Resolved gateway endpoint for the approval-action REST call: the base URL
-    /// and the session token, packaged so the (possibly background-launched)
-    /// notification-action delegate can build a ``RestClient`` without reaching
-    /// into the `@MainActor` store graph.
-    struct ActionEndpoint: Sendable {
-        let baseURL: URL
-        let token: String
-        /// REST path family for the mobile endpoints (ABH-88). Resolved from
-        /// the live/cached capability snapshot; a stale value self-heals via
-        /// ``RestClient/respondToApproval``'s alternate-family 404 retry.
-        var pathStyle: APIPathStyle = .legacy
-    }
-
-    /// App-supplied resolver for the current gateway endpoint. Wired once at
-    /// launch by `HermesMobileApp` off the live `ConnectionStore` (mirrors how
-    /// `PushRegistrar.makePoster()` resolves URL + token). Read on the main actor
-    /// from the action callback. `nil` when the app isn't configured yet, in
-    /// which case the action falls back to a feedback notification.
-    nonisolated(unsafe) static var endpointProvider:
-        (@MainActor @Sendable () -> ActionEndpoint?)?
-
-    /// Seam over `LAContext` so the destructive-approval gate is unit-testable
-    /// (XCTest can't satisfy a real biometric prompt). Defaults to the live
-    /// `LAContext`-backed implementation reused from ``AppLock``.
-    nonisolated(unsafe) static var biometricAuthenticator: BiometricAuthenticating
-        = LAContextAuthenticator()
-
-    #if DEBUG
-    /// Injectable approval sender for killed-launch action tests.
-    nonisolated(unsafe) static var approvalActionSender:
-        ((ActionEndpoint, ApprovalActionPayload, Bool) async -> RestClient.ApprovalRespondOutcome)?
-    #endif
-
-    /// Install the action backend resolver (endpoint + categories). Idempotent.
-    static func setActionEndpointProvider(
-        _ provider: @escaping @MainActor @Sendable () -> ActionEndpoint?
-    ) {
-        endpointProvider = provider
-    }
-
-    // MARK: - Approval action handling (A2)
-
-    /// Whether a given action identifier maps to approve vs deny. `nil` for any
-    /// other action (e.g. the default open-app tap, dismiss).
-    ///
-    /// Pure mapping, exposed for the unit tests (A5: action→request mapping).
-    nonisolated static func approveChoice(for actionIdentifier: String) -> Bool? {
-        switch actionIdentifier {
-        case approveActionIdentifier: return true
-        case denyActionIdentifier: return false
-        default: return nil
-        }
-    }
-
-    /// Handle an `APPROVE` / `DENY` notification action.
-    ///
-    /// Flow (contract A2):
-    ///  1. Decode the `hermes` block → runtime session id + `destructive`.
-    ///  2. If `destructive == true`, gate behind an explicit `LAContext`
-    ///     biometric re-check (the `.authenticationRequired` action option
-    ///     already forced a device unlock to even reach here; this is the
-    ///     app-level Wave-2.2 amendment for dangerous actions). A failed/cancelled
-    ///     gate aborts the send and posts feedback — the inbox stays authoritative.
-    ///  3. `POST /api/approvals/respond` with the Keychain token + loopback Host
-    ///     override (via ``RestClient``, which runs fine from this possibly
-    ///     background-launched callback).
-    ///  4. `resolved:false` / 404 → "Already handled elsewhere" feedback.
-    ///     Transport / 401 failure → feedback + the inbox remains the source of
-    ///     truth (nothing is silently dropped).
-    ///
-    /// Returns when the work is done so the delegate can call its completion
-    /// handler — the system keeps the app alive for the action only until then.
-    @MainActor
-    static func handleApprovalAction(
-        approve: Bool,
-        action: ApprovalActionPayload
-    ) async {
-        // Destructive approvals (and the BINDING for dangerous actions) require an
-        // explicit biometric re-check before the response is sent. Deny is also
-        // gated when destructive: confirming a dangerous decision either way
-        // should prove device ownership.
-        if action.destructive {
-            let result = await biometricAuthenticator.evaluate(
-                reason: approve ? "Approve a destructive action"
-                                : "Respond to a destructive action"
-            )
-            if case .failure = result {
-                // Authentication failed/cancelled: do not send. Keep the prompt
-                // actionable in-app and tell the user why nothing happened.
-                postFeedbackNotification(
-                    title: "Not confirmed",
-                    body: "Face ID was needed to \(approve ? "approve" : "deny") this. Open Hermes to respond."
-                )
-                return
-            }
-        }
-
-        guard let endpoint = endpointProvider?() else {
-            // Not configured (no server/token yet): can't reach the gateway.
-            postFeedbackNotification(
-                title: "Couldn't respond",
-                body: "Open Hermes to respond to this request."
-            )
-            return
-        }
-
-        let outcome: RestClient.ApprovalRespondOutcome
-        #if DEBUG
-        if let sender = approvalActionSender {
-            outcome = await sender(endpoint, action, approve)
-        } else {
-            outcome = await sendApproval(endpoint: endpoint, action: action, approve: approve)
-        }
-        #else
-        outcome = await sendApproval(endpoint: endpoint, action: action, approve: approve)
-        #endif
-
-        switch outcome {
-        case .resolved:
-            // Mirror the in-flight Live Activity: the turn resumes.
-            LiveActivityManager.shared.clearNeedsApproval()
-        case .alreadyHandled:
-            postFeedbackNotification(
-                title: "Already handled elsewhere",
-                body: feedbackBody(for: action)
-            )
-        case .failed:
-            postFeedbackNotification(
-                title: "Couldn't respond",
-                body: "The request didn't go through. Open Hermes to respond."
-            )
-        }
-    }
-
-    private static func sendApproval(
-        endpoint: ActionEndpoint, action: ApprovalActionPayload, approve: Bool
-    ) async -> RestClient.ApprovalRespondOutcome {
-        let rest = RestClient(
-            baseURL: endpoint.baseURL, token: endpoint.token, pathStyle: endpoint.pathStyle
-        )
-        return await rest.respondToApproval(
-            sessionId: action.sessionId, approve: approve, all: false
-        )
-    }
-
-    // MARK: - Clarify text reply handling (ABH-296)
-
-    /// The fields a `REPLY` text action needs from a `HERMES_CLARIFY` push.
-    struct ClarifyReplyActionPayload: Sendable, Equatable {
-        /// Runtime session id — used for session ownership/auth checks server-side.
-        let sessionId: String
-        /// `_block(...)` request id (`approval_id` in the mobile push payload).
-        let approvalId: String
-    }
-
-    #if DEBUG
-    /// Injectable sender for notification-reply unit tests. `nil` in production.
-    nonisolated(unsafe) static var clarifyReplySender:
-        ((ActionEndpoint, ClarifyReplyActionPayload, String) async -> RestClient.ApprovalRespondOutcome)?
-    #endif
-
-    /// Decode the clarify-reply payload from a notification's `userInfo`.
-    nonisolated static func decodeClarifyReplyAction(
-        from userInfo: [AnyHashable: Any]
-    ) -> ClarifyReplyActionPayload? {
-        guard let block = userInfo["hermes"] as? [AnyHashable: Any] else { return nil }
-        guard
-            let sessionId = (block["session_id"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            !sessionId.isEmpty
-        else { return nil }
-        let rawApprovalId = (block["approval_id"] as? String)
-            ?? (block["request_id"] as? String)
-        guard
-            let approvalId = rawApprovalId?.trimmingCharacters(in: .whitespacesAndNewlines),
-            !approvalId.isEmpty
-        else { return nil }
-        let responseAction = (block["response_action"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard responseAction == nil || responseAction == "reply" else { return nil }
-        return ClarifyReplyActionPayload(sessionId: sessionId, approvalId: approvalId)
-    }
-
-    /// Handle a `REPLY` text action on a `HERMES_CLARIFY` notification.
-    @MainActor
-    static func handleClarifyReplyAction(
-        text: String,
-        action: ClarifyReplyActionPayload
-    ) async {
-        let answer = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !answer.isEmpty else {
-            postFeedbackNotification(
-                title: "Couldn't reply",
-                body: "Type a reply, or open Hermes to answer this question."
-            )
-            return
-        }
-        guard let endpoint = endpointProvider?() else {
-            postFeedbackNotification(
-                title: "Couldn't reply",
-                body: "Open Hermes to answer this question."
-            )
-            return
-        }
-
-        let outcome: RestClient.ApprovalRespondOutcome
-        #if DEBUG
-        if let sender = clarifyReplySender {
-            outcome = await sender(endpoint, action, answer)
-        } else {
-            outcome = await sendClarifyReply(endpoint: endpoint, action: action, answer: answer)
-        }
-        #else
-        outcome = await sendClarifyReply(endpoint: endpoint, action: action, answer: answer)
-        #endif
-
-        switch outcome {
-        case .resolved:
-            LiveActivityManager.shared.clearNeedsApproval()
-        case .alreadyHandled:
-            postFeedbackNotification(
-                title: "Already handled elsewhere",
-                body: "This question was already answered."
-            )
-        case .failed:
-            postFeedbackNotification(
-                title: "Couldn't reply",
-                body: "The reply didn't go through. Open Hermes to answer."
-            )
-        }
-    }
-
-    private static func sendClarifyReply(
-        endpoint: ActionEndpoint,
-        action: ClarifyReplyActionPayload,
-        answer: String
-    ) async -> RestClient.ApprovalRespondOutcome {
-        let rest = RestClient(
-            baseURL: endpoint.baseURL,
-            token: endpoint.token,
-            pathStyle: endpoint.pathStyle
-        )
-        return await rest.respondToClarification(
-            sessionId: action.sessionId,
-            requestId: action.approvalId,
-            answer: answer
-        )
-    }
-
-    /// Body line for the "already handled" feedback, naming the target when known.
-    private static func feedbackBody(for action: ApprovalActionPayload) -> String {
-        if let title = action.approvalTitle, !title.isEmpty {
-            return "\(title) was already resolved."
-        }
-        return "This request was already resolved."
     }
 
     /// Fire a local feedback notification for an action that couldn't land
@@ -619,65 +351,6 @@ enum NotificationService {
         (userInfo["aps"] as? [AnyHashable: Any])?["category"] as? String
     }
 
-    // MARK: - Approval action payload (A2)
-
-    /// The fields an `APPROVE` / `DENY` action needs, decoded from a
-    /// `HERMES_APPROVAL` push's `hermes` block. Per the pinned interface the
-    /// block carries `session_id` (runtime sid), `stored_session_id` (when
-    /// resolvable), `destructive` (bool, default false), and `approval_title`.
-    struct ApprovalActionPayload: Sendable, Equatable {
-        /// Runtime session id — the target of `POST /api/approvals/respond`.
-        let sessionId: String
-        /// Stable gateway request id used to suppress duplicate APNs delivery.
-        let requestId: String?
-        /// Persistent stored session id, when the push carried it.
-        let storedSessionId: String?
-        /// `true` when the approval marks a destructive/dangerous action: gates
-        /// the action behind an explicit `LAContext` biometric re-check.
-        let destructive: Bool
-        /// Short target string, surfaced in the "Already handled" feedback.
-        let approvalTitle: String?
-    }
-
-    /// Decode the approval-action payload from a notification's `userInfo`.
-    /// Returns `nil` when there is no usable runtime `session_id`.
-    nonisolated static func decodeApprovalAction(
-        from userInfo: [AnyHashable: Any]
-    ) -> ApprovalActionPayload? {
-        guard let block = userInfo["hermes"] as? [AnyHashable: Any] else { return nil }
-        guard
-            let sessionId = (block["session_id"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            !sessionId.isEmpty
-        else { return nil }
-
-        let stored = (block["stored_session_id"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let title = (block["approval_title"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let requestId = ((block["approval_id"] as? String) ?? (block["request_id"] as? String))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return ApprovalActionPayload(
-            sessionId: sessionId,
-            requestId: (requestId?.isEmpty == false) ? requestId : nil,
-            storedSessionId: (stored?.isEmpty == false) ? stored : nil,
-            // Tolerate both a real JSON bool and a "true"/"1" string, since some
-            // APNs JSON paths stringify booleans.
-            destructive: boolValue(block["destructive"]),
-            approvalTitle: (title?.isEmpty == false) ? title : nil
-        )
-    }
-
-    /// Coerce a JSON value (Bool, NSNumber, or "true"/"1" string) to a Bool.
-    private nonisolated static func boolValue(_ any: Any?) -> Bool {
-        if let bool = any as? Bool { return bool }
-        if let number = any as? NSNumber { return number.boolValue }
-        if let string = (any as? String)?.lowercased() {
-            return string == "true" || string == "1" || string == "yes"
-        }
-        return false
-    }
-
     /// Ask for notification authorization. Also installs the foreground-
     /// presentation delegate so notifications fired while the app is active still
     /// show a banner + play a sound.
@@ -731,7 +404,7 @@ enum NotificationService {
 
     // MARK: - Category registration (A1)
 
-    /// Register the actionable-push categories with the notification center.
+    /// Register open-app push categories with the notification center.
     ///
     /// Idempotent and cheap; called from `requestAuthorizationIfNeeded()` (so the
     /// categories exist before any push lands) and again at launch via
@@ -746,34 +419,15 @@ enum NotificationService {
     /// Build the remote APNs categories. Exposed internally for host tests;
     /// `registerCategories()` is still the only production registration path.
     nonisolated static func remoteNotificationCategoriesForTesting() -> Set<UNNotificationCategory> {
-        let approve = UNNotificationAction(
-            identifier: approveActionIdentifier,
-            title: "Approve",
-            options: [.authenticationRequired]
-        )
-        let deny = UNNotificationAction(
-            identifier: denyActionIdentifier,
-            title: "Deny",
-            // `.destructive` renders the button red; `.authenticationRequired`
-            // forces a device unlock before the action reaches the app.
-            options: [.destructive, .authenticationRequired]
-        )
-        let reply = UNTextInputNotificationAction(
-            identifier: replyActionIdentifier,
-            title: "Reply",
-            options: [.authenticationRequired],
-            textInputButtonTitle: "Send",
-            textInputPlaceholder: "Reply to Hermes"
-        )
         let approvalCat = UNNotificationCategory(
             identifier: remoteApprovalCategory,
-            actions: [approve, deny],
+            actions: [],
             intentIdentifiers: [],
             options: []
         )
         let clarifyCat = UNNotificationCategory(
             identifier: remoteClarifyCategory,
-            actions: [reply],
+            actions: [],
             intentIdentifiers: [],
             options: []
         )

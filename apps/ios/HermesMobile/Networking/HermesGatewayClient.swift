@@ -122,6 +122,10 @@ actor HermesGatewayClient {
     private var generation: UInt64 = 0
     private var requestCounter: UInt64 = 0
     private var pending: [String: CheckedContinuation<JSONValue, Error>] = [:]
+    /// Optimistic-concurrency epochs learned from stock Hermes responses. The
+    /// gateway remains authoritative; this map only echoes its latest revision
+    /// back on later session-scoped actions.
+    private var actionRevisions: [String: Int] = [:]
     /// Resolved by the first `gateway.ready` frame to unblock `connect`.
     private var readyContinuation: CheckedContinuation<Void, Error>?
 
@@ -297,9 +301,10 @@ actor HermesGatewayClient {
         // authorizes a new JSON-RPC request for this transport generation.
         guard state == .open, let task else { throw GatewayError.notConnected }
 
+        let authorizedParams = paramsWithExpectedActionRevision(params)
         requestCounter &+= 1
         let id = "r\(requestCounter)"
-        let rpc = JSONRPCRequest(id: id, method: method, params: params)
+        let rpc = JSONRPCRequest(id: id, method: method, params: authorizedParams)
 
         let data: Data
         do {
@@ -318,7 +323,7 @@ actor HermesGatewayClient {
         }
         defer { timeoutTask.cancel() }
 
-        return try await withTaskCancellationHandler {
+        let result = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 // CRITICAL ORDERING (RPC response race): register the pending
                 // continuation on the actor BEFORE the socket send. `send` is
@@ -335,6 +340,31 @@ actor HermesGatewayClient {
             }
         } onCancel: {
             Task { await self.failPending(id: id, with: CancellationError()) }
+        }
+        recordActionRevision(from: result, requestParams: authorizedParams)
+        return result
+    }
+
+    private func paramsWithExpectedActionRevision(_ params: JSONValue) -> JSONValue {
+        guard case .object(var object) = params,
+              object["expected_action_revision"] == nil else { return params }
+        let selectors = ["session_id", "session_key", "runtime_session_id"]
+            .compactMap { object[$0]?.coercedStringValue }
+        guard let revision = selectors.compactMap({ actionRevisions[$0] }).first else {
+            return params
+        }
+        object["expected_action_revision"] = .number(Double(revision))
+        return .object(object)
+    }
+
+    private func recordActionRevision(from result: JSONValue, requestParams: JSONValue) {
+        guard let revision = result["action_revision"]?.intValue else { return }
+        let responseSelectors = ["session_id", "stored_session_id", "session_key", "resumed"]
+            .compactMap { result[$0]?.coercedStringValue }
+        let requestSelectors = ["session_id", "session_key", "runtime_session_id"]
+            .compactMap { requestParams[$0]?.coercedStringValue }
+        for selector in Set(responseSelectors + requestSelectors) where !selector.isEmpty {
+            actionRevisions[selector] = revision
         }
     }
 

@@ -1,37 +1,101 @@
 import Foundation
 
-// MARK: - F4A-A1 file-browser REST surface
+// MARK: - Stock Hermes file-browser REST surface
 //
-// The two session-cwd file endpoints (`GET /api/fs/list`, `GET /api/fs/read`).
-// Kept on `RestClient` so they
-// inherit the loopback `Host` override, the `X-Hermes-Session-Token` auth header,
-// the ephemeral session, and the 15s timeout (no cloned plumbing).
-//
-// `fsList`/`fsRead` go through `perform(_:)` for the happy path, but FIRST
-// classify the contract's meaningful non-2xx codes (403 sandbox escape, 404 not
-// a dir/file, 413 over the read cap) into typed `FSReadError`/`RestError` so the
-// viewer can show "Too large to preview" instead of a generic HTTP error. The
+// Hermes owns working files through its stock desktop/dashboard routes. Those
+// routes accept absolute gateway-local paths, while the iOS browser deliberately
+// keeps its navigation state relative to the active session cwd. This extension
+// is the bounded presentation adapter between the two contracts: it resolves a
+// relative path under the canonical cwd echoed by `session.create`/`resume`/
+// `session.info`, calls the stock route, and maps the desktop response into the
+// existing native viewer models. It does not persist files or create another
+// filesystem authority.
 extension RestClient {
 
-    // MARK: - List a directory under the session cwd
+    /// Side-effect-free availability check for the stock Hermes filesystem
+    /// contract. The response shape matters: an unrelated route returning 200
+    /// must not enable the browser.
+    func probeStockFSEndpoint() async -> UploadProbeResult {
+        let request = makeRequest(path: "/api/fs/default-cwd", method: "GET")
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let response = response as? HTTPURLResponse else { return .inconclusive }
+            switch response.statusCode {
+            case 200:
+                guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      object["cwd"] is String else { return .inconclusive }
+                return .available
+            case 404, 405:
+                return .unavailable
+            default:
+                return .inconclusive
+            }
+        } catch {
+            return .inconclusive
+        }
+    }
 
-    /// `GET /api/fs/list?session_id=…[&path=…]` — list a directory under the
-    /// session's sandboxed cwd. `path` is relative to the cwd root (omit / pass
-    /// empty for the root itself). Throws ``FSReadError/pathEscapesRoot`` on a
-    /// `403`, ``FSReadError/notAFile`` on a `404` (the path is a file or is
-    /// missing — `"not a directory"`), and the underlying ``RestError`` otherwise.
-    func fsList(sessionId: String, path: String? = nil) async throws -> FSListResult {
+    private struct StockFSList: Decodable {
+        struct Entry: Decodable {
+            let name: String
+            let isDirectory: Bool
+        }
+
+        let entries: [Entry]
+        let error: String?
+    }
+
+    private struct StockFSReadText: Decodable {
+        let binary: Bool
+        let byteSize: Int
+        let mimeType: String?
+        let path: String
+        let text: String
+        let truncated: Bool
+    }
+
+    private struct StockFSDataURL: Decodable {
+        let dataUrl: String
+    }
+
+    private struct StockFSDiff: Decodable {
+        let diff: String
+    }
+
+    // MARK: - List a directory under the canonical session cwd
+
+    /// `GET /api/fs/list?path=<absolute>` using the cwd Hermes reported for the
+    /// active runtime. `path` remains relative in the UI (`nil`/empty = cwd).
+    func fsList(cwd: String, path: String? = nil) async throws -> FSListResult {
+        let resolved = try Self.resolveFSPath(cwd: cwd, path: path)
         let request = makeRequest(
-            path: "\(mobileAPIPrefix)/fs/list?" + Self.fsQuery(sessionId: sessionId, path: path),
+            path: "/api/fs/list?" + Self.fsQuery([
+                URLQueryItem(name: "path", value: resolved.absolute)
+            ]),
             method: "GET"
         )
         do {
             let data = try await perform(request)
-            return try decode(
-                FSListResult.self,
+            let payload = try decode(
+                StockFSList.self,
                 from: data,
                 context: "fs.list",
                 strategy: .useDefaultKeys
+            )
+            if let error = payload.error {
+                switch error {
+                case "ENOENT", "ENOTDIR": throw FSReadError.notAFile
+                case "EACCES": throw FSReadError.other("That folder isn't readable.")
+                default: throw FSReadError.other("Couldn't read that folder (\(error)).")
+                }
+            }
+            return FSListResult(
+                root: resolved.root,
+                path: resolved.relative,
+                entries: payload.entries.map {
+                    FSEntry(name: $0.name, isDir: $0.isDirectory, size: 0, modified: nil)
+                },
+                truncated: false
             )
         } catch let error as RestError {
             throw Self.mapFSError(error)
@@ -40,25 +104,30 @@ extension RestClient {
 
     // MARK: - Read a file under the session cwd
 
-    /// `GET /api/fs/read?session_id=…&path=…` — read a file's contents under the
-    /// session's sandboxed cwd. Returns text for a UTF-8 file (`truncated` flagged
-    /// if cut to the server's read cap) and `content == nil` /
-    /// `encoding == .binary` for a binary file. Throws
-    /// ``FSReadError/tooLarge(size:)`` on a `413` (over the 1 MB hard cap),
-    /// ``FSReadError/pathEscapesRoot`` on a `403`, ``FSReadError/notAFile`` on a
-    /// `404`, and ``FSReadError/other`` for any other failure.
-    func fsRead(sessionId: String, path: String) async throws -> FSReadResult {
+    /// `GET /api/fs/read-text?path=<absolute>` — stock Hermes text preview.
+    func fsRead(cwd: String, path: String) async throws -> FSReadResult {
+        let resolved = try Self.resolveFSPath(cwd: cwd, path: path)
         let request = makeRequest(
-            path: "\(mobileAPIPrefix)/fs/read?" + Self.fsQuery(sessionId: sessionId, path: path),
+            path: "/api/fs/read-text?" + Self.fsQuery([
+                URLQueryItem(name: "path", value: resolved.absolute)
+            ]),
             method: "GET"
         )
         do {
             let data = try await perform(request)
-            return try decode(
-                FSReadResult.self,
+            let payload = try decode(
+                StockFSReadText.self,
                 from: data,
                 context: "fs.read",
                 strategy: .useDefaultKeys
+            )
+            return FSReadResult(
+                path: resolved.relative,
+                size: payload.byteSize,
+                mimeType: payload.mimeType,
+                encoding: payload.binary ? .binary : .utf8,
+                content: payload.binary ? nil : payload.text,
+                truncated: payload.truncated
             )
         } catch let error as RestError {
             throw Self.mapFSError(error)
@@ -67,30 +136,31 @@ extension RestClient {
 
     // MARK: - Read an image file as a data URL
 
-    /// `GET /api/fs/read?session_id=…&path=…&format=data_url` — request an image
-    /// file as a `data:<mime>;base64,…` URL so the viewer can render it inline.
-    /// This is the patched-gateway path that mirrors the desktop's
-    /// `window.hermesDesktop.readFileDataUrl(filePath)` (see `LocalFilePreview`).
-    ///
-    /// Falls back gracefully: if the server does not support the `format` param
-    /// it returns the normal `FSReadResult` shape; the viewer checks `dataURL !=
-    /// nil` before trying to render as an image, so a stock gateway that ignores
-    /// the param and returns `encoding: "binary"` just shows the binary fallback.
-    ///
-    /// Same error mapping as ``fsRead``.
-    func fsReadAsDataURL(sessionId: String, path: String) async throws -> FSReadResult {
-        let baseQuery = Self.fsQuery(sessionId: sessionId, path: path)
+    /// `GET /api/fs/read-data-url?path=<absolute>` — stock Hermes binary/image
+    /// read used by the native image preview.
+    func fsReadAsDataURL(cwd: String, path: String) async throws -> FSReadResult {
+        let resolved = try Self.resolveFSPath(cwd: cwd, path: path)
         let request = makeRequest(
-            path: "\(mobileAPIPrefix)/fs/read?" + baseQuery + "&format=data_url",
+            path: "/api/fs/read-data-url?" + Self.fsQuery([
+                URLQueryItem(name: "path", value: resolved.absolute)
+            ]),
             method: "GET"
         )
         do {
             let data = try await perform(request)
-            return try decode(
-                FSReadResult.self,
+            let payload = try decode(
+                StockFSDataURL.self,
                 from: data,
                 context: "fs.read.image",
                 strategy: .useDefaultKeys
+            )
+            return FSReadResult(
+                path: resolved.relative,
+                size: 0,
+                encoding: .binary,
+                content: nil,
+                truncated: false,
+                dataURL: payload.dataUrl
             )
         } catch let error as RestError {
             throw Self.mapFSError(error)
@@ -99,21 +169,29 @@ extension RestClient {
 
     // MARK: - Diff a file under the session cwd
 
-    /// `GET /api/fs/diff?session_id=…&path=…` — fetch a working-tree-vs-HEAD
-    /// diff for one sandboxed session-cwd path. Clean/non-repo outcomes are
-    /// successful empty diffs. Same 403/404 mapping as ``fsRead``.
-    func fsDiff(sessionId: String, path: String) async throws -> FSDiffResult {
+    /// `GET /api/git/file-diff?path=<cwd>&file=<relative>` — stock Hermes'
+    /// working-tree-vs-HEAD preview. Clean/non-repo outcomes are empty diffs.
+    func fsDiff(cwd: String, path: String) async throws -> FSDiffResult {
+        let resolved = try Self.resolveFSPath(cwd: cwd, path: path)
         let request = makeRequest(
-            path: "\(mobileAPIPrefix)/fs/diff?" + Self.fsQuery(sessionId: sessionId, path: path),
+            path: "/api/git/file-diff?" + Self.fsQuery([
+                URLQueryItem(name: "path", value: resolved.root),
+                URLQueryItem(name: "file", value: resolved.relative)
+            ]),
             method: "GET"
         )
         do {
             let data = try await perform(request)
-            return try decode(
-                FSDiffResult.self,
+            let payload = try decode(
+                StockFSDiff.self,
                 from: data,
                 context: "fs.diff",
                 strategy: .useDefaultKeys
+            )
+            return FSDiffResult(
+                path: resolved.relative,
+                diff: payload.diff,
+                hasChanges: !payload.diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             )
         } catch let error as RestError {
             throw Self.mapFSError(error)
@@ -122,19 +200,61 @@ extension RestClient {
 
     // MARK: - Helpers
 
-    /// Build the `session_id`/`path` query string, percent-encoding both so a
-    /// path with spaces or `/` survives. `path` is omitted entirely when nil/empty
-    /// (the list root); `read` always passes a non-empty path.
-    static func fsQuery(sessionId: String, path: String?) -> String {
-        var items = [URLQueryItem(name: "session_id", value: sessionId)]
-        if let path, !path.isEmpty {
-            items.append(URLQueryItem(name: "path", value: path))
+    struct ResolvedFSPath: Equatable, Sendable {
+        let root: String
+        let relative: String
+        let absolute: String
+    }
+
+    /// Resolve UI-relative navigation under Hermes' canonical runtime cwd.
+    /// Absolute tool-result paths are accepted only when they remain inside the
+    /// cwd; traversal and cross-workspace paths never become implicit reads.
+    static func resolveFSPath(cwd: String, path: String?) throws -> ResolvedFSPath {
+        let trimmedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedCwd.isEmpty, trimmedCwd.hasPrefix("/") else {
+            throw FSReadError.noActiveSession
         }
+        guard !trimmedCwd.contains("\0"), !(path ?? "").contains("\0") else {
+            throw FSReadError.pathEscapesRoot
+        }
+
+        let root = URL(fileURLWithPath: trimmedCwd, isDirectory: true).standardizedFileURL.path
+        let rawPath = path ?? ""
+        let absolute: String
+        if rawPath.isEmpty {
+            absolute = root
+        } else if rawPath.lowercased().hasPrefix("file:"),
+                  let fileURL = URL(string: rawPath),
+                  fileURL.isFileURL,
+                  fileURL.host == nil || fileURL.host == "" || fileURL.host == "localhost" {
+            absolute = fileURL.standardizedFileURL.path
+        } else if rawPath.hasPrefix("/") {
+            absolute = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        } else {
+            absolute = URL(fileURLWithPath: root, isDirectory: true)
+                .appendingPathComponent(rawPath)
+                .standardizedFileURL.path
+        }
+
+        let rootPrefix = root == "/" ? "/" : root + "/"
+        guard absolute == root || absolute.hasPrefix(rootPrefix) else {
+            throw FSReadError.pathEscapesRoot
+        }
+        let relative: String
+        if absolute == root {
+            relative = ""
+        } else if root == "/" {
+            relative = String(absolute.dropFirst())
+        } else {
+            relative = String(absolute.dropFirst(root.count + 1))
+        }
+        return ResolvedFSPath(root: root, relative: relative, absolute: absolute)
+    }
+
+    /// Percent-encode stock route query values without cloning request plumbing.
+    static func fsQuery(_ items: [URLQueryItem]) -> String {
         var components = URLComponents()
         components.queryItems = items
-        // `percentEncodedQuery` from `queryItems` encodes spaces but leaves "/"
-        // and "+"; the gateway reads `path` as a literal relative path so encode
-        // those too to avoid a `+`→space or a path-split surprise.
         return (components.percentEncodedQuery ?? "")
             .replacingOccurrences(of: "+", with: "%2B")
     }
@@ -149,30 +269,15 @@ extension RestClient {
             case 413:
                 return .tooLarge(size: Self.parseSizeField(from: body))
             case 403:
-                return .pathEscapesRoot
+                return .other("That file isn't readable.")
             case 404:
-                // R1-fix finding 2: the server returns `{"error":"unknown
-                // session"}` for a stale/unknown sid (no dashboard-cwd fallback),
-                // vs `{"error":"not a directory"}`/`"not a file"` for a real path
-                // miss. Distinguish so the browser shows "No Active Session"
-                // rather than a misleading file-not-found.
-                return Self.is404UnknownSession(body) ? .noActiveSession : .notAFile
+                return .notAFile
             default:
                 return .other(error.errorDescription ?? "HTTP \(code)")
             }
         case .network, .decoding:
             return .other(error.errorDescription ?? "Request failed")
         }
-    }
-
-    /// True when a `404` body is the unknown-session marker
-    /// (`{"error":"unknown session"}`) rather than a path miss. Tolerant: any
-    /// parse failure falls back to the path-miss interpretation.
-    private static func is404UnknownSession(_ body: String) -> Bool {
-        guard let data = body.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return false }
-        return (object["error"] as? String) == "unknown session"
     }
 
     /// Pull the `"size"` int out of a `413` body (`{"error":"file too
@@ -248,7 +353,7 @@ extension RestClient {
             search: search,
             lineCount: lineCount
         )
-        // /api/logs is a STOCK gateway route (not a plugin-mount route), so it
+        // /api/logs is a stock gateway route, so it
         // hangs off /api directly regardless of pathStyle. The existing
         // makeRequest joins the path under baseURL, and the Host override +
         // bearer auth headers are applied uniformly.

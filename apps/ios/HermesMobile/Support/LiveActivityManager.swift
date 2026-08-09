@@ -49,16 +49,8 @@ final class LiveActivityManager {
     private var staleEndTask: Task<Void, Never>?
     private var staleGeneration = 0
 
-    /// Runtime session id the live activity belongs to — the key the gateway's
-    /// `/api/push/live-activity` registry upserts/prunes by (A3). `nil` when the
-    /// turn started without a known session id, in which case remote LA updates
-    /// can't be routed and we run the activity locally only.
+    /// Runtime session id represented by the local activity.
     private var sessionId: String?
-    /// The most recently registered LA push token (hex), so a rotation re-POSTs
-    /// and the end-time DELETE can target it.
-    private var registeredLAToken: String?
-    /// Long-lived task observing `activity.pushTokenUpdates`. Cancelled on end.
-    private var tokenObservationTask: Task<Void, Never>?
 
     /// Tail of the FIFO delivery chain (R1 #3): every ActivityKit content push
     /// awaits its predecessor, so racing unstructured Tasks can no longer apply
@@ -68,12 +60,6 @@ final class LiveActivityManager {
     /// Bumped by ``end()`` so queued-but-undelivered updates from the dying
     /// turn become no-ops instead of chasing (or overtaking) the end frame.
     private var deliveryGeneration = 0
-
-    /// Lifecycle token for the token-registration round-trip (R1 #32/#97): a
-    /// register POST that resumes after ``end()`` (or after a new lifecycle
-    /// began) must not record — or leave the gateway holding — a token for a
-    /// dismissed activity. Bumped on every `start()`/`end()`.
-    private var registrationGeneration = 0
 
     /// A detached activity awaiting its grace dismissal (R1 #53). `end()` hands
     /// the activity off here and clears the manager synchronously; a
@@ -178,7 +164,7 @@ final class LiveActivityManager {
     ///   - sessionTitle: the lock-screen / Dynamic Island title (fixed for the
     ///     activity's lifetime).
     ///   - sessionId: the runtime session id this turn belongs to, used to key the
-    ///     gateway's `/api/push/live-activity` registry so remote LA updates land
+    ///     on-device ActivityKit surface so local live updates land
     ///     on the right activity (A3). Omit for a local-only activity.
     func start(sessionTitle: String, sessionId: String? = nil) {
         #if canImport(ActivityKit)
@@ -206,10 +192,6 @@ final class LiveActivityManager {
         currentToolName = nil
         currentNeedsApproval = false
         self.sessionId = sessionId
-        registeredLAToken = nil
-        // New lifecycle: invalidate any straggling registration round-trip
-        // from a previous activity (R1 #32/#97).
-        registrationGeneration += 1
         // New lifecycle also resets the stale watchdog. The new activity below
         // arms a fresh one whose deadline matches its ActivityContent.staleDate.
         staleEndTask?.cancel()
@@ -228,11 +210,7 @@ final class LiveActivityManager {
             startedAt: startedAt
         )
         do {
-            // `pushType: .token` so ActivityKit issues a remote push token the
-            // gateway can target for server-driven content-state updates (A3).
-            // `Activity.request(attributes:content:pushType:)` is iOS 16.2+
-            // (verified against the SDK swiftinterface); the deployment base is
-            // iOS 17, so it's unconditionally available.
+            // Local-only until the optional thin APNs provider is implemented.
             let started = try Activity.request(
                 attributes: attributes,
                 content: ActivityContent(
@@ -241,12 +219,9 @@ final class LiveActivityManager {
                     // as live forever (`staleDate: nil` never staled).
                     staleDate: Date().addingTimeInterval(Self.staleAfter)
                 ),
-                pushType: .token
+                pushType: nil
             )
             activity = started
-            // Observe the push token (and its rotations) and register each with
-            // the gateway. Only meaningful when we have a session id to key by.
-            observePushToken(for: started)
             scheduleStaleEnd()
         } catch {
             // Disabled, over budget, or unsupported — silently skip.
@@ -299,11 +274,10 @@ final class LiveActivityManager {
     /// The manager's state is detached and cleared SYNCHRONOUSLY (R1 #49/#53):
     /// the deferred task only delivers the terminal frame and dismisses the
     /// already-detached activity, so a back-to-back `start()` always builds a
-    /// fresh activity with a fresh token observation — the old path deferred
+    /// fresh activity — the old path deferred
     /// the state reset behind the grace sleep, where a cancellation window
     /// after ActivityKit's `end` could leave a DEAD activity installed for the
-    /// reuse branch, and `registeredLAToken` survived to suppress the next
-    /// turn's re-registration.
+    /// reuse branch.
     func end() {
         #if canImport(ActivityKit)
         guard let activity else { return }
@@ -312,16 +286,6 @@ final class LiveActivityManager {
         staleEndTask?.cancel()
         staleEndTask = nil
         staleGeneration += 1
-        // Stop observing token rotations and drop the gateway registration up
-        // front — the activity is on its way out, so no further remote LA pushes
-        // should be routed to it.
-        tokenObservationTask?.cancel()
-        tokenObservationTask = nil
-        unregisterLAToken()
-        // Invalidate any in-flight registration round-trip (R1 #32/#97): its
-        // post-await write must not resurrect a registration the DELETE above
-        // just removed.
-        registrationGeneration += 1
         let content = ActivityContent(
             state: makeState(phaseOverride: "Done"),
             staleDate: Date().addingTimeInterval(Self.endStaleAfter)
@@ -333,7 +297,6 @@ final class LiveActivityManager {
         currentToolName = nil
         currentNeedsApproval = false
         sessionId = nil
-        registeredLAToken = nil
         // Queued-but-undelivered updates from this turn are stale: bump the
         // generation BEFORE enqueueing the end frame so they no-op while the
         // end frame (enqueued under the new generation, FIFO behind anything
@@ -439,95 +402,6 @@ final class LiveActivityManager {
         to box: ActivityBox
     ) async {
         await box.activity.update(content)
-    }
-
-    // MARK: - Push token registration (A3)
-
-    /// Observe an activity's push token + rotations and register each with the
-    /// gateway. `pushTokenUpdates` is an `AsyncSequence` of `Data` (verified
-    /// against the SDK swiftinterface); the loop ends when the activity ends or
-    /// the task is cancelled.
-    ///
-    /// The `Activity` is non-Sendable, so it crosses into the observation task
-    /// through the same one-shot `ActivityBox` transfer used elsewhere; the token
-    /// `Data` it yields IS Sendable and is hopped back to the main actor for the
-    /// registration POST.
-    private func observePushToken(for activity: Activity<HermesTurnAttributes>) {
-        tokenObservationTask?.cancel()
-        let box = ActivityBox(activity: activity)
-        tokenObservationTask = Task { @MainActor [weak self] in
-            for await tokenData in box.activity.pushTokenUpdates {
-                if Task.isCancelled { return }
-                let hex = tokenData.map { String(format: "%02x", $0) }.joined()
-                await self?.registerLAToken(hex)
-            }
-        }
-    }
-
-    /// Register (or re-register on rotation) the LA push token with the gateway.
-    /// No-op without a session id (nothing to key the registry by) or an empty
-    /// token. A re-POST with the same token is skipped.
-    ///
-    /// The registration generation is snapshotted before the network await and
-    /// re-checked after (R1 #32/#97): `end()` (or a fresh `start()`) during the
-    /// round-trip invalidates this registration — the post-await write must not
-    /// re-arm a token for a dismissed activity, and a register that landed
-    /// server-side for a dead lifecycle is compensated with a DELETE rather
-    /// than left for a future 410 to prune.
-    private func registerLAToken(_ hex: String) async {
-        guard let sessionId, !sessionId.isEmpty, !hex.isEmpty else { return }
-        guard registeredLAToken != hex else { return }
-        let generation = registrationGeneration
-        guard let endpoint = PushRegistrar.shared.resolveEndpoint() else { return }
-        let env = PushRegistrar.apnsEnvironment
-        let rest = RestClient(
-            baseURL: endpoint.url, token: endpoint.token, pathStyle: endpoint.pathStyle
-        )
-        let outcome = await rest.registerLiveActivity(
-            token: hex,
-            sessionId: sessionId,
-            env: env
-        )
-        guard generation == registrationGeneration else {
-            // The lifecycle died mid-flight but the gateway accepted the
-            // registration — take it back, UNLESS a newer lifecycle now owns
-            // the SAME session id (consecutive turns share the runtime sid and
-            // the gateway registry upserts one token per sid): a DELETE keyed
-            // by that sid could land after the new turn's register and clobber
-            // its routing (ABH-49 judge round). When skipped, the new turn's
-            // own upsert supersedes this row; if the two POSTs reordered
-            // server-side, the next token rotation or the server's 410-prune /
-            // age-GC reconciles.
-            if case .success = outcome, self.sessionId != sessionId {
-                Task {
-                    _ = await rest.unregisterLiveActivity(
-                        token: hex, sessionId: sessionId, env: env
-                    )
-                }
-            }
-            return
-        }
-        if case .success = outcome {
-            registeredLAToken = hex
-        }
-    }
-
-    /// Tell the gateway to drop the LA token for this session (DELETE), so the
-    /// pruned-on-end registry doesn't keep pushing to a dead activity.
-    private func unregisterLAToken() {
-        guard let sessionId, !sessionId.isEmpty, let hex = registeredLAToken, !hex.isEmpty else {
-            return
-        }
-        guard let endpoint = PushRegistrar.shared.resolveEndpoint() else { return }
-        let env = PushRegistrar.apnsEnvironment
-        // Fire-and-forget: the activity is already ending; a failed unregister is
-        // pruned server-side on the next 410/BadDeviceToken anyway.
-        Task {
-            let rest = RestClient(
-                baseURL: endpoint.url, token: endpoint.token, pathStyle: endpoint.pathStyle
-            )
-            _ = await rest.unregisterLiveActivity(token: hex, sessionId: sessionId, env: env)
-        }
     }
 
     private static func finish(

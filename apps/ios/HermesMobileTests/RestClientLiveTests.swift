@@ -1,8 +1,8 @@
 import XCTest
 @testable import HermesMobile
 
-/// Live integration coverage for `RestClient.upload` against a running hermes
-/// gateway.
+/// Live integration coverage for stock `RestClient` endpoints against a running
+/// Hermes gateway.
 ///
 /// Requires the shared dashboard to be reachable, with credentials supplied via
 /// the test-runner environment:
@@ -20,7 +20,7 @@ final class RestClientLiveTests: XCTestCase {
         )
         TranscriptPageStubProtocol.requestedPath = nil
         TranscriptPageStubProtocol.requestedQuery = nil
-        let rest = transcriptPageStubClient(pathStyle: .plugin)
+        let rest = transcriptPageStubClient()
 
         let page = await fetchStockTranscriptPage(
             rest: rest,
@@ -42,14 +42,46 @@ final class RestClientLiveTests: XCTestCase {
         XCTAssertEqual(page?.hasMoreBefore, true)
     }
 
-    func testBoundedTranscriptTailIgnoresPluginPathStyle() async throws {
+    func testTranscriptPageFetchUsesStockLatestWindow() async {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"messages":[{"id":41,"role":"user","content":"older"}],"pagination":{"limit":50,"offset":0,"order":"latest","returned":1}}"#.data(using: .utf8)!,
+            200
+        )
+        TranscriptPageStubProtocol.requestedPath = nil
+        TranscriptPageStubProtocol.requestedQuery = nil
+        let rest = transcriptPageStubClient()
+
+        let page = await fetchTranscriptPage(rest: rest, sessionId: "s 1", limit: 50)
+
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/sessions/s%201/messages")
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedQuery, "limit=50&offset=0&order=latest")
+        XCTAssertEqual(page?.messages.map(\.wireId), [41])
+        XCTAssertEqual(page?.oldestId, 41)
+        XCTAssertEqual(page?.hasMoreBefore, false)
+    }
+
+    func testTranscriptPageFetchDoesNotRequirePluginPathStyle() async {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"messages":[],"pagination":{"limit":50,"offset":0,"order":"latest","returned":0}}"#.data(using: .utf8)!,
+            200
+        )
+        TranscriptPageStubProtocol.requestedPath = nil
+        let rest = transcriptPageStubClient()
+
+        let page = await fetchTranscriptPage(rest: rest, sessionId: "s1", limit: 50)
+
+        XCTAssertNotNil(page)
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/sessions/s1/messages")
+    }
+
+    func testBoundedTranscriptTailUsesStockHistory() async throws {
         TranscriptPageStubProtocol.nextResponse = (
             #"{"session_id":"s 1","messages":[{"id":51,"role":"user","content":"tail"}],"pagination":{"limit":50,"offset":10,"returned":1}}"#.data(using: .utf8)!,
             200
         )
         TranscriptPageStubProtocol.requestedPath = nil
         TranscriptPageStubProtocol.requestedQuery = nil
-        let rest = transcriptPageStubClient(pathStyle: .plugin)
+        let rest = transcriptPageStubClient()
 
         let messages = try await fetchBoundedStockTranscript(
             rest: rest,
@@ -95,39 +127,6 @@ final class RestClientLiveTests: XCTestCase {
         )
     }
 
-    /// Round-trip a tiny PNG through `POST /api/upload` and assert the server
-    /// hands back a stored path under `/uploads/` keeping the `.png` extension.
-    func testLiveUploadReturnsUploadsPath() async throws {
-        let env = ProcessInfo.processInfo.environment
-        guard let urlString = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
-              !urlString.isEmpty, !token.isEmpty,
-              let url = URL(string: urlString) else {
-            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live upload test")
-        }
-
-        // Mirror production (ABH-88): pin the path family the gateway serves.
-        let probe = RestClient(baseURL: url, token: token)
-        let mount = await probe.probePluginMountEndpoint()
-        let client = probe.withPathStyle(mount == .available ? .plugin : .legacy)
-        let png = Self.makeTinyPNG()
-        XCTAssertFalse(png.isEmpty, "Failed to generate test PNG")
-
-        let result = try await client.upload(
-            data: png,
-            filename: "\(UUID().uuidString).png",
-            mimeType: "image/png"
-        )
-
-        XCTAssertTrue(
-            result.path.hasSuffix(".png"),
-            "Upload path should keep the .png extension, got \(result.path)"
-        )
-        XCTAssertTrue(
-            result.path.contains("/uploads/"),
-            "Upload path should be served from /uploads/, got \(result.path)"
-        )
-    }
-
     /// `GET /api/cron/delivery-targets` keeps snake_case target metadata intact
     /// and exposes both configured and needs-home-channel states to the cron
     /// editor. This is stubbed (not live) so CI pins the decoder without a
@@ -161,39 +160,13 @@ final class RestClientLiveTests: XCTestCase {
 
     // MARK: - Test fixtures
 
-    /// A minimal, valid 1x1 opaque-red PNG, built in-code so the test carries no
-    /// asset dependency. Bytes are the canonical smallest single-pixel PNG:
-    /// 8-byte signature + IHDR + a single zlib-deflated IDAT scanline + IEND,
-    /// each chunk carrying its correct CRC-32.
-    private static func makeTinyPNG() -> Data {
-        let bytes: [UInt8] = [
-            // PNG signature
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-            // IHDR chunk: 1x1, 8-bit, color type 2 (truecolor)
-            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-            0xDE,
-            // IDAT chunk: one zlib-deflated scanline (filter 0 + R,G,B)
-            0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54,
-            0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00,
-            0x03, 0x01, 0x01, 0x00,
-            0x18, 0xDD, 0x8D, 0xB0,
-            // IEND chunk
-            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
-            0xAE, 0x42, 0x60, 0x82,
-        ]
-        return Data(bytes)
-    }
-
-    private func transcriptPageStubClient(pathStyle: APIPathStyle) -> RestClient {
+    private func transcriptPageStubClient() -> RestClient {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [TranscriptPageStubProtocol.self]
         return RestClient(
             baseURL: URL(string: "http://127.0.0.1:9119")!,
             token: "test-token",
-            session: URLSession(configuration: config),
-            pathStyle: pathStyle
+            session: URLSession(configuration: config)
         )
     }
 }

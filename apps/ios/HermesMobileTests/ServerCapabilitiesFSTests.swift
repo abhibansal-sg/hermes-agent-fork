@@ -1,8 +1,8 @@
 import XCTest
 @testable import HermesMobile
 
-/// Capability-matrix coverage: one plugin-mount result owns the bundled upload,
-/// file, and device features; profiles remains an independent stock probe.
+/// Capability-matrix coverage: filesystem and profiles are stock probes;
+/// broad mobile-plugin capabilities stay unavailable without a probe.
 @MainActor
 final class ServerCapabilitiesFSTests: XCTestCase {
 
@@ -30,7 +30,8 @@ final class ServerCapabilitiesFSTests: XCTestCase {
         XCTAssertEqual(caps.subagentEvents, .unknown)
     }
 
-    func testPluginMountControlsBundledCapabilitiesWithOneProbe() async {
+    func testStockFSIsIndependentFromPluginMount() async {
+        defer { UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverCapabilities) }
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [CapabilityMatrixProtocol.self]
         let session = URLSession(configuration: config)
@@ -44,14 +45,14 @@ final class ServerCapabilitiesFSTests: XCTestCase {
 
         await caps.probe(serverURL: "http://gateway.test", rest: rest, force: true)
 
-        XCTAssertEqual(caps.pluginMount, .available)
-        XCTAssertEqual(caps.upload, .available)
         XCTAssertEqual(caps.fs, .available)
-        XCTAssertEqual(caps.devices, .available)
         XCTAssertEqual(caps.profiles, .unavailable)
         XCTAssertEqual(
             Set(CapabilityMatrixProtocol.paths),
-            ["/api/plugins/hermes-mobile/devices", "/api/profiles/sessions"]
+            [
+                "/api/fs/default-cwd",
+                "/api/profiles/sessions",
+            ]
         )
     }
 }
@@ -77,9 +78,9 @@ private final class CapabilityMatrixProtocol: URLProtocol, @unchecked Sendable {
 
         let status: Int
         let body: String
-        if path == "/api/plugins/hermes-mobile/devices" {
+        if path == "/api/fs/default-cwd" {
             status = 200
-            body = #"{"devices":[]}"#
+            body = #"{"cwd":"/workspace","branch":"main"}"#
         } else {
             status = 404
             body = #"{"detail":"not found"}"#

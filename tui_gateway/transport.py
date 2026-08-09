@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 # Errno values that mean "the peer is gone" rather than "the host has a
@@ -43,6 +44,23 @@ _PEER_GONE_ERRNOS = frozenset({
 } - {-1})
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AuthenticatedPrincipal:
+    """Transport-neutral identity authorized to issue gateway RPCs.
+
+    Authentication providers own credential verification and supply the stable
+    subject. Hermes owns what that identity may do to a live session.
+    """
+
+    subject: str
+    provider: str
+    credential: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}:{self.subject}"
 
 # Optional knob: when true, StdioTransport does not call ``stream.flush``
 # after writing.  Use this on environments where a half-closed pipe (TUI
@@ -66,6 +84,8 @@ _DISABLE_FLUSH = (os.environ.get("HERMES_TUI_GATEWAY_NO_FLUSH", "") or "").strip
 @runtime_checkable
 class Transport(Protocol):
     """Minimal interface every transport implements."""
+
+    authenticated_principal: AuthenticatedPrincipal
 
     def write(self, obj: dict) -> bool:
         """Emit one JSON frame. Return ``False`` when the peer is gone."""
@@ -105,11 +125,19 @@ class StdioTransport:
     existing test suite relies on (``monkeypatch.setattr(server, "_real_stdout", ...)``).
     """
 
-    __slots__ = ("_stream_getter", "_lock")
+    __slots__ = ("_stream_getter", "_lock", "authenticated_principal")
 
     def __init__(self, stream_getter: Callable[[], Any], lock: threading.Lock) -> None:
         self._stream_getter = stream_getter
         self._lock = lock
+        # One stable compatibility identity for the process-local TUI. It keeps
+        # existing stdio behavior unchanged while making the authorization seam
+        # explicit instead of treating a missing identity as trusted.
+        self.authenticated_principal = AuthenticatedPrincipal(
+            subject="stdio",
+            provider="local",
+            credential="process",
+        )
 
     def write(self, obj: dict) -> bool:
         """Return ``True`` on success, ``False`` ONLY when the peer is gone.
@@ -192,11 +220,12 @@ class TeeTransport:
     on stdio (Ink) AND on a back-WS feeding the dashboard sidebar.
     """
 
-    __slots__ = ("_primary", "_secondaries")
+    __slots__ = ("_primary", "_secondaries", "authenticated_principal")
 
     def __init__(self, primary: "Transport", *secondaries: "Transport") -> None:
         self._primary = primary
         self._secondaries = secondaries
+        self.authenticated_principal = primary.authenticated_principal
 
     def write(self, obj: dict) -> bool:
         # Primary first so a slow sidecar (WS publisher) never delays Ink/stdio.

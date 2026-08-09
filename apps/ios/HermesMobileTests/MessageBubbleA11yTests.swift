@@ -72,6 +72,10 @@ final class MessageBubbleA11yTests: XCTestCase {
         XCTAssertEqual(result.displayText, "Please look at this.")
         XCTAssertEqual(result.attachments.map(\.name), ["abcdef0123456789abcdef0123456789.jpg"])
         XCTAssertEqual(result.attachments.first?.filename, "abcdef0123456789abcdef0123456789.jpg")
+        XCTAssertEqual(
+            result.attachments.first?.path,
+            "/Users/abhi/.hermes/uploads/abcdef0123456789abcdef0123456789.jpg"
+        )
     }
 
     func testSentImageAttachmentsIgnoresUnsafeOrUnsupportedReferences() {

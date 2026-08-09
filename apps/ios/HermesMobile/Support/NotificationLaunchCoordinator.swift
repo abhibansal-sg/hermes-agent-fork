@@ -1,47 +1,10 @@
 import UIKit
 import UserNotifications
 
-/// Resolves the notification-action REST endpoint without constructing or
-/// waiting for a ``ConnectionStore``. The URL and path family come from their
-/// established UserDefaults owners; the credential is read exclusively through
-/// ``KeychainService``.
-struct PersistedNotificationEndpointResolver {
-    var loadURLString: () -> String? = {
-        UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
-    }
-    var loadToken: (String) -> String? = { KeychainService.loadToken(server: $0) }
-    var loadAuthMode: () -> GatewayAuthMode = { .saved() }
-    var loadPathStyle: (String) -> APIPathStyle = {
-        ServerCapabilities.cachedPathStyle(serverURL: $0)
-    }
-
-    func resolve() -> NotificationService.ActionEndpoint? {
-        guard let rawURL = loadURLString()?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !rawURL.isEmpty,
-              let url = URL(string: rawURL),
-              url.scheme != nil,
-              url.host != nil else { return nil }
-        let token: String
-        if loadAuthMode() == .session {
-            token = ""
-        } else {
-            guard let savedToken = loadToken(rawURL), !savedToken.isEmpty else { return nil }
-            token = savedToken
-        }
-        return NotificationService.ActionEndpoint(
-            baseURL: url, token: token, pathStyle: loadPathStyle(rawURL)
-        )
-    }
-}
-
 /// Process-lifetime owner for notification registration and response delivery.
 /// UIKit creates this through `AppDelegate`, before any SwiftUI view task runs.
 @MainActor
 final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDelegate {
-    struct CompletionBox: @unchecked Sendable {
-        let handler: () -> Void
-    }
-
     private struct PresentationBox: @unchecked Sendable {
         let userInfo: [AnyHashable: Any]
         let completion: (UNNotificationPresentationOptions) -> Void
@@ -49,19 +12,13 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
 
     enum Event: Sendable {
         case tap(NotificationService.Tap)
-        case approval(Bool, NotificationService.ApprovalActionPayload?, CompletionBox)
-        case reply(String, NotificationService.ClarifyReplyActionPayload?, CompletionBox)
     }
 
     private var pending: [Event] = []
     private var didInstall = false
     private var tapHandler: (@MainActor @Sendable (NotificationService.Tap) -> Void)?
-    private var endpointProvider:
-        (@MainActor @Sendable () -> NotificationService.ActionEndpoint?)?
     private var reconciliationHandler: (@MainActor @Sendable () -> Void)?
     private var owesReconciliation = false
-    private var actionRequestIDsInFlight: Set<String> = []
-    private var completedActionRequestIDs: Set<String> = []
 
     func install(center: UNUserNotificationCenter = .current()) {
         guard !didInstall else { return }
@@ -75,14 +32,6 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
     ) {
         tapHandler = handler
         NotificationService.setTapHandler(handler)
-        drainIfReady()
-    }
-
-    func attachActionEndpointProvider(
-        _ provider: @escaping @MainActor @Sendable () -> NotificationService.ActionEndpoint?
-    ) {
-        endpointProvider = provider
-        NotificationService.setActionEndpointProvider(provider)
         drainIfReady()
     }
 
@@ -103,10 +52,7 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
     }
 
     private func isReady(for event: Event) -> Bool {
-        switch event {
-        case .tap: return tapHandler != nil
-        case .approval, .reply: return endpointProvider != nil
-        }
+        tapHandler != nil
     }
 
     private func drainIfReady() {
@@ -122,55 +68,7 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
         switch event {
         case .tap(let tap):
             tapHandler?(tap)
-        case .approval(let approve, let action, let completion):
-            guard beginAction(requestID: action?.requestId) else {
-                completion.handler()
-                return
-            }
-            Task { @MainActor in
-                if let action {
-                    await NotificationService.handleApprovalAction(approve: approve, action: action)
-                } else {
-                    NotificationService.postFeedbackNotification(
-                        title: "Couldn't respond", body: "Open Hermes to respond to this request."
-                    )
-                }
-                self.finishAction(requestID: action?.requestId)
-                self.notifyReconciliation()
-                completion.handler()
-            }
-        case .reply(let text, let action, let completion):
-            guard beginAction(requestID: action?.approvalId) else {
-                completion.handler()
-                return
-            }
-            Task { @MainActor in
-                if let action {
-                    await NotificationService.handleClarifyReplyAction(text: text, action: action)
-                } else {
-                    NotificationService.postFeedbackNotification(
-                        title: "Couldn't reply", body: "Open Hermes to answer this question."
-                    )
-                }
-                self.finishAction(requestID: action?.approvalId)
-                self.notifyReconciliation()
-                completion.handler()
-            }
         }
-    }
-
-    private func beginAction(requestID: String?) -> Bool {
-        guard let requestID, !requestID.isEmpty else { return true }
-        guard !actionRequestIDsInFlight.contains(requestID),
-              !completedActionRequestIDs.contains(requestID) else { return false }
-        actionRequestIDsInFlight.insert(requestID)
-        return true
-    }
-
-    private func finishAction(requestID: String?) {
-        guard let requestID, !requestID.isEmpty else { return }
-        actionRequestIDsInFlight.remove(requestID)
-        completedActionRequestIDs.insert(requestID)
     }
 
     private func notifyReconciliation() {
@@ -211,19 +109,8 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
-        let actionId = response.actionIdentifier
         let event: Event?
-        let completion = CompletionBox(handler: completionHandler)
-        if let approve = NotificationService.approveChoice(for: actionId) {
-            event = .approval(
-                approve, NotificationService.decodeApprovalAction(from: userInfo), completion
-            )
-        } else if actionId == NotificationService.replyActionIdentifier {
-            let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
-            event = .reply(
-                text, NotificationService.decodeClarifyReplyAction(from: userInfo), completion
-            )
-        } else if actionId == UNNotificationDefaultActionIdentifier,
+        if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
                   let tap = NotificationService.decodeTap(from: userInfo) {
             event = .tap(tap)
         } else {
@@ -233,7 +120,7 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
             completionHandler()
             return
         }
-        if case .tap = event { completionHandler() }
+        completionHandler()
         Task { @MainActor in self.receive(event) }
     }
 }

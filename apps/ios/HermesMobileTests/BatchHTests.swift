@@ -4,10 +4,9 @@ import XCTest
 /// ABH-53 (R1 Batch H) — the store/helper-level slices of the navigation +
 /// affordances batch. Most of Batch H is view wiring (verified by build +
 /// manual paths); these pin the newly-wired store affordances and the
-/// clock-skew clamp.
+/// inbox lifecycle helpers.
 ///
-/// Ledger coverage here: #78 (relative-date clamp), #94 (inbox dismiss /
-/// clear-expired, previously dead code now reachable from InboxView).
+/// Ledger coverage here: #94 (inbox dismiss / clear-expired).
 @MainActor
 final class BatchHTests: XCTestCase {
 
@@ -21,19 +20,6 @@ final class BatchHTests: XCTestCase {
             "session_id": .string(runtime),
             "payload": payload,
         ]))!
-    }
-
-    // MARK: - #78: server-clock skew must never render a future "last seen"
-
-    func testRelativeDateClampsFutureTimestamps() {
-        let now = Date().timeIntervalSince1970
-        // A server clock 5 minutes ahead must render exactly like "just now"
-        // (clamped), not "in 5 min".
-        let skewed = DevicesView.relativeDate(now + 300)
-        let justNow = DevicesView.relativeDate(now)
-        XCTAssertEqual(skewed, justNow,
-                       "future timestamps clamp to the same render as now")
-        XCTAssertEqual(DevicesView.relativeDate(0), "—")
     }
 
     // MARK: - #94: dismiss / clearExpired are live store affordances

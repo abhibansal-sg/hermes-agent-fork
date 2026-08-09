@@ -144,6 +144,7 @@ final class SessionStore {
         refreshToken &+= 1
         cancelEnsureRuntime()
         cancelRuntimeBinding()
+        cancelWatchPolling()
     }
 
     /// A runtime id belongs to one WebSocket generation only. Keep the durable
@@ -155,6 +156,7 @@ final class SessionStore {
         activeRuntimeEpoch = nil
         cancelEnsureRuntime()
         cancelRuntimeBinding()
+        cancelWatchPolling()
     }
 
     /// A different gateway is a different cache and runtime namespace. Do not
@@ -1055,6 +1057,11 @@ final class SessionStore {
     /// Coalesces concurrent on-demand re-resumes (a live send and a queue drain
     /// racing) onto a single `session.resume` RPC.
     private var ensureRuntimeTask: Task<String?, Never>?
+    /// Stock `session.watch` is a non-rebinding snapshot, not a subscription.
+    /// This single task refreshes it only while the selected binding is `.watch`.
+    private var watchPollTask: Task<Void, Never>?
+    private static let watchWorkingPollInterval: Duration = .milliseconds(250)
+    private static let watchIdlePollInterval: Duration = .seconds(2)
     /// Per-session attempt budget for ``ensureActiveRuntime()`` so a genuinely
     /// unresumable session can't spin. Reset on a fresh ``open(_:revealOnFirstPaint:)``
     /// (new user intent) or a successful bind.
@@ -1072,13 +1079,78 @@ final class SessionStore {
     /// version guard for older gateways and falls back to the legacy resume.
     var activeListRPC: (() async throws -> SessionActiveListResult)?
 
+    /// Versioned stock `session.watch` snapshot. The RPC returns the live
+    /// projection without rebinding the gateway's driver transport. Tests inject
+    /// this seam directly; production calls the actor-isolated gateway client.
+    var watchRPC: ((_ storedId: String) async throws -> SessionOpenResult)?
+    /// Injectable stock `session.takeover` RPC used by authority race tests.
+    var takeoverRPC: ((_ runtimeId: String) async throws -> Void)?
+
+    struct WatchedLiveSession {
+        let id: String
+        let sessionKey: String
+        let status: SessionActiveItem.Status
+        let model: String?
+        let snapshot: SessionOpenResult?
+
+        init(activeItem: SessionActiveItem) {
+            id = activeItem.id
+            sessionKey = activeItem.sessionKey
+            status = activeItem.status
+            model = activeItem.model
+            snapshot = nil
+        }
+
+        init(snapshot: SessionOpenResult, requestedStoredID: String) {
+            id = snapshot.sessionId
+            sessionKey = snapshot.storedSessionId ?? requestedStoredID
+            status = SessionActiveItem.Status(rawValue: snapshot.status ?? "")
+                ?? (snapshot.snapshotRunning == true ? .working : .idle)
+            model = snapshot.info?.model
+            self.snapshot = snapshot
+        }
+    }
+
     enum LiveSessionInspection {
-        case found(SessionActiveItem)
+        case found(WatchedLiveSession)
         case absent
         case unsupported
     }
 
-    func inspectLiveSession(storedID: String) async throws -> LiveSessionInspection {
+    func inspectLiveSession(
+        storedID: String,
+        compactSnapshot: Bool = false
+    ) async throws -> LiveSessionInspection {
+        // Prefer the versioned stock snapshot. Test graphs that install only the
+        // legacy active-list seam deliberately exercise the compatibility path.
+        let stockWatchAvailable = connection?.supportsGatewayCapability(
+            "session_watch_v1"
+        ) == true
+        if watchRPC != nil || (resumeRPC == nil && client != nil && stockWatchAvailable) {
+            do {
+                let snapshot: SessionOpenResult
+                if let watchRPC {
+                    snapshot = try await watchRPC(storedID)
+                } else {
+                    guard let client else { throw GatewayError.notConnected }
+                    snapshot = try await client.request(
+                        "session.watch",
+                        params: .object([
+                            "session_key": .string(storedID),
+                            "omit_messages": .bool(true),
+                            "omit_info": .bool(compactSnapshot),
+                        ])
+                    )
+                }
+                return .found(WatchedLiveSession(
+                    snapshot: snapshot, requestedStoredID: storedID
+                ))
+            } catch let GatewayError.rpc(code, _) where code == 4001 {
+                return .absent
+            } catch let GatewayError.rpc(code, _) where code == -32601 {
+                // Older stock gateways: retain the existing active-list probe.
+            }
+        }
         let result: SessionActiveListResult
         do {
             if let activeListRPC {
@@ -1098,7 +1170,7 @@ final class SessionStore {
         guard let live = result.sessions.first(where: { $0.sessionKey == storedID }) else {
             return .absent
         }
-        return .found(live)
+        return .found(WatchedLiveSession(activeItem: live))
     }
 
     /// Mirror the stock client's foreground active-list observation without
@@ -1131,14 +1203,6 @@ final class SessionStore {
                         snapshotRunning: true,
                         watchOnly: mode == .watch
                     )
-                    if live.status == .waiting,
-                       chat?.pendingApproval == nil,
-                       chat?.pendingClarification == nil,
-                       chat?.pendingSecurePrompt == nil,
-                       let scope = projectsCacheScope,
-                       let rest = connection?.rest {
-                        await connection?.inboxStore?.refresh(scope: scope, rest: rest)
-                    }
                 } else if mode == .watch,
                           chat?.settleWatchOnlyTurn(runtimeId: live.id) == true {
                     markTurnCompleted(storedId: storedID, runtimeId: live.id)
@@ -1281,6 +1345,83 @@ final class SessionStore {
     private func cancelEnsureRuntime() {
         ensureRuntimeTask?.cancel()
         ensureRuntimeTask = nil
+    }
+
+    private func cancelWatchPolling() {
+        watchPollTask?.cancel()
+        watchPollTask = nil
+    }
+
+    private func startWatchPolling() {
+        cancelWatchPolling()
+        guard watchRPC != nil
+                || connection?.supportsGatewayCapability("session_watch_v1") == true,
+              sessionBinding?.mode == .watch else { return }
+        watchPollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self,
+                      self.connection?.isTransportReady == true,
+                      self.sessionBinding?.mode == .watch,
+                      let storedID = self.activeStoredId,
+                      let runtimeID = self.activeRuntimeId else { return }
+                let delay = self.chat?.isStreaming == true
+                    ? Self.watchWorkingPollInterval
+                    : Self.watchIdlePollInterval
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled else { return }
+                if !(await self.refreshWatchedSessionOnce(
+                    storedID: storedID, runtimeID: runtimeID
+                )) { return }
+            }
+        }
+    }
+
+    /// Refresh one stock watch snapshot. Internal for deterministic protocol
+    /// tests; the production poll task is the sole recurring caller.
+    @discardableResult
+    func refreshWatchedSessionOnce(storedID: String, runtimeID: String) async -> Bool {
+        guard watchRPC != nil || connection?.isTransportReady == true,
+              sessionBinding?.mode == .watch,
+              activeStoredId == storedID,
+              activeRuntimeId == runtimeID else { return false }
+        do {
+            guard case .found(let live) = try await inspectLiveSession(
+                storedID: storedID, compactSnapshot: true
+            )
+            else { return false }
+            guard sessionBinding?.mode == .watch,
+                  activeStoredId == storedID,
+                  activeRuntimeId == runtimeID else { return false }
+            if live.id != runtimeID {
+                bindSession(
+                    storedID: storedID, runtimeID: live.id,
+                    mode: .watch, generation: nil
+                )
+            }
+            connection?.applySessionModel(live.model)
+            guard let snapshot = live.snapshot else { return false }
+            if let info = snapshot.info { connection?.applyRuntimeInfo(info) }
+            if snapshot.snapshotRunning == true {
+                await chat?.reconcileLiveTurnStatus(
+                    runtimeId: live.id,
+                    snapshotRunning: true,
+                    inflight: snapshot.inflight,
+                    watchOnly: true
+                )
+            } else if chat?.settleWatchOnlyTurn(runtimeId: live.id) == true {
+                markTurnCompleted(storedId: storedID, runtimeId: live.id)
+                await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
+            }
+            return true
+        } catch {
+            // A transient timeout must not permanently stop observation. The
+            // loop is already cadence-limited; reconnect/scope teardown cancels
+            // it through the guards above.
+            return sessionBinding?.mode == .watch
+                && activeStoredId == storedID
+                && activeRuntimeId == runtimeID
+                && (watchRPC != nil || connection?.isTransportReady == true)
+        }
     }
 
     // MARK: - Offline cache (P3 read-through / write-through)
@@ -1439,11 +1580,10 @@ final class SessionStore {
     /// ABH-194: this previously re-read ``KeychainService/loadToken(server:)``
     /// directly, creating a second token source that could diverge from
     /// ``ConnectionStore/currentToken`` (the authoritative in-memory token).
-    /// Divergence scenarios: a re-pair that wrote `currentToken` before the
-    /// Keychain item was updated, a device-token upgrade whose Keychain write
-    /// failed (the `try?` path in ``ConnectionStore/configure(_:token:…)``), or
-    /// a simulator reinstall that cleared UserDefaults but left a stale Keychain
-    /// item. In all cases `SessionStore.restAPI` sent the stale/wrong token on
+    /// Divergence scenarios include a re-pair that updates in-memory state before
+    /// Keychain persistence, or a simulator reinstall that clears UserDefaults
+    /// but leaves a stale Keychain item. In both cases `SessionStore.restAPI` sent
+    /// the stale/wrong token on
     /// REST calls and received HTTP 401, while everything routed through
     /// `connection.rest` / `currentToken` worked (including the WS auth and the
     /// transcript-fetch paths that correctly used `connection?.rest`).
@@ -2646,6 +2786,7 @@ final class SessionStore {
             mode: mode,
             generation: generation
         )
+        if mode == .drive { cancelWatchPolling() }
         if previous != storedID {
             chat?.pendingGateOwnerMoved(toStoredSession: storedID)
         }
@@ -3172,12 +3313,25 @@ final class SessionStore {
                     guard self.openToken == token,
                           self.activeStoredId == summary.id,
                           self.activeRuntimeId == live.id else { return }
+                    if let snapshot = live.snapshot {
+                        if let info = snapshot.info {
+                            self.connection?.applyRuntimeInfo(info)
+                        }
+                        await self.chat?.reconcileLiveTurnStatus(
+                            runtimeId: live.id,
+                            snapshotRunning: snapshot.snapshotRunning,
+                            inflight: snapshot.inflight,
+                            watchOnly: true
+                        )
+                    } else {
+                        await self.chat?.reconcileLiveTurnStatus(
+                            runtimeId: live.id,
+                            snapshotRunning: live.status.isRunning,
+                            watchOnly: true
+                        )
+                    }
+                    self.startWatchPolling()
                     self.ensureRuntimeAttempts = 0
-                    await self.chat?.reconcileLiveTurnStatus(
-                        runtimeId: live.id,
-                        snapshotRunning: live.status.isRunning,
-                        watchOnly: true
-                    )
                     self.onActiveRuntimeBound?()
                     self.lastError = nil
                     self.sessionActionError = nil
@@ -3524,17 +3678,40 @@ final class SessionStore {
     /// `prompt.submit` is the deliberate watch -> drive ownership edge. Claim
     /// it before awaiting the receipt so an immediate `message.start` is routed
     /// as this phone's local turn.
-    func beginPromptSubmission(runtimeID: String) -> SessionBindingMode? {
+    func beginPromptSubmission(runtimeID: String) async throws -> SessionBindingMode? {
         guard let storedID = activeStoredId,
               activeRuntimeId == runtimeID else { return nil }
         let prior = sessionBinding?.mode
+        if prior == .watch,
+           connection?.supportsGatewayCapability("session_action_authority_v1") == true {
+            if let takeoverRPC {
+                try await takeoverRPC(runtimeID)
+            } else {
+                guard let client else { throw GatewayError.notConnected }
+                _ = try await client.requestRaw(
+                    "session.takeover",
+                    params: .object(["session_id": .string(runtimeID)])
+                )
+            }
+            // A different selection can win while takeover is awaiting Hermes.
+            guard activeStoredId == storedID,
+                  activeRuntimeId == runtimeID,
+                  sessionBinding?.mode == .watch else {
+                throw CancellationError()
+            }
+        }
         bindSession(
             storedID: storedID,
             runtimeID: runtimeID,
             mode: .drive,
             generation: connection?.transportEpoch
         )
-        return prior
+        // Once Hermes accepted takeover, this client remains the driver even if
+        // the following prompt is rejected for an unrelated reason.
+        return prior == .watch
+            && connection?.supportsGatewayCapability("session_action_authority_v1") == true
+            ? nil
+            : prior
     }
 
     func restoreWatchAfterRejectedSubmission(
@@ -3550,6 +3727,7 @@ final class SessionStore {
             mode: .watch,
             generation: nil
         )
+        startWatchPolling()
     }
 
     /// Branch-in-new-chat (F4A-A2): create a brand-new session SEEDED with the
@@ -3785,11 +3963,23 @@ final class SessionStore {
                     mode: recoveryMode,
                     generation: recoveryMode == .drive ? bindingEpoch : nil
                 )
-                await chat?.reconcileLiveTurnStatus(
-                    runtimeId: live.id,
-                    snapshotRunning: live.status.isRunning,
-                    watchOnly: recoveryMode == .watch
-                )
+                connection?.applySessionModel(live.model)
+                if let snapshot = live.snapshot {
+                    if let info = snapshot.info { connection?.applyRuntimeInfo(info) }
+                    await chat?.reconcileLiveTurnStatus(
+                        runtimeId: live.id,
+                        snapshotRunning: snapshot.snapshotRunning,
+                        inflight: snapshot.inflight,
+                        watchOnly: recoveryMode == .watch
+                    )
+                } else {
+                    await chat?.reconcileLiveTurnStatus(
+                        runtimeId: live.id,
+                        snapshotRunning: live.status.isRunning,
+                        watchOnly: recoveryMode == .watch
+                    )
+                }
+                startWatchPolling()
                 lastError = nil
                 sessionActionError = nil
                 return live.id
@@ -3968,8 +4158,8 @@ final class SessionStore {
     // MARK: - Search
 
     /// React to a change in `searchQuery` from the `.searchable` field. Debounces
-    /// 300ms, then tries the plugin endpoint first with graceful fallback to the
-    /// stock `/api/sessions/search` on 404 (older gateways without the plugin).
+    /// 300ms, publishes bounded local-cache hits first, then merges the first
+    /// authoritative stock `/api/sessions/search` page.
     /// Queries under two characters clear the results immediately.
     /// Call from the view's `onChange(of:)`.
     func searchQueryChanged() {
@@ -4143,32 +4333,24 @@ final class SessionStore {
         }
     }
 
-    /// Execute search through the stock gateway endpoint.
-    ///
-    /// `offset` is forwarded to both the plugin and stock endpoints.
-    ///
-    /// Returns `(results, rawPageFull)` where `rawPageFull` indicates whether the
-    /// underlying server page was full at the message level (for plugin) or session
-    /// level (for stock). Callers use `rawPageFull` to set `searchHasMore` — this
-    /// correctly handles plugin pages that collapse to fewer sessions than the raw
-    /// message limit but still have more messages to return.
+    /// Execute search against stock Hermes authority. The stock endpoint currently
+    /// returns one session-deduped page and does not expose an offset contract, so
+    /// `rawPageFull` is deliberately false: the UI must not offer pagination that
+    /// would only fetch and deduplicate page one again.
     ///
     /// Extracted so tests can call it directly without spinning a Task.
     func fetchSearch(
         query: String, offset: Int = 0, api: RestClient
     ) async throws -> (results: [SessionSearchResult], rawPageFull: Bool) {
+        _ = offset
         let results = try await api.searchSessions(
-            query: query,
-            limit: Self.searchPageLimit,
-            offset: offset,
+            query: query, limit: Self.searchPageLimit,
             scope: searchScope.rawValue
         )
-        return (results, results.count == Self.searchPageLimit)
+        return (results, false)
     }
 
-    /// Map the UI search scope to a list of `role` values for the plugin endpoint.
-    /// `all` sends no filter (server returns every role); `messages` returns user +
-    /// assistant prose; `code` returns tool output.
+    /// Map the presentation-cache search scope to transcript roles.
     static func roles(for scope: SearchScope) -> [String] {
         switch scope {
         case .all:      return []
@@ -4610,6 +4792,7 @@ final class SessionStore {
         // into a session we're detaching from.
         cancelEnsureRuntime()
         cancelRuntimeBinding()
+        cancelWatchPolling()
         isDraft = false
         activeRuntimeId = nil
         activeRuntimeEpoch = nil

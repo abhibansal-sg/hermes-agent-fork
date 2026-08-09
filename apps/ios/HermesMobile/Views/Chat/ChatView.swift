@@ -154,16 +154,9 @@ struct ChatView: View {
     /// Drives the working-directory picker sheet (F4A-A1 ``WorkingDirPicker``,
     /// wired here per the ownership boundary — A2 owns the mount + the
     /// `session.cwd.set` call). Reached from the chat overflow menu; gated on
-    /// `capabilities.fs != .unavailable` (the patched gateway that serves the
-    /// file endpoints) AND an active runtime session.
+    /// `capabilities.fs != .unavailable` AND an active runtime session with a
+    /// canonical cwd.
     @State private var showingWorkingDirPicker = false
-
-    /// ABH-362: the current absolute session cwd, fetched when the working-dir
-    /// picker opens (and updated on successful change). Drives (a) the overflow
-    /// menu label so the user sees the current dir without opening the picker,
-    /// (b) the explainer banner inside the picker, and (c) the in-transcript
-    /// confirmation message posted on change.
-    @State private var currentSessionCwd: String = ""
 
     /// A fetched markdown export awaiting the share sheet (R1 #66 — the store's
     /// `exportMarkdown` was fully implemented + tested with no UI entry point).
@@ -594,27 +587,17 @@ struct ChatView: View {
                 // banner; on successful change posts an in-transcript system notice.
                 .sheet(isPresented: $showingWorkingDirPicker) {
                     if let control = connectionStore.control,
-                       let sessionId = sessionStore.activeRuntimeId, !sessionId.isEmpty {
+                       let sessionId = sessionStore.activeRuntimeId, !sessionId.isEmpty,
+                       let cwd = connectionStore.sessionCwd, !cwd.isEmpty {
                         WorkingDirPicker(
                             rest: control,
                             sessionId: sessionId,
                             onPick: { relativePath in
-                                handleWorkingDirPick(relativePath, rest: control, sessionId: sessionId)
+                                handleWorkingDirPick(relativePath)
                             },
-                            currentCwd: currentSessionCwd
+                            currentCwd: cwd
                         )
                         .hermesThemed(themeStore)
-                        .task {
-                            // Fetch the current cwd so the explainer banner + the
-                            // confirmation message know the starting point.
-                            do {
-                                currentSessionCwd = try await control.fsList(
-                                    sessionId: sessionId, path: nil
-                                ).root
-                            } catch {
-                                currentSessionCwd = ""
-                            }
-                        }
                     } else {
                         ContentUnavailableView(
                             "No Active Session",
@@ -645,49 +628,24 @@ struct ChatView: View {
         }
     }
 
-    /// Resolve the picker's RELATIVE path to an absolute cwd and call
-    /// `session.cwd.set`. Per A1's `onPick` contract the picker hands back a path
-    /// relative to the file-browser root, so we fetch the root once via `fsList`
-    /// (the cheap, side-effect-free list of the cwd root) and join. On success the
-    /// gateway sets the cwd, persists `explicit_cwd`, and emits a `session.info`
-    /// event; both the file browser and the composer @-file picker resolve their
-    /// cwd by `session_id` on every call, so the next listing/completion reflects
-    /// the new root automatically (no client-side cache to invalidate). Errors land
-    /// in `chatStore.lastError` (rendered as the chat toast).
+    /// Resolve the picker's relative path against the canonical cwd already
+    /// echoed by Hermes, then call `session.cwd.set`. The RPC response is itself
+    /// canonical `session.info`; `ChatStore` applies it immediately so subsequent
+    /// stock filesystem reads use the new cwd without a plugin re-list probe.
     ///
     /// ABH-362: On success, posts a visible in-transcript system confirmation
     /// ("Working directory set to ~/x/y") so the effect is immediately observable,
-    /// and updates `currentSessionCwd` so the menu label + explainer reflect it.
-    private func handleWorkingDirPick(_ relativePath: String, rest: RestClient, sessionId: String) {
+    /// and updates `ConnectionStore.sessionCwd` so the menu label + explainer
+    /// reflect the same canonical runtime value.
+    private func handleWorkingDirPick(_ relativePath: String) {
         Task {
-            // Resolve the absolute cwd root the browser was showing. fsList with no
-            // path lists the root and returns its absolute `root` — the join base.
-            let root: String
-            do {
-                root = try await rest.fsList(sessionId: sessionId, path: nil).root
-            } catch {
-                chatStore.lastError = WorkingDirectory.mapSetError(error).message
+            guard let root = connectionStore.sessionCwd, !root.isEmpty else {
+                chatStore.lastError = "No active working directory"
                 return
             }
             let success = await chatStore.setWorkingDirectory(root: root, relativePath: relativePath)
             guard success else { return }
-            // E2E adoption probe (ABH-362 bounce-1): the gateway accepted the RPC,
-            // but Abhi's complaint was "I pressed it and couldn't tell if it works."
-            // So we RE-READ the session cwd via fsList (the authoritative post-change
-            // root — the gateway's `_set_session_cwd` sets `session["cwd"]` and the
-            // next `fsList` resolves its root from exactly that). If the session did
-            // NOT adopt the cwd we sent, resolveCwdPlumbing returns nil and we refuse
-            // to post a confirmation — surfacing the failure honestly instead of a
-            // false green.
-            let adoptedCwd: String?
-            do {
-                adoptedCwd = try await rest.fsList(sessionId: sessionId, path: nil).root
-            } catch {
-                // The fsList probe failed (transient). Don't block the confirmation
-                // on a transport hiccup — but DO surface the error so the user can
-                // retry the verification. Pass nil to skip the adoption gate.
-                adoptedCwd = nil
-            }
+            let adoptedCwd = connectionStore.sessionCwd
             guard let plumbing = WorkingDirectory.resolveCwdPlumbing(
                 root: root,
                 relativePath: relativePath,
@@ -697,10 +655,8 @@ struct ChatView: View {
                 // break. Surface it rather than posting a false-green confirmation.
                 let sent = WorkingDirectory.absolutePath(root: root, relative: relativePath)
                 chatStore.lastError = "Working directory did not update (sent \(WorkingDirectory.displayPath(sent)), session is at \(WorkingDirectory.displayPath(adoptedCwd ?? "?")))."
-                currentSessionCwd = adoptedCwd ?? ""
                 return
             }
-            currentSessionCwd = plumbing.wireCwd
             // ABH-362 (c): post a desktop-style system confirmation in the
             // transcript so the user can SEE that the change took effect — now
             // backed by the E2E adoption probe above.
@@ -1657,10 +1613,6 @@ struct ChatView: View {
             // the composer) for one consistent home alongside approval / tasks /
             // queued. See `bottomStack` → `TurnDock`. Its design and respond
             // wiring are unchanged.
-            if let deviceLimitAdvisory = connectionStore.deviceLimitAdvisory {
-                deviceLimitAdvisoryBanner(deviceLimitAdvisory)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
             if chatStore.undoRollbackPhase != .idle {
                 undoRollbackBanner(chatStore.undoRollbackPhase)
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -1683,7 +1635,6 @@ struct ChatView: View {
         // smooth across that cycle and across item-to-item swaps.
         .animation(.spring(response: 0.35, dampingFraction: 0.85),
                    value: crossSessionItems.isEmpty)
-        .animation(.easeInOut(duration: 0.25), value: connectionStore.deviceLimitAdvisory)
         .animation(.easeInOut(duration: 0.25), value: toastError)
         .animation(.easeInOut(duration: 0.25), value: compressionToast)
     }
@@ -1773,45 +1724,6 @@ struct ChatView: View {
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.popover, in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private func deviceLimitAdvisoryBanner(_ message: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "iphone.badge.exclamationmark")
-                .foregroundStyle(theme.statusWarn)
-            Text(message)
-                .font(.callout)
-                .foregroundStyle(theme.fg)
-                .lineLimit(3)
-            Spacer(minLength: 0)
-            Button {
-                let serverURL = connectionStore.serverURLString
-                Task {
-                    await connectionStore.retryDeviceUpgrade(serverURL: serverURL)
-                }
-            } label: {
-                Text("Retry")
-                    .font(.callout.weight(.semibold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(theme.accent)
-            .accessibilityLabel("Retry device token upgrade")
-            Button {
-                connectionStore.dismissDeviceLimitAdvisory()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(theme.midground)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Dismiss device limit advisory")
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(theme.popover, in: RoundedRectangle(cornerRadius: 12))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Device limit advisory: \(message)")
     }
 
     private func compressionToastBanner(_ message: String) -> some View {
@@ -2078,13 +1990,13 @@ struct ChatView: View {
             && chatStore.hasSubagentActivity
     }
 
-    /// Whether the working-directory affordance should appear: the patched gateway
-    /// serves the fs endpoints (`fs != .unavailable`, the same gate as the file
-    /// browser / @-mentions) AND there is an active runtime session whose cwd we
-    /// can change. A stock gateway shows nothing.
+    /// Whether the working-directory affordance should appear: stock Hermes
+    /// serves the fs endpoints and there is an active runtime session whose cwd
+    /// we can change.
     private var showWorkingDirAffordance: Bool {
         connectionStore.capabilities.fs != .unavailable
             && (sessionStore.activeRuntimeId?.isEmpty == false)
+            && (connectionStore.sessionCwd?.isEmpty == false)
     }
 
     @ViewBuilder
@@ -2107,16 +2019,17 @@ struct ChatView: View {
             Divider()
         }
         if showWorkingDirAffordance {
+            let cwd = connectionStore.sessionCwd ?? ""
             Button {
                 showingWorkingDirPicker = true
             } label: {
-                if currentSessionCwd.isEmpty {
+                if cwd.isEmpty {
                     Label("Working Directory", systemImage: "folder.badge.gearshape")
                 } else {
                     // ABH-362 (a): show the current cwd truncated so the user
                     // sees WHERE they are without opening the picker.
                     Label {
-                        Text("Working Directory: \(WorkingDirectory.displayPath(currentSessionCwd))")
+                        Text("Working Directory: \(WorkingDirectory.displayPath(cwd))")
                             .lineLimit(1)
                             .truncationMode(.middle)
                     } icon: {

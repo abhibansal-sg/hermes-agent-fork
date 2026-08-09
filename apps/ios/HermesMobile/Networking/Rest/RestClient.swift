@@ -24,32 +24,6 @@ enum RestError: Error, LocalizedError, Sendable {
     }
 }
 
-/// Which REST path family the gateway serves for the MOBILE endpoint group
-/// (upload / devices / approvals / fs / push). The ABH-88 de-patch moved these
-/// from legacy top-level routes to the hermes-mobile plugin mount; the app
-/// probes which family the server speaks (``ServerCapabilities/pluginMount``)
-/// and pins the result per server. Core endpoints (`/api/sessions`,
-/// `/api/status`, the WS protocol, …) never moved and are unaffected.
-enum APIPathStyle: String, Sendable, Codable {
-    /// Legacy top-level paths (`/api/upload`, `/api/devices`, …) —
-    /// pre-de-patch gateways (e.g. the live dashboard until its redeploy).
-    case legacy
-    /// Plugin mount (`/api/plugins/hermes-mobile/…`) — de-patched gateways.
-    case plugin
-
-    /// The other family — used by the self-healing 404 retries on background
-    /// flows (push/Live-Activity registration, notification-action respond).
-    var alternate: APIPathStyle { self == .plugin ? .legacy : .plugin }
-
-    /// The path prefix the MOBILE endpoint group hangs off in this family.
-    var mobileAPIPrefix: String {
-        switch self {
-        case .legacy: return "/api"
-        case .plugin: return "/api/plugins/hermes-mobile"
-        }
-    }
-}
-
 /// Stateless HTTP client for the hermes gateway's REST surface.
 ///
 /// Token gateways receive `X-Hermes-Session-Token`; session gateways use the
@@ -65,35 +39,21 @@ struct RestClient: Sendable {
     let baseURL: URL
     let token: String
     let session: URLSession
-    /// The injected-session initializer is used by tests to keep uploads on the
-    /// same URLProtocol-backed transport as the other REST calls. Production
-    /// clients always use the durable background transfer path below.
-    private let usesInjectedUploadSession: Bool
-    /// Path family for the MOBILE endpoint group (see ``APIPathStyle``).
-    /// Defaults to `.legacy` so an un-migrated construction site keeps today's
-    /// behavior; ``ConnectionStore`` passes the probed style.
-    let pathStyle: APIPathStyle
     /// - Parameters:
     ///   - baseURL: The gateway base, e.g. `https://host[:port]`.
     ///   - token: The session token sent as `X-Hermes-Session-Token`.
-    ///   - pathStyle: Path family for the mobile endpoint group.
     init(
         baseURL: URL,
-        token: String,
-        pathStyle: APIPathStyle = .legacy
+        token: String
     ) {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = Self.timeout
         config.waitsForConnectivity = false
         config.httpCookieStorage = .shared
         config.httpShouldSetCookies = true
-        self.init(
-            baseURL: baseURL,
-            token: token,
-            session: URLSession(configuration: config),
-            pathStyle: pathStyle,
-            usesInjectedUploadSession: false
-        )
+        self.baseURL = baseURL
+        self.token = token
+        self.session = URLSession(configuration: config)
     }
 
     /// Testing-only initialiser: accepts a pre-built ``URLSession`` so tests
@@ -102,45 +62,12 @@ struct RestClient: Sendable {
     init(
         baseURL: URL,
         token: String,
-        session: URLSession,
-        pathStyle: APIPathStyle = .legacy
-    ) {
-        self.init(
-            baseURL: baseURL,
-            token: token,
-            session: session,
-            pathStyle: pathStyle,
-            usesInjectedUploadSession: true
-        )
-    }
-
-    private init(
-        baseURL: URL,
-        token: String,
-        session: URLSession,
-        pathStyle: APIPathStyle,
-        usesInjectedUploadSession: Bool
+        session: URLSession
     ) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
-        self.pathStyle = pathStyle
-        self.usesInjectedUploadSession = usesInjectedUploadSession
     }
-
-    /// A copy of this client speaking the given path family (same session).
-    func withPathStyle(_ style: APIPathStyle) -> RestClient {
-        RestClient(
-            baseURL: baseURL,
-            token: token,
-            session: session,
-            pathStyle: style,
-            usesInjectedUploadSession: usesInjectedUploadSession
-        )
-    }
-
-    /// Prefix for the MOBILE endpoint group under this client's path family.
-    var mobileAPIPrefix: String { pathStyle.mobileAPIPrefix }
 
     private static let timeout: TimeInterval = 15
 
@@ -308,114 +235,11 @@ struct RestClient: Sendable {
         return array.compactMap(StoredMessage.init(json:))
     }
 
-    /// Outcome of the zero-side-effect plugin/profile capability checks.
+    /// Result of a side-effect-free stock-gateway capability probe.
     enum UploadProbeResult: Sendable, Equatable {
-        /// `400` — the endpoint exists and rejected the missing multipart field.
         case available
-        /// `404`/`405` — the endpoint isn't routed on this (stock) gateway.
         case unavailable
-        /// Any other status or a transport error — can't decide from this probe.
         case inconclusive
-    }
-
-    /// Side-effect-free probe of the plugin mount itself (ABH-88): `GET
-    /// /api/plugins/hermes-mobile/devices` — an ABSOLUTE path, independent of
-    /// this client's ``pathStyle``. A de-patched gateway returns `200` with a
-    /// well-formed `{"devices":[…]}` body; a pre-de-patch gateway has no plugin mount and returns
-    /// `404`/`405`. Drives ``ServerCapabilities/pluginMount``, which selects
-    /// the path family every OTHER mobile call uses.
-    func probePluginMountEndpoint() async -> UploadProbeResult {
-        let request = makeRequest(
-            path: "/api/plugins/hermes-mobile/devices", method: "GET"
-        )
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return .inconclusive }
-            switch http.statusCode {
-            case 200:
-                if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   object["devices"] is [Any] {
-                    return .available
-                }
-                return .inconclusive
-            case 404, 405:
-                return .unavailable
-            default:
-                return .inconclusive
-            }
-        } catch {
-            return .inconclusive
-        }
-    }
-
-    /// `POST /api/upload` — multipart upload of a single file under field `file`.
-    func upload(data: Data, filename: String, mimeType: String) async throws -> UploadResult {
-        try await uploadDurable(
-            data: data,
-            filename: filename,
-            mimeType: mimeType,
-            ownerJobID: nil
-        ).upload
-    }
-
-    struct DurableUploadResult: Sendable {
-        let upload: UploadResult
-        let transferID: String
-    }
-
-    func uploadDurable(
-        data: Data,
-        filename: String,
-        mimeType: String,
-        ownerJobID: String?
-    ) async throws -> DurableUploadResult {
-        let request = makeRequest(path: "\(mobileAPIPrefix)/upload", method: "POST")
-        guard let url = request.url else { throw RestError.network("Invalid upload URL") }
-
-        if usesInjectedUploadSession {
-            let boundary = "Boundary-\(UUID().uuidString)"
-            var request = request
-            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            let body = multipartBody(
-                data: data, filename: filename, mimeType: mimeType, boundary: boundary
-            )
-            let response: URLResponse
-            let responseData: Data
-            do {
-                (responseData, response) = try await session.upload(for: request, from: body)
-            } catch {
-                throw RestError.network(error.localizedDescription)
-            }
-            guard let http = response as? HTTPURLResponse else {
-                throw RestError.network("Non-HTTP response")
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                let responseBody = String(data: responseData, encoding: .utf8) ?? ""
-                throw RestError.badStatus(
-                    http.statusCode, body: String(responseBody.prefix(512))
-                )
-            }
-            return DurableUploadResult(
-                upload: try decode(UploadResult.self, from: responseData, context: "upload"),
-                transferID: "injected-session-upload"
-            )
-        }
-
-        let transfer = try await TransferManager.shared.uploadMultipart(
-            data: data,
-            filename: filename,
-            mimeType: mimeType,
-            to: url,
-            headers: request.allHTTPHeaderFields ?? [:],
-            ownerJobId: ownerJobID
-        )
-        guard let status = transfer.httpStatus, (200...299).contains(status) else {
-            throw RestError.badStatus(transfer.httpStatus ?? 0, body: "Background upload failed")
-        }
-        return DurableUploadResult(
-            upload: try decode(UploadResult.self, from: transfer.responseBody ?? Data(), context: "upload"),
-            transferID: transfer.id
-        )
     }
 
     // MARK: - Request plumbing
@@ -543,32 +367,21 @@ struct RestClient: Sendable {
         }
     }
 
-    /// Assemble an RFC 7578 multipart/form-data body for a single `file` part.
-    private func multipartBody(
-        data: Data,
-        filename: String,
-        mimeType: String,
-        boundary: String
-    ) -> Data {
-        var body = Data()
-        let crlf = "\r\n"
-        body.append("--\(boundary)\(crlf)")
-        body.append(
-            "Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\(crlf)"
-        )
-        body.append("Content-Type: \(mimeType)\(crlf)\(crlf)")
-        body.append(data)
-        body.append(crlf)
-        body.append("--\(boundary)--\(crlf)")
-        return body
-    }
 }
 
-private extension Data {
-    /// Append a UTF-8 string fragment to a multipart body.
-    mutating func append(_ string: String) {
-        if let data = string.data(using: .utf8) {
-            append(data)
-        }
-    }
+// MARK: - Stock bounded transcript fetch
+
+/// Compatibility name retained for callers while authority moves entirely to
+/// stock session history. Hermes bounds the default response server-side; the
+/// local cache is only a presentation accelerator.
+func fetchTranscriptDeltaAware(
+    rest: RestClient,
+    cacheStore: CacheStore?,
+    sessionId: String,
+    identity: CacheIdentity?,
+    shape: String? = nil
+) async throws -> [StoredMessage] {
+    _ = cacheStore
+    _ = identity
+    return try await rest.messages(sessionId: sessionId, shape: shape)
 }

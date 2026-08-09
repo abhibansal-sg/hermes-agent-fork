@@ -143,32 +143,35 @@ final class AppEnvironment {
                 },
                 uploadAsset: { [weak connectionStore, weak workRepository] job, snapshot in
                     guard let connectionStore,
-                          let rest = connectionStore.rest,
                           let workRepository else {
                         throw AttachmentError.notConfigured
                     }
                     let client = connectionStore.client
                     let data = try await workRepository.assetData(snapshot.asset)
-                    let upload = try await rest.uploadDurable(
-                        data: data,
-                        filename: "\(snapshot.asset.assetID).jpg",
-                        mimeType: snapshot.asset.mimeType,
-                        ownerJobID: job.jobID
-                    )
                     guard let runtimeID = try await sessionStore.runtimeForOutboxDestination(
                         job.destinationSessionID ?? job.storedSessionID ?? ""
                     ) else { throw OutboxProcessorError.destinationUnavailable }
-                    _ = try await client.requestRaw(
-                        "image.attach",
+                    let contentBase64 = await Task.detached(priority: .userInitiated) {
+                        AttachmentStore.imageContentBase64(data)
+                    }.value
+                    let attached = try await client.requestRaw(
+                        "image.attach_bytes",
                         params: .object([
                             "session_id": .string(runtimeID),
-                            "path": .string(upload.upload.path),
+                            "content_base64": .string(contentBase64),
+                            "filename": .string("\(snapshot.asset.assetID).jpg"),
                         ]),
-                        timeout: .seconds(30)
+                        timeout: .seconds(60)
                     )
+                    guard let remotePath = attached["path"]?.stringValue,
+                          !remotePath.isEmpty else {
+                        throw AttachmentError.failed(
+                            "The gateway did not return an attached image path."
+                        )
+                    }
                     return OutboxUploadedAsset(
-                        transferID: upload.transferID,
-                        remotePath: upload.upload.path
+                        transferID: "stock-rpc:\(job.jobID):\(snapshot.asset.assetID)",
+                        remotePath: remotePath
                     )
                 },
                 willSubmit: { _, _ in },
@@ -248,10 +251,6 @@ final class AppEnvironment {
             }
             var patch = WidgetSnapshotWriter.Patch()
             patch.pendingAttentionCount = .set(snapshot.pendingCount)
-            if let metadata = snapshot.metadata {
-                patch.serverRevision = .set(String(metadata.revision))
-                patch.fetchedAt = .set(Date(timeIntervalSince1970: metadata.updatedAt))
-            }
             WidgetSnapshotWriter.write(patch)
         }
         // ConnectionStore's event router also fans approval/clarify/complete to
@@ -315,7 +314,7 @@ final class AppEnvironment {
         chatStore.onTurnStart = { [weak sessionStore] in
             let title = sessionStore?.activeSummary?.displayTitle ?? "Hermes"
             // Pass the runtime session id so the LA push-token registration can
-            // key the gateway's /api/push/live-activity registry by session (A3).
+            // key the on-device Live Activity by session.
             LiveActivityManager.shared.start(
                 sessionTitle: title,
                 sessionId: sessionStore?.activeRuntimeId

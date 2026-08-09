@@ -1133,10 +1133,14 @@ struct GeneratedImageToolCard: View {
             localPhase = .failed("Open the source session to load this generated image.")
             return
         }
+        guard let cwd = connection.sessionCwd, !cwd.isEmpty else {
+            localPhase = .failed("The source session has no working directory.")
+            return
+        }
 
         localPhase = .loading
         do {
-            let imageResult = try await rest.fsReadAsDataURL(sessionId: sessionId, path: result.reference)
+            let imageResult = try await rest.fsReadAsDataURL(cwd: cwd, path: result.reference)
             guard let dataURL = imageResult.dataURL,
                   let decoded = Self.decodeDataURL(dataURL) else {
                 localPhase = .failed("Image preview requires an updated gateway.")

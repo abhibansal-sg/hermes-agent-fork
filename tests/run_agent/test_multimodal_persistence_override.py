@@ -106,6 +106,11 @@ def _configure_flush(agent):
     agent._flushed_db_message_session_id = None
 
 
+def _first_flushed_row(agent):
+    """Return the first row from the current batched SessionDB write contract."""
+    return agent._session_db.append_messages_batch.call_args.kwargs["messages"][0]
+
+
 def _tool_call(call_id):
     return SimpleNamespace(
         id=call_id,
@@ -143,7 +148,7 @@ def test_model_gets_rich_list_while_db_gets_safe_string_and_live_message_stays_r
     _configure_flush(agent)
     agent._flush_messages_to_session_db([message], [])
 
-    db_write = agent._session_db.append_message.call_args.kwargs
+    db_write = _first_flushed_row(agent)
     assert db_write["content"] == "safe AX"
     assert PERSISTENCE_METADATA_KEY not in db_write
     assert message["content"] == result["content"]
@@ -167,7 +172,7 @@ def test_explicit_list_override_persists_image_parts_exactly():
 
     agent._flush_messages_to_session_db([message], [])
 
-    assert agent._session_db.append_message.call_args.kwargs["content"] == override
+    assert _first_flushed_row(agent)["content"] == override
 
 
 def test_no_override_keeps_legacy_image_stripping():
@@ -178,7 +183,7 @@ def test_no_override_keeps_legacy_image_stripping():
 
     agent._flush_messages_to_session_db([message], [])
 
-    assert agent._session_db.append_message.call_args.kwargs["content"] == (
+    assert _first_flushed_row(agent)["content"] == (
         "AX: Save button is visible\n[screenshot]"
     )
 
@@ -196,7 +201,7 @@ def test_malformed_override_falls_back_without_repr_persistence():
 
     agent._flush_messages_to_session_db([message], [])
 
-    persisted = agent._session_db.append_message.call_args.kwargs["content"]
+    persisted = _first_flushed_row(agent)["content"]
     assert persisted == "AX: Save button is visible\n[screenshot]"
     assert "object at" not in str(persisted)
 
@@ -298,7 +303,7 @@ def test_repeated_flush_is_idempotent_with_override():
     agent._flush_messages_to_session_db([message], [])
     agent._flush_messages_to_session_db([message], [])
 
-    assert agent._session_db.append_message.call_count == 1
+    assert agent._session_db.append_messages_batch.call_count == 1
 
 
 def test_arbitrary_tool_cannot_opt_into_persistence_override():
@@ -361,7 +366,7 @@ def test_empty_override_list_falls_back_to_legacy_summary():
 
     agent._flush_messages_to_session_db([message], [])
 
-    assert agent._session_db.append_message.call_args.kwargs["content"] == (
+    assert _first_flushed_row(agent)["content"] == (
         "AX: Save button is visible\n[screenshot]"
     )
     assert PERSISTENCE_METADATA_KEY not in message

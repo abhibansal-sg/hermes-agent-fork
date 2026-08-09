@@ -1,11 +1,6 @@
 import Foundation
 
-/// Observable record of which branch-only server features the connected gateway
-/// supports, so one binary degrades gracefully against a STOCK hermes-agent.
-///
-/// The mobile plugin adds `POST /api/upload` and `POST/DELETE
-/// /api/push/register`. A stock gateway has none of these. Rather than feature-flag at build
-/// time, the app **probes** at connect and gates UI on the result (E1).
+/// Observable record of stock gateway capabilities used by the native app.
 ///
 /// Each feature is one of three states:
 ///   - ``State/unknown`` — not yet probed (the safe default; UI shows the
@@ -17,11 +12,11 @@ import Foundation
 /// Capability strategy (cached per server URL + app version in
 /// `UserDefaults` so reconnects don't re-probe; a `configure()` to a NEW URL or
 /// an app-version change re-probes):
-///   - **plugin bundle**: one mount probe proves the bundled upload, fs, and
-///     device routes together. These routes ship from the same plugin router.
+///   - **filesystem**: an independent stock `/api/fs/default-cwd` probe.
 ///   - **profiles**: one independent stock-route probe.
-///   - **pushRegistry**: wired off ``PushRegistrar``'s existing 404 soft-fail —
-///     a soft-fail ⇒ unavailable, a `2xx`/`4xx` validation response ⇒ available.
+///   - **broadcast**: passive — marked available when the connection router sees
+///     the first event carrying `stored_session_id`; otherwise stays unknown
+///     (it is never provably unavailable, which is acceptable).
 ///
 /// `@MainActor`-isolated; stores and views read it on the main actor. The actual
 /// HTTP probe runs on a `Sendable` helper so it stays off the main actor.
@@ -36,23 +31,11 @@ final class ServerCapabilities {
         case unavailable
     }
 
-    /// The ABH-88 plugin mount (`/api/plugins/hermes-mobile/…`). Probed
-    /// EAGERLY at connect, BEFORE every other eager probe, because its result
-    /// selects the path family (``APIPathStyle``) those probes — and every
-    /// mobile REST call — use. Probe: `GET /api/plugins/hermes-mobile/devices`
-    /// (absolute path): `200` with a `{"devices":[…]}` body ⇒ available
-    /// (de-patched gateway), `404`/`405` ⇒ unavailable (legacy gateway),
-    /// anything else ⇒ unknown (and the path family stays `.legacy`, which is
-    /// what today's live server speaks).
-    private(set) var pluginMount: State = .unknown
-    /// `POST <prefix>/upload` — follows the plugin-mount verdict.
-    private(set) var upload: State = .unknown
-    /// `POST/DELETE /api/push/register` — remote push. Set from PushRegistrar.
-    private(set) var pushRegistry: State = .unknown
-    /// `GET /api/fs/list` + `/api/fs/read` — the F4A file-browser / @-file
-    /// endpoints. Ships in the same plugin router as the mount probe. Every
-    /// file-browser / working-dir / @-file affordance gates on `fs !=
-    /// .unavailable` so a stock gateway shows none of them and never errors.
+    /// `stored_session_id` enrichment on broadcast frames. Set passively.
+    private(set) var broadcast: State = .unknown
+    /// Stock `GET /api/fs/*` + `/api/git/file-diff` file presentation surface.
+    /// Probed independently from the mobile plugin so stock Hermes enables the
+    /// browser even when no plugin is installed.
     private(set) var fs: State = .unknown
     /// `subagent.*` event emission (F4A-A2). PASSIVE — it can't be eagerly probed
     /// (it only fires when the agent delegates). Set via ``noteSubagentObserved()``
@@ -75,32 +58,12 @@ final class ServerCapabilities {
     /// gateway (today's live 9119) shows none of the switcher chrome and never
     /// errors — the F4b dormancy guarantee.
     private(set) var profiles: State = .unknown
-    /// The W3a per-device-token capability. The plugin-mount probe itself reads
-    /// the device list, so this shares the plugin-bundle verdict.
-    ///
-    /// EVERY Devices-section affordance (the Settings section, the revoke button,
-    /// the audit view, AND the auto-upgrade issue call) gates on
-    /// `devices == .available`, so a stock hermes-agent (no device routes) hides
-    /// the Devices section entirely, never errors, and never issues a device
-    /// token — the W3a stock-degradation guarantee (the legacy shared token keeps
-    /// working untouched). Single writer of this field is the W3A-A app module.
-    private(set) var devices: State = .unknown
-
     /// The server URL the current snapshot was probed against. A `configure()` to
     /// a different URL invalidates the snapshot and forces a re-probe.
     private var probedServerURL: String?
     /// The app version the current snapshot was probed against. A version change
     /// (the branch-only feature set may shift between builds) forces a re-probe.
     private var probedAppVersion: String?
-
-    /// The path family mobile REST calls should use against the probed server.
-    /// `.plugin` only when the mount probe CONCLUDED available; `.unknown` and
-    /// `.unavailable` both resolve `.legacy` (safe against today's live server;
-    /// the background flows carry a one-shot alternate-family retry for the
-    /// stale-cache case).
-    var resolvedPathStyle: APIPathStyle {
-        pluginMount == .available ? .plugin : .legacy
-    }
 
     init() {}
 
@@ -113,10 +76,8 @@ final class ServerCapabilities {
     /// it is restored and no network call is made. Otherwise the eager probes
     /// run and the result is cached.
     ///
-    /// `pushRegistry` is deliberately NOT probed here — it has no zero-side-effect
-    /// probe of its own and is instead learned from ``PushRegistrar``'s real
-    /// register call (``notePushRegistry(available:)``). It is preserved across a
-    /// cache restore so a known value survives a reconnect.
+    /// Broadcast enrichment stays passive (``noteBroadcastObserved()``) and is
+    /// preserved across a cache restore so a known value survives reconnect.
     func probe(serverURL: String, rest: RestClient, force: Bool = false) async {
         let version = Self.currentAppVersion
 
@@ -133,7 +94,7 @@ final class ServerCapabilities {
         if !force {
             if probedServerURL == serverURL,
                probedAppVersion == version,
-               upload != .unknown {
+               fs != .unknown {
                 return
             }
             if let cached = Self.loadCache(),
@@ -146,36 +107,22 @@ final class ServerCapabilities {
 
         // Fresh server (or new app version): reset passive/derived state so a
         // stale prior-server value can't leak through, then probe.
-        pluginMount = .unknown
-        upload = .unknown
-        pushRegistry = .unknown
+        broadcast = .unknown
         fs = .unknown
         subagentEvents = .unknown
         profiles = .unknown
-        devices = .unknown
         probedServerURL = serverURL
         probedAppVersion = version
 
-        // Stage 1 (ABH-88): resolve the plugin mount FIRST — its result selects
-        // the path family every other eager probe (and every mobile REST call)
-        // targets. One extra round-trip, paid once per server + app version.
-        let mountState = await Self.probePluginMount(rest: rest)
-        guard probedServerURL == serverURL else { return }
-        pluginMount = mountState
-
-        // Upload, file browsing, and device management are one versioned plugin
-        // bundle, not independently installed features. Do not probe three routes
-        // that the mount already proved.
-        upload = mountState
-        fs = mountState
-        devices = mountState
-
-        // Multi-profile support belongs to the stock gateway and remains the one
-        // independent route probe.
-        let profilesState = await Self.probeProfiles(rest: rest)
+        // Files and profiles are independent stock capabilities. Probe them
+        // concurrently after path-style resolution.
+        async let fsProbe = Self.probeStockFS(rest: rest)
+        async let profilesProbe = Self.probeProfiles(rest: rest)
+        let (fsState, profilesState) = await (fsProbe, profilesProbe)
         // The connection (and thus serverURL) may have changed while we awaited;
         // only apply if we're still probing the same server.
         guard probedServerURL == serverURL else { return }
+        fs = fsState
         profiles = profilesState
         persist()
     }
@@ -184,50 +131,32 @@ final class ServerCapabilities {
     /// snapshot is intentionally retained so a reconnect to the same server can
     /// reuse it; only the live in-memory state resets to `.unknown`.
     func reset() {
-        pluginMount = .unknown
-        upload = .unknown
-        pushRegistry = .unknown
+        broadcast = .unknown
         fs = .unknown
         subagentEvents = .unknown
         profiles = .unknown
-        devices = .unknown
         probedServerURL = nil
         probedAppVersion = nil
     }
 
     #if DEBUG
-    /// DEBUG-only test seam: seed `devices` directly, skipping the real
-    /// `GET /api/devices` probe. Lets a test drive `ConnectionStore`'s
-    /// auto-upgrade path (which gates on `devices == .available`) without
-    /// standing up a stub for every probe endpoint. Absent in Release.
-    func _setDevicesForTesting(_ state: State) {
-        devices = state
-    }
-
-    /// DEBUG-only test seam: seed `upload` directly, skipping the REST probe,
-    /// so the B9 composer-gating test can pin the stock-gateway verdict
-    /// (`.unavailable`) without standing up a stub gateway. Absent in Release.
-    func _setUploadForTesting(_ state: State) {
-        upload = state
-    }
     #endif
 
     // MARK: - Passive / derived signals
 
-    /// Record the outcome of a real push-register call (from ``PushRegistrar``).
-    /// `false` (the 404 soft-fail) ⇒ unavailable; `true` (a 2xx or a 4xx
-    /// validation response) ⇒ available. Persists so the gate is stable across a
-    /// reconnect within the same server + app version.
-    func notePushRegistry(available: Bool) {
-        let newState: State = available ? .available : .unavailable
-        guard pushRegistry != newState else { return }
-        pushRegistry = newState
+    /// Mark broadcast enrichment available — called by the connection router the
+    /// first time an event carries `stored_session_id`. Idempotent; only the
+    /// first transition persists.
+    func noteBroadcastObserved() {
+        guard broadcast != .available else { return }
+        broadcast = .available
         persist()
     }
 
     /// Mark `subagent.*` emission available — called by the connection router the
     /// first time a `subagent.*` frame routes (F4A-A2). Idempotent; only the
-    /// first transition persists. Passive (never proves unavailable).
+    /// first transition persists. Passive (never proves unavailable), mirroring
+    /// ``noteBroadcastObserved()``.
     func noteSubagentObserved() {
         guard subagentEvents != .available else { return }
         subagentEvents = .available
@@ -244,12 +173,8 @@ final class ServerCapabilities {
     }
     #endif
 
-    // MARK: - Plugin-mount probe (ABH-88)
-
-    /// `GET /api/plugins/hermes-mobile/devices` (absolute path — style-free).
-    /// See ``RestClient/probePluginMountEndpoint()`` for the classification.
-    private nonisolated static func probePluginMount(rest: RestClient) async -> State {
-        switch await rest.probePluginMountEndpoint() {
+    private nonisolated static func probeStockFS(rest: RestClient) async -> State {
+        switch await rest.probeStockFSEndpoint() {
         case .available: return .available
         case .unavailable: return .unavailable
         case .inconclusive: return .unknown
@@ -284,75 +209,57 @@ final class ServerCapabilities {
     /// `.unknown` rather than failing the whole decode (which would force a
     /// needless re-probe).
     private struct Cache: Codable {
+        var contractVersion: Int
         var serverURL: String
         var appVersion: String
-        var pluginMount: State
-        var upload: State
-        var pushRegistry: State
+        var broadcast: State
         var fs: State
         var subagentEvents: State
         var profiles: State
-        var devices: State
 
         enum CodingKeys: String, CodingKey {
-            case serverURL, appVersion, pluginMount, upload, pushRegistry, fs, subagentEvents, profiles, devices
+            case contractVersion, serverURL, appVersion, broadcast, fs, subagentEvents, profiles
         }
 
         init(
             serverURL: String,
             appVersion: String,
-            pluginMount: State,
-            upload: State,
-            pushRegistry: State,
+            broadcast: State,
             fs: State,
             subagentEvents: State,
-            profiles: State,
-            devices: State
+            profiles: State
         ) {
+            self.contractVersion = ServerCapabilities.capabilityContractVersion
             self.serverURL = serverURL
             self.appVersion = appVersion
-            self.pluginMount = pluginMount
-            self.upload = upload
-            self.pushRegistry = pushRegistry
+            self.broadcast = broadcast
             self.fs = fs
             self.subagentEvents = subagentEvents
             self.profiles = profiles
-            self.devices = devices
         }
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
+            contractVersion = try c.decodeIfPresent(Int.self, forKey: .contractVersion) ?? 1
             serverURL = try c.decode(String.self, forKey: .serverURL)
             appVersion = try c.decode(String.self, forKey: .appVersion)
-            // Tolerant so a cache written by a pre-ABH-88 build (no
-            // `pluginMount` key) restores cleanly as `.unknown` (→ legacy
-            // path family) rather than failing the whole decode.
-            pluginMount = try c.decodeIfPresent(State.self, forKey: .pluginMount) ?? .unknown
-            upload = try c.decode(State.self, forKey: .upload)
-            pushRegistry = try c.decode(State.self, forKey: .pushRegistry)
+            broadcast = try c.decode(State.self, forKey: .broadcast)
             fs = try c.decodeIfPresent(State.self, forKey: .fs) ?? .unknown
             subagentEvents = try c.decodeIfPresent(State.self, forKey: .subagentEvents) ?? .unknown
             // `decodeIfPresent`-tolerant so a cache written by a pre-F4b build
             // (no `profiles` key) restores cleanly as `.unknown` rather than
             // failing the whole decode (which would force a needless re-probe).
             profiles = try c.decodeIfPresent(State.self, forKey: .profiles) ?? .unknown
-            // Likewise tolerant so a cache written by a pre-W3a build (no
-            // `devices` key) restores cleanly as `.unknown` rather than failing
-            // the whole decode (which would force a needless re-probe).
-            devices = try c.decodeIfPresent(State.self, forKey: .devices) ?? .unknown
         }
     }
 
     private func applyCache(_ cache: Cache) {
         probedServerURL = cache.serverURL
         probedAppVersion = cache.appVersion
-        pluginMount = cache.pluginMount
-        upload = cache.upload
-        pushRegistry = cache.pushRegistry
+        broadcast = cache.broadcast
         fs = cache.fs
         subagentEvents = cache.subagentEvents
         profiles = cache.profiles
-        devices = cache.devices
     }
 
     private func persist() {
@@ -365,18 +272,14 @@ final class ServerCapabilities {
         // launches until the URL or app version changes (ABH-52 judge round).
         // Keep the prior snapshot; the in-memory unknowns last only until a
         // probe actually concludes.
-        guard pluginMount != .unknown || upload != .unknown || fs != .unknown
-            || profiles != .unknown || devices != .unknown else { return }
+        guard fs != .unknown || profiles != .unknown else { return }
         let cache = Cache(
             serverURL: serverURL,
             appVersion: appVersion,
-            pluginMount: pluginMount,
-            upload: upload,
-            pushRegistry: pushRegistry,
+            broadcast: broadcast,
             fs: fs,
             subagentEvents: subagentEvents,
-            profiles: profiles,
-            devices: devices
+            profiles: profiles
         )
         guard let data = try? JSONEncoder().encode(cache) else { return }
         UserDefaults.standard.set(data, forKey: DefaultsKeys.serverCapabilities)
@@ -386,20 +289,9 @@ final class ServerCapabilities {
         guard let data = UserDefaults.standard.data(forKey: DefaultsKeys.serverCapabilities) else {
             return nil
         }
-        return try? JSONDecoder().decode(Cache.self, from: data)
-    }
-
-    /// The cached path family for `serverURL`, readable WITHOUT an instance —
-    /// for background flows (notification-action respond, push registration)
-    /// that run before any live connection exists. Matches on `serverURL` only
-    /// (NOT app version): the server doesn't change because the app updated,
-    /// and a wrong guess self-heals via the callers' alternate-family 404
-    /// retry. Missing/foreign cache → `.legacy` (today's live server).
-    nonisolated static func cachedPathStyle(serverURL: String) -> APIPathStyle {
-        guard let cache = loadCache(), cache.serverURL == serverURL else {
-            return .legacy
-        }
-        return cache.pluginMount == .available ? .plugin : .legacy
+        guard let cache = try? JSONDecoder().decode(Cache.self, from: data),
+              cache.contractVersion == capabilityContractVersion else { return nil }
+        return cache
     }
 
     /// `"<short> (<build>)"` — matches the version string SettingsView renders, so
@@ -410,4 +302,8 @@ final class ServerCapabilities {
         let build = info?["CFBundleVersion"] as? String ?? "?"
         return "\(short) (\(build))"
     }
+
+    /// Bump when a cached field changes authority/meaning. Version 3 removes
+    /// the historical broad mobile-plugin capability family.
+    nonisolated static let capabilityContractVersion = 3
 }

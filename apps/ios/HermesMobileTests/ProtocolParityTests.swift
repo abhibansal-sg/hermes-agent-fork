@@ -179,6 +179,101 @@ final class ProtocolParityTests: XCTestCase {
         ])
     }
 
+    func testGatewayReadyAdvertisesStockWatchCapability() {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+
+        connection.applyGatewayReadyCapabilities(.object([
+            "capabilities": .array([
+                .string("session_watch_v1"),
+                .string("session_action_authority_v1"),
+                .string("future_contract_v2"),
+            ]),
+        ]))
+
+        XCTAssertTrue(connection.supportsGatewayCapability("session_watch_v1"))
+        XCTAssertTrue(connection.supportsGatewayCapability("session_action_authority_v1"))
+        XCTAssertFalse(connection.supportsGatewayCapability("missing_contract_v1"))
+
+        connection.applyGatewayReadyCapabilities(.object([:]))
+        XCTAssertFalse(connection.supportsGatewayCapability("session_watch_v1"))
+    }
+
+    func testWatchedPromptExplicitlyTakesOverBeforeDriving() async throws {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        connection.applyGatewayReadyCapabilities(.object([
+            "capabilities": .array([.string("session_action_authority_v1")]),
+        ]))
+        sessions.transcriptFetch = { _ in [] }
+        sessions.watchRPC = { _ in
+            JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "messages": .array([]),
+                "action_revision": .number(4),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        var takeoverRuntime: String?
+        sessions.takeoverRPC = { runtimeID in takeoverRuntime = runtimeID }
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil, lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+
+        _ = try await sessions.beginPromptSubmission(runtimeID: "runtime-desktop")
+
+        XCTAssertEqual(takeoverRuntime, "runtime-desktop")
+        XCTAssertEqual(sessions.sessionBinding?.mode, .drive)
+    }
+
+    func testTakeoverLandingAfterNavigationCannotRebindOldSession() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        connection.applyGatewayReadyCapabilities(.object([
+            "capabilities": .array([.string("session_action_authority_v1")]),
+        ]))
+        sessions.transcriptFetch = { _ in [] }
+        sessions.watchRPC = { _ in
+            JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "messages": .array([]),
+                "action_revision": .number(4),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        sessions.takeoverRPC = { _ in try await Task.sleep(for: .milliseconds(50)) }
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil, lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+
+        let takeover = Task {
+            try await sessions.beginPromptSubmission(runtimeID: "runtime-desktop")
+        }
+        await Task.yield()
+        sessions.startDraft()
+
+        do {
+            _ = try await takeover.value
+            XCTFail("stale takeover must be cancelled after navigation")
+        } catch is CancellationError {
+            XCTAssertTrue(sessions.isDraft)
+            XCTAssertNil(sessions.activeRuntimeId)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     func testPassiveOpenWatchesLiveSessionWithoutResume() async {
         let chat = ChatStore()
         let sessions = SessionStore()
@@ -248,6 +343,113 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertTrue(SessionActiveItem.Status.starting.isRunning)
         XCTAssertTrue(SessionActiveItem.Status.waiting.isRunning)
         XCTAssertTrue(SessionActiveItem.Status.working.isRunning)
+    }
+
+    func testPassiveOpenUsesStockWatchSnapshotWithoutResume() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        sessions.watchRPC = { storedID in
+            XCTAssertEqual(storedID, "stored-desktop")
+            return JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "running": .bool(true),
+                "status": .string("working"),
+                "inflight": .object([
+                    "user": .string("build the feature"),
+                    "assistant": .string("working on it"),
+                    "streaming": .bool(true),
+                ]),
+                "messages": .array([]),
+                "info": .object(["model": .string("watch-model")]),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        sessions.activeListRPC = {
+            XCTFail("versioned stock watch must avoid the legacy inventory probe")
+            return SessionActiveListResult(sessions: [])
+        }
+        var resumeCalls = 0
+        sessions.resumeRPC = { _, _ in
+            resumeCalls += 1
+            return JSONValue.object([
+                "session_id": .string("must-not-resume"),
+                "resumed": .string("stored-desktop"),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(resumeCalls, 0)
+        XCTAssertEqual(sessions.sessionBinding?.runtimeID, "runtime-desktop")
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertEqual(connection.sessionModelRaw, "watch-model")
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertFalse(chat.localTurnInFlight)
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant])
+        XCTAssertEqual(chat.messages.first?.text, "build the feature")
+        XCTAssertEqual(chat.messages.last?.text, "working on it")
+    }
+
+    func testStockWatchRefreshSettlesFromCanonicalTranscriptWithoutTakeover() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        chat.backfillFetch = { _ in [
+            StoredMessage(role: "user", content: .string("build the feature")),
+            StoredMessage(role: "assistant", content: .string("finished")),
+        ] }
+        var watchCalls = 0
+        sessions.watchRPC = { _ in
+            watchCalls += 1
+            let running = watchCalls == 1
+            return JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "running": .bool(running),
+                "status": .string(running ? "working" : "idle"),
+                "inflight": running ? .object([
+                    "user": .string("build the feature"),
+                    "assistant": .string("working on it"),
+                    "streaming": .bool(true),
+                ]) : .null,
+                "messages": .array([]),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("watch refresh must not resume or rebind the session")
+            throw GatewayError.notConnected
+        }
+
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertTrue(chat.isStreaming)
+
+        let continued = await sessions.refreshWatchedSessionOnce(
+            storedID: "stored-desktop", runtimeID: "runtime-desktop"
+        )
+
+        XCTAssertTrue(continued)
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertFalse(chat.localTurnInFlight)
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+        XCTAssertEqual(chat.messages.last?.text, "finished")
+        await sessions.closeActive()
     }
 
     func testPassiveOpenOfIdleSessionDoesNotResume() async {
@@ -430,7 +632,7 @@ final class ProtocolParityTests: XCTestCase {
 
     func testLocalWorkingSettlesWhenActiveListBecomesIdle() async {
         let (chat, sessions) = makeStore()
-        _ = sessions.beginPromptSubmission(runtimeID: activeRuntime)
+        _ = try? await sessions.beginPromptSubmission(runtimeID: activeRuntime)
         var status: SessionActiveItem.Status = .working
         var historyCalls = 0
         sessions.activeListRPC = {

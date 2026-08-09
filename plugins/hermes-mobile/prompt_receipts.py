@@ -1,13 +1,7 @@
-"""Durable ``prompt.submit`` idempotency receipts for hermes-mobile.
-
-The gateway core exposes only a structural provider seam.  This module owns
-the SQLite schema, profile-home placement, process-liveness interpretation,
-and the frozen 30-day retention policy required by the mobile outbox protocol.
-"""
+"""Durable SQLite reservations for the stock Hermes prompt-admission seam."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -21,13 +15,7 @@ _DB_RELATIVE_PATH = Path("plugins") / "hermes-mobile" / "prompt_receipts.sqlite3
 
 
 class SQLitePromptReceiptProvider:
-    """Atomic, process-aware prompt receipt registry.
-
-    A reservation owned by this provider instance is live.  The same durable
-    row observed by a new provider instance (the gateway restarted after the
-    claim but before recording a disposition) is permanently marked
-    ``indeterminate`` and is never automatically re-executed.
-    """
+    """Atomic, process-aware prompt receipt storage and nothing else."""
 
     provider_name = "hermes-mobile.sqlite-prompt-receipts"
 
@@ -44,32 +32,19 @@ class SQLitePromptReceiptProvider:
     def database_path(profile_home: str | os.PathLike[str]) -> Path:
         return Path(profile_home) / _DB_RELATIVE_PATH
 
-    @staticmethod
-    def _fingerprint(
-        *,
-        session_id: Any,
-        text: Any,
-        truncate_before_user_ordinal: int | None,
-    ) -> str:
-        encoded = json.dumps(
-            {
-                "session_id": session_id,
-                "text": text,
-                "truncate_before_user_ordinal": truncate_before_user_ordinal,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-
     def _connect(self, profile_home: str | os.PathLike[str]) -> sqlite3.Connection:
         path = self.database_path(profile_home)
         path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
         conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA journal_mode = WAL")
+        from hermes_state import apply_wal_with_fallback
+
+        apply_wal_with_fallback(conn, db_label=str(path))
         conn.execute("PRAGMA synchronous = FULL")
         conn.execute(
             """
@@ -86,49 +61,25 @@ class SQLitePromptReceiptProvider:
         )
         try:
             os.chmod(path, 0o600)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{path}{suffix}")
+                if sidecar.exists():
+                    os.chmod(sidecar, 0o600)
         except OSError:
             pass
         return conn
 
-    @staticmethod
-    def _reservation(
-        *,
-        profile_home: Path,
-        path: Path,
-        client_message_id: str,
-        fingerprint: str,
-        owner_id: str,
-    ) -> dict[str, str]:
-        return {
-            "profile_home": str(profile_home),
-            "path": str(path),
-            "client_message_id": client_message_id,
-            "fingerprint": fingerprint,
-            "owner_id": owner_id,
-        }
-
     def reserve(
         self,
         *,
-        profile_home: str | os.PathLike[str],
+        profile_home: Path,
         client_message_id: str,
-        session_id: Any,
-        text: Any,
-        truncate_before_user_ordinal: int | None,
+        request_fingerprint: str,
     ) -> dict[str, Any]:
-        profile_home = Path(profile_home)
-        fingerprint = self._fingerprint(
-            session_id=session_id,
-            text=text,
-            truncate_before_user_ordinal=truncate_before_user_ordinal,
-        )
-        path = self.database_path(profile_home)
         now = float(self._clock())
         conn = self._connect(profile_home)
         try:
             conn.execute("BEGIN IMMEDIATE")
-            # Strictly older than 30 days: a receipt at the boundary is still
-            # retained, matching the protocol's minimum retention guarantee.
             conn.execute(
                 "DELETE FROM prompt_receipts WHERE created_at < ?",
                 (now - RETENTION_SECONDS,),
@@ -145,24 +96,22 @@ class SQLitePromptReceiptProvider:
                         disposition_json, created_at, updated_at
                     ) VALUES (?, ?, 'reserved', ?, NULL, ?, ?)
                     """,
-                    (client_message_id, fingerprint, self.owner_id, now, now),
+                    (client_message_id, request_fingerprint, self.owner_id, now, now),
                 )
                 conn.commit()
                 return {
                     "state": "claimed",
-                    "reservation": self._reservation(
-                        profile_home=profile_home,
-                        path=path,
-                        client_message_id=client_message_id,
-                        fingerprint=fingerprint,
-                        owner_id=self.owner_id,
-                    ),
+                    "reservation": {
+                        "profile_home": str(profile_home),
+                        "client_message_id": client_message_id,
+                        "request_fingerprint": request_fingerprint,
+                        "owner_id": self.owner_id,
+                    },
                 }
 
-            if row["request_fingerprint"] != fingerprint:
+            if row["request_fingerprint"] != request_fingerprint:
                 conn.commit()
                 return {"state": "conflict"}
-
             if row["state"] == "accepted" and row["disposition_json"]:
                 try:
                     disposition = json.loads(row["disposition_json"])
@@ -171,7 +120,6 @@ class SQLitePromptReceiptProvider:
                 if isinstance(disposition, dict):
                     conn.commit()
                     return {"state": "replay", "disposition": disposition}
-
             if row["state"] == "reserved" and row["owner_id"] == self.owner_id:
                 conn.commit()
                 return {"state": "in_progress"}
@@ -194,14 +142,13 @@ class SQLitePromptReceiptProvider:
         finally:
             conn.close()
 
-    def complete(self, reservation: dict[str, str], disposition: dict) -> None:
+    def complete(self, reservation: dict[str, str], disposition: dict[str, Any]) -> None:
         payload = json.dumps(
             disposition,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
         )
-        now = float(self._clock())
         conn = self._connect(reservation["profile_home"])
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -216,9 +163,9 @@ class SQLitePromptReceiptProvider:
                 """,
                 (
                     payload,
-                    now,
+                    float(self._clock()),
                     reservation["client_message_id"],
-                    reservation["fingerprint"],
+                    reservation["request_fingerprint"],
                     reservation["owner_id"],
                 ),
             )
@@ -233,7 +180,6 @@ class SQLitePromptReceiptProvider:
             conn.close()
 
     def release(self, reservation: dict[str, str]) -> None:
-        """Delete an unaccepted reservation after a mutation-free rejection."""
         conn = self._connect(reservation["profile_home"])
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -247,7 +193,7 @@ class SQLitePromptReceiptProvider:
                 """,
                 (
                     reservation["client_message_id"],
-                    reservation["fingerprint"],
+                    reservation["request_fingerprint"],
                     reservation["owner_id"],
                 ),
             )

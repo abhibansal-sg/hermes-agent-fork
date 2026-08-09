@@ -24,7 +24,8 @@ final class BatchGTests: XCTestCase {
         // PATCHED gateway (fs/upload available) — what a pre-restart probe
         // would have left behind.
         let cached = """
-        {"serverURL":"\(url)","appVersion":"\(ServerCapabilities.currentAppVersion)",
+        {"contractVersion":\(ServerCapabilities.capabilityContractVersion),
+         "serverURL":"\(url)","appVersion":"\(ServerCapabilities.currentAppVersion)",
          "upload":"available","pushRegistry":"unknown","broadcast":"unknown",
          "fs":"available","subagentEvents":"unknown","profiles":"unknown",
          "devices":"unknown"}
@@ -46,8 +47,6 @@ final class BatchGTests: XCTestCase {
         await cold.probe(serverURL: url, rest: rest, force: true)
         XCTAssertNotEqual(cold.fs, .available,
                           "a forced re-probe must not resurrect the pre-restart snapshot")
-        XCTAssertNotEqual(cold.upload, .available)
-
         // Judge round: the entirely-INCONCLUSIVE forced probe must not have
         // poisoned the disk cache with all-unknowns — a later unforced probe
         // (fresh launch) still restores the last CONCLUSIVE snapshot.

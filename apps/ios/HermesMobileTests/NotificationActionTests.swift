@@ -1,30 +1,9 @@
 import XCTest
 @testable import HermesMobile
 
-/// Coverage for the F2-A actionable-push surfaces:
-///  - push-payload decoding (category routing + the `hermes` block, incl.
-///    `destructive` / `stored_session_id` / `approval_title`),
-///  - the action-identifier → approve/deny mapping,
-///  - the per-event push-prefs round-trip through `DefaultsKeys`.
-///
-/// These exercise the pure, host-runnable transforms. The network legs
-/// (`/api/approvals/respond`, `/api/push/live-activity`) and the LAContext gate
-/// are status-code / system-prompt driven and are validated by the integration
-/// gate against an isolated gateway.
+/// Coverage for push tap routing and per-event preferences. Notification
+/// categories intentionally open the app; foreground responses use stock RPC.
 final class NotificationActionTests: XCTestCase {
-
-    @MainActor
-    func testNotificationActionCompletionTriggersInboxReconciliation() async {
-        let coordinator = NotificationLaunchCoordinator()
-        coordinator.attachActionEndpointProvider { nil }
-        let reconciled = expectation(description: "attention reconciliation requested")
-        coordinator.attachReconciliationHandler { reconciled.fulfill() }
-        coordinator.receive(.approval(
-            true, nil,
-            .init(handler: {})
-        ))
-        await fulfillment(of: [reconciled], timeout: 1)
-    }
 
     // MARK: - aps.category decode
 
@@ -132,71 +111,6 @@ final class NotificationActionTests: XCTestCase {
         )
     }
 
-    // MARK: - decodeApprovalAction (the hermes block)
-
-    func testDecodeApprovalActionFullBlock() throws {
-        let userInfo: [AnyHashable: Any] = [
-            "aps": ["category": "HERMES_APPROVAL"],
-            "hermes": [
-                "session_id": "sess-runtime",
-                "stored_session_id": "sess-stored",
-                "request_id": "approval-42",
-                "destructive": true,
-                "approval_title": "rm -rf build/",
-            ],
-        ]
-        let action = try XCTUnwrap(NotificationService.decodeApprovalAction(from: userInfo))
-        XCTAssertEqual(action.sessionId, "sess-runtime")
-        XCTAssertEqual(action.requestId, "approval-42")
-        XCTAssertEqual(action.storedSessionId, "sess-stored")
-        XCTAssertTrue(action.destructive)
-        XCTAssertEqual(action.approvalTitle, "rm -rf build/")
-    }
-
-    func testDecodeApprovalActionDefaultsDestructiveFalse() throws {
-        let userInfo: [AnyHashable: Any] = [
-            "hermes": ["session_id": "sess-x"],
-        ]
-        let action = try XCTUnwrap(NotificationService.decodeApprovalAction(from: userInfo))
-        XCTAssertEqual(action.sessionId, "sess-x")
-        XCTAssertNil(action.storedSessionId)
-        XCTAssertFalse(action.destructive, "destructive must default to false when absent")
-        XCTAssertNil(action.approvalTitle)
-    }
-
-    func testDecodeApprovalActionToleratesStringifiedDestructive() throws {
-        // Some APNs JSON paths stringify booleans; "true"/"1" must still gate.
-        for raw in ["true", "1", "yes", "TRUE"] {
-            let userInfo: [AnyHashable: Any] = [
-                "hermes": ["session_id": "s", "destructive": raw],
-            ]
-            let action = try XCTUnwrap(NotificationService.decodeApprovalAction(from: userInfo))
-            XCTAssertTrue(action.destructive, "expected destructive for \(raw)")
-        }
-        // And a stringy false stays false.
-        let falsey: [AnyHashable: Any] = ["hermes": ["session_id": "s", "destructive": "false"]]
-        let action = try XCTUnwrap(NotificationService.decodeApprovalAction(from: falsey))
-        XCTAssertFalse(action.destructive)
-    }
-
-    func testDecodeApprovalActionNilWithoutHermesBlock() {
-        XCTAssertNil(NotificationService.decodeApprovalAction(from: ["aps": ["alert": "x"]]))
-    }
-
-    func testDecodeApprovalActionNilWithEmptySessionId() {
-        let userInfo: [AnyHashable: Any] = ["hermes": ["session_id": "   "]]
-        XCTAssertNil(NotificationService.decodeApprovalAction(from: userInfo))
-    }
-
-    func testDecodeApprovalActionBlankStoredAndTitleBecomeNil() throws {
-        let userInfo: [AnyHashable: Any] = [
-            "hermes": ["session_id": "s", "stored_session_id": "  ", "approval_title": ""],
-        ]
-        let action = try XCTUnwrap(NotificationService.decodeApprovalAction(from: userInfo))
-        XCTAssertNil(action.storedSessionId)
-        XCTAssertNil(action.approvalTitle)
-    }
-
     func testDecodeCorrelatedAlertPreservesStableRouteIdentity() throws {
         let userInfo: [AnyHashable: Any] = ["hermes": [
             "event_type": "clarify",
@@ -227,21 +141,7 @@ final class NotificationActionTests: XCTestCase {
         XCTAssertTrue(approval.id.isEmpty, "the client must not substitute a random UUID")
     }
 
-    // MARK: - action identifier → choice mapping
-
-    func testApproveChoiceMapping() {
-        XCTAssertEqual(NotificationService.approveChoice(for: "APPROVE"), true)
-        XCTAssertEqual(NotificationService.approveChoice(for: "DENY"), false)
-        XCTAssertNil(NotificationService.approveChoice(for: "com.apple.UNNotificationDefaultActionIdentifier"))
-        XCTAssertNil(NotificationService.approveChoice(for: "approve")) // case-sensitive: only the registered id
-        XCTAssertNil(NotificationService.approveChoice(for: ""))
-    }
-
     func testActionIdentifiersMatchCategoryContract() {
-        // The action ids are part of the pinned interface; pin them in a test so
-        // a rename can't silently break the server-stamped category.
-        XCTAssertEqual(NotificationService.approveActionIdentifier, "APPROVE")
-        XCTAssertEqual(NotificationService.denyActionIdentifier, "DENY")
         XCTAssertEqual(NotificationService.remoteApprovalCategory, "HERMES_APPROVAL")
         XCTAssertEqual(NotificationService.remoteClarifyCategory, "HERMES_CLARIFY")
         XCTAssertEqual(NotificationService.remoteTurnCategory, "HERMES_TURN")
@@ -734,23 +634,5 @@ final class PushRegistrarEnvDedupeTests: XCTestCase {
             wouldSkip(token: "aaa", events: ["approval", "clarify"], env: "production", defaults: defaults),
             "different events must be a miss even when token+env match"
         )
-    }
-}
-
-// MARK: - Approval respond outcome shape
-
-/// Pins the `RestClient.ApprovalRespondOutcome` cases the action handler branches
-/// on, so a refactor can't silently drop the "already handled" feedback path.
-final class ApprovalRespondOutcomeTests: XCTestCase {
-    func testOutcomeCasesAreDistinct() {
-        XCTAssertNotEqual(RestClient.ApprovalRespondOutcome.resolved, .alreadyHandled)
-        XCTAssertNotEqual(RestClient.ApprovalRespondOutcome.resolved, .failed)
-        XCTAssertNotEqual(RestClient.ApprovalRespondOutcome.alreadyHandled, .failed)
-    }
-
-    func testLiveActivityOutcomeCasesAreDistinct() {
-        XCTAssertNotEqual(RestClient.LiveActivityTokenOutcome.success, .notDeployed)
-        XCTAssertNotEqual(RestClient.LiveActivityTokenOutcome.success, .failed)
-        XCTAssertNotEqual(RestClient.LiveActivityTokenOutcome.notDeployed, .failed)
     }
 }

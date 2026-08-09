@@ -195,6 +195,7 @@ struct SessionOpenResult: Decodable, Sendable {
     let inflight: SessionInflightTurn?
     /// Optional v0.19 resume snapshot. Fork main currently omits it.
     let queued: [JSONValue]
+    let actionRevision: Int?
 
     var snapshotRunning: Bool? {
         if let running { return running }
@@ -221,6 +222,7 @@ struct SessionOpenResult: Decodable, Sendable {
         case status
         case inflight
         case queued
+        case actionRevision
     }
 
     init(from decoder: Decoder) throws {
@@ -242,6 +244,7 @@ struct SessionOpenResult: Decodable, Sendable {
         self.status = try c.decodeIfPresent(String.self, forKey: .status)
         self.inflight = try c.decodeIfPresent(SessionInflightTurn.self, forKey: .inflight)
         self.queued = try c.decodeIfPresent([JSONValue].self, forKey: .queued) ?? []
+        self.actionRevision = try c.decodeIfPresent(Int.self, forKey: .actionRevision)
     }
 }
 
@@ -713,20 +716,6 @@ struct ServerStatus: Decodable, Sendable {
     let gatewayRunning: Bool?
     let activeSessions: Int?
     let authRequired: Bool?
-}
-
-/// `POST /api/upload` response (added on the hermes-mobile branch).
-struct UploadResult: Decodable, Sendable {
-    let path: String
-    let size: Int?
-    let mimeType: String?
-    let contentVersion: String?
-
-    private enum CodingKeys: String, CodingKey {
-        case path, size
-        case mimeType = "mime"
-        case contentVersion = "content_version"
-    }
 }
 
 // MARK: - Subagent delegation (F4A-A2)

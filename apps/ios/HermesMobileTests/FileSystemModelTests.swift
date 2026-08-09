@@ -49,8 +49,7 @@ final class FileSystemModelTests: XCTestCase {
         return RestClient(
             baseURL: URL(string: "https://gw.example:9119")!,
             token: "tok",
-            session: URLSession(configuration: config),
-            pathStyle: .plugin
+            session: URLSession(configuration: config)
         )
     }
 
@@ -183,36 +182,120 @@ final class FileSystemModelTests: XCTestCase {
         XCTAssertEqual(result, FSDiffResult(path: "", diff: "", hasChanges: false))
     }
 
-    func testRestClientFSDiffUsesMobilePrefixAndDecodes() async throws {
-        let body = Data(#"{"path":"a dir/file.swift","diff":"+hello\n","has_changes":true}"#.utf8)
+    func testRestClientFSDiffUsesStockGitRouteAndDecodes() async throws {
+        let body = Data(#"{"diff":"+hello\n"}"#.utf8)
         let rest = makeRecordingRest(body: body)
 
-        let result = try await rest.fsDiff(sessionId: "sess-1", path: "a dir/file.swift")
+        let result = try await rest.fsDiff(cwd: "/workspace/root", path: "a dir/file.swift")
 
         XCTAssertEqual(result.path, "a dir/file.swift")
         XCTAssertEqual(result.diff, "+hello\n")
         XCTAssertTrue(result.hasChanges)
         XCTAssertEqual(RecordingProtocol.requests.count, 1)
         let url = try XCTUnwrap(RecordingProtocol.requests.first?.url)
-        XCTAssertEqual(url.path, "/api/plugins/hermes-mobile/fs/diff")
+        XCTAssertEqual(url.path, "/api/git/file-diff")
         let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
         let items = components.queryItems ?? []
-        XCTAssertEqual(items.first(where: { $0.name == "session_id" })?.value, "sess-1")
-        XCTAssertEqual(items.first(where: { $0.name == "path" })?.value, "a dir/file.swift")
+        XCTAssertEqual(items.first(where: { $0.name == "path" })?.value, "/workspace/root")
+        XCTAssertEqual(items.first(where: { $0.name == "file" })?.value, "a dir/file.swift")
     }
 
-    func testRestClientFSDiffMapsUnknownSession() async throws {
-        let body = Data(#"{"error":"unknown session"}"#.utf8)
-        let rest = makeRecordingRest(body: body, status: 404)
+    func testMissingCanonicalCwdMapsToNoActiveSessionWithoutNetwork() async throws {
+        let rest = makeRecordingRest(body: Data())
 
         do {
-            _ = try await rest.fsDiff(sessionId: "ghost", path: "a.swift")
+            _ = try await rest.fsDiff(cwd: "", path: "a.swift")
             XCTFail("expected noActiveSession")
         } catch let error as FSReadError {
             guard case .noActiveSession = error else {
                 return XCTFail("expected .noActiveSession, got \(error)")
             }
         }
+        XCTAssertTrue(RecordingProtocol.requests.isEmpty)
+    }
+
+    func testStockListMapsDesktopShapeAndAbsoluteQuery() async throws {
+        let body = Data(#"{"entries":[{"name":"Sources","path":"/workspace/root/Sources","isDirectory":true},{"name":"A.swift","path":"/workspace/root/A.swift","isDirectory":false}]}"#.utf8)
+        let rest = makeRecordingRest(body: body)
+
+        let result = try await rest.fsList(cwd: "/workspace/root", path: "")
+
+        XCTAssertEqual(result.root, "/workspace/root")
+        XCTAssertEqual(result.path, "")
+        XCTAssertEqual(result.entries.map(\.name), ["Sources", "A.swift"])
+        XCTAssertTrue(result.entries[0].isDir)
+        XCTAssertFalse(result.entries[1].isDir)
+        let url = try XCTUnwrap(RecordingProtocol.requests.first?.url)
+        XCTAssertEqual(url.path, "/api/fs/list")
+        XCTAssertEqual(
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first?.value,
+            "/workspace/root"
+        )
+    }
+
+    func testStockReadMapsDesktopShape() async throws {
+        let body = Data(#"{"binary":false,"byteSize":5,"language":"text","mimeType":"text/plain","path":"/workspace/root/note.txt","text":"hello","truncated":false}"#.utf8)
+        let rest = makeRecordingRest(body: body)
+
+        let result = try await rest.fsRead(cwd: "/workspace/root", path: "note.txt")
+
+        XCTAssertEqual(result.path, "note.txt")
+        XCTAssertEqual(result.size, 5)
+        XCTAssertEqual(result.mimeType, "text/plain")
+        XCTAssertEqual(result.encoding, .utf8)
+        XCTAssertEqual(result.content, "hello")
+        let url = try XCTUnwrap(RecordingProtocol.requests.first?.url)
+        XCTAssertEqual(url.path, "/api/fs/read-text")
+    }
+
+    func testStockDataURLReadUsesNativeRoute() async throws {
+        let body = Data(#"{"dataUrl":"data:image/png;base64,AA=="}"#.utf8)
+        let rest = makeRecordingRest(body: body)
+
+        let result = try await rest.fsReadAsDataURL(
+            cwd: "/workspace/root", path: "images/a+b.png"
+        )
+
+        XCTAssertEqual(result.dataURL, "data:image/png;base64,AA==")
+        let url = try XCTUnwrap(RecordingProtocol.requests.first?.url)
+        XCTAssertEqual(url.path, "/api/fs/read-data-url")
+        XCTAssertEqual(
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first?.value,
+            "/workspace/root/images/a+b.png"
+        )
+    }
+
+    func testPathResolverRejectsTraversalAndOutsideAbsolutePath() throws {
+        XCTAssertThrowsError(try RestClient.resolveFSPath(
+            cwd: "/workspace/root", path: "../secret.txt"
+        )) { error in
+            guard case FSReadError.pathEscapesRoot = error else {
+                return XCTFail("expected pathEscapesRoot, got \(error)")
+            }
+        }
+        XCTAssertThrowsError(try RestClient.resolveFSPath(
+            cwd: "/workspace/root", path: "/etc/passwd"
+        )) { error in
+            guard case FSReadError.pathEscapesRoot = error else {
+                return XCTFail("expected pathEscapesRoot, got \(error)")
+            }
+        }
+    }
+
+    func testPathResolverAcceptsAbsoluteToolResultInsideCwd() throws {
+        let resolved = try RestClient.resolveFSPath(
+            cwd: "/workspace/root", path: "/workspace/root/output/image.png"
+        )
+        XCTAssertEqual(resolved.relative, "output/image.png")
+        XCTAssertEqual(resolved.absolute, "/workspace/root/output/image.png")
+    }
+
+    func testPathResolverAcceptsLocalFileURLInsideCwd() throws {
+        let resolved = try RestClient.resolveFSPath(
+            cwd: "/workspace/root", path: "file:///workspace/root/output/image.png"
+        )
+        XCTAssertEqual(resolved.relative, "output/image.png")
+        XCTAssertEqual(resolved.absolute, "/workspace/root/output/image.png")
     }
 
     // MARK: - isImage detection
@@ -353,19 +436,13 @@ final class FileSystemModelTests: XCTestCase {
 
     // MARK: - Query building
 
-    func testFSQueryOmitsEmptyPath() {
-        let q = RestClient.fsQuery(sessionId: "sess-1", path: nil)
-        XCTAssertEqual(q, "session_id=sess-1")
-        let q2 = RestClient.fsQuery(sessionId: "sess-1", path: "")
-        XCTAssertEqual(q2, "session_id=sess-1")
-    }
-
     func testFSQueryEncodesPath() {
-        let q = RestClient.fsQuery(sessionId: "s", path: "a dir/b.txt")
-        XCTAssertTrue(q.contains("session_id=s"))
+        let q = RestClient.fsQuery([
+            URLQueryItem(name: "path", value: "/workspace/a dir/b+1.txt")
+        ])
         XCTAssertTrue(q.contains("path="))
-        // The space must be percent-encoded.
-        XCTAssertTrue(q.contains("a%20dir") || q.contains("a%2520dir"))
+        XCTAssertTrue(q.contains("a%20dir"))
+        XCTAssertTrue(q.contains("b%2B1.txt"))
         XCTAssertFalse(q.contains("a dir"))
     }
 

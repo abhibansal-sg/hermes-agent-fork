@@ -1,52 +1,15 @@
 import Foundation
 
-/// Frozen `/pending-attention` snapshot/delta envelope exposed by the
-/// hermes-mobile plugin. The cursor is opaque and must be persisted verbatim.
-struct PendingAttentionEnvelope: Decodable, Sendable, Equatable {
-    let serverInstanceId: String
-    let cursor: String
-    let reset: Bool
-    let resetReason: String?
-    let upserts: [PendingAttentionRecord]
-    let tombstones: [PendingAttentionTombstone]
-}
+struct AttentionDetail: Codable, Sendable, Equatable {
+    let description: String?
+    let question: String?
+    let choices: [String]
 
-struct PendingAttentionRecord: Codable, Sendable, Equatable, Identifiable {
-    struct Detail: Codable, Sendable, Equatable {
-        let description: String?
-        let question: String?
-        let choices: [String]
-
-        init(description: String? = nil, question: String? = nil, choices: [String] = []) {
-            self.description = description
-            self.question = question
-            self.choices = choices
-        }
+    init(description: String? = nil, question: String? = nil, choices: [String] = []) {
+        self.description = description
+        self.question = question
+        self.choices = choices
     }
-
-    let id: String
-    let requestId: String
-    let kind: String
-    let sessionId: String
-    let storedSessionId: String?
-    let safeTitle: String
-    let detail: Detail
-    let destructive: Bool
-    let createdAt: Double
-    let expiresAt: Double?
-    let status: String
-    let revision: Int64
-}
-
-struct PendingAttentionTombstone: Codable, Sendable, Equatable, Identifiable {
-    let id: String
-    let requestId: String
-    let kind: String
-    let sessionId: String
-    let storedSessionId: String?
-    let status: String
-    let deletedAt: Double
-    let revision: Int64
 }
 
 /// Durable local lifecycle. `responding` and `failedRetryable` are overlays on
@@ -80,7 +43,7 @@ struct PersistedAttentionItem: Codable, Sendable, Equatable, Identifiable {
     let storedSessionId: String?
     let kind: String
     let safeTitle: String
-    let detail: PendingAttentionRecord.Detail
+    let detail: AttentionDetail
     let destructive: Bool
     let createdAt: Double
     let expiresAt: Double?
@@ -88,24 +51,8 @@ struct PersistedAttentionItem: Codable, Sendable, Equatable, Identifiable {
     var state: AttentionLifecycle
     var updatedAt: Double
 
-    init(server record: PendingAttentionRecord, now: Double = Date().timeIntervalSince1970) {
-        id = record.id
-        requestId = record.requestId
-        sessionId = record.sessionId
-        storedSessionId = record.storedSessionId?.nilIfBlank
-        kind = record.kind
-        safeTitle = record.safeTitle
-        detail = record.detail
-        destructive = record.destructive
-        createdAt = record.createdAt
-        expiresAt = record.expiresAt
-        revision = record.revision
-        state = record.status == "expired" ? .expired : .pending
-        updatedAt = now
-    }
-
     init(id: String, requestId: String, sessionId: String, storedSessionId: String?,
-         kind: String, safeTitle: String, detail: PendingAttentionRecord.Detail,
+         kind: String, safeTitle: String, detail: AttentionDetail,
          destructive: Bool = false, createdAt: Double, expiresAt: Double? = nil,
          revision: Int64 = 0, state: AttentionLifecycle = .pending,
          updatedAt: Double = Date().timeIntervalSince1970) {
@@ -117,16 +64,8 @@ struct PersistedAttentionItem: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
-struct AttentionReconciliationMetadata: Sendable, Equatable {
-    let serverInstanceId: String
-    let cursor: String
-    let revision: Int64
-    let updatedAt: Double
-}
-
 struct AttentionSnapshot: Sendable, Equatable {
     let items: [PersistedAttentionItem]
-    let metadata: AttentionReconciliationMetadata?
 
     var pendingCount: Int { items.reduce(0) { $0 + ($1.state.contributesToPendingCount ? 1 : 0) } }
 }

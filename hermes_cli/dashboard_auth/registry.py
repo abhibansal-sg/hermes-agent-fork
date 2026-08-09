@@ -75,6 +75,23 @@ def list_session_providers() -> List[DashboardAuthProvider]:
         return [p for p in _providers.values() if getattr(p, "supports_session", True)]
 
 
+def list_interactive_providers() -> List[DashboardAuthProvider]:
+    """Session providers that intentionally expose a human login surface.
+
+    Native-client credential providers may need the normal session
+    verification and refresh stack without being a valid choice on ``/login``.
+    They set ``supports_interactive_login = False`` and remain visible to
+    :func:`list_session_providers` while this narrower view omits them.
+    """
+    with _lock:
+        return [
+            p
+            for p in _providers.values()
+            if getattr(p, "supports_session", True)
+            and getattr(p, "supports_interactive_login", True)
+        ]
+
+
 def clear_providers() -> None:
     """Test-only: drop all registrations."""
     with _lock:

@@ -7,8 +7,7 @@ import SwiftUI
 // HMAC-signed subscription fires the agent (or delivers a payload directly)
 // on an inbound HTTP event. `/api/webhooks*` are STOCK gateway routes (same
 // posture as `/api/logs`), so — like ``SystemLogsView`` — this panel is
-// reachable whenever `connectionStore.rest` exists, independent of the
-// plugin-mount probe that gates the Provider/toolset panels.
+// reachable whenever `connectionStore.rest` exists.
 //
 // Scoped OUT of this iOS pass (see STR-338 spec): the desktop's automatic
 // gateway-restart POLLING loop (`watchRestartOutcome` in WebhooksPage.tsx).

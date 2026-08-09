@@ -10,9 +10,11 @@ from typing import Optional
 class Session:
     """A verified identity. Returned by ``complete_login`` and ``verify_session``.
 
-    All fields are mandatory. Providers that don't have a concept of orgs
-    should set ``org_id`` to an empty string. ``access_token`` and
-    ``refresh_token`` are opaque to Hermes — provider-specific.
+    Core identity fields are mandatory. Providers that don't have a concept of
+    orgs should set ``org_id`` to an empty string. ``access_token`` and
+    ``refresh_token`` are opaque to Hermes — provider-specific. ``client_id``
+    is optional and identifies one remote client/device within a user account;
+    providers that omit it retain user-scoped ownership compatibility.
     """
 
     user_id: str
@@ -23,6 +25,7 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    client_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,15 @@ class DashboardAuthProvider(ABC):
     # token-only credential (e.g. drain) is never offered a login. Mirrors
     # supports_token.
     supports_session: bool = True
+
+    # Some providers mint and verify interactive-user-equivalent sessions for
+    # native clients without offering a browser login of their own.  Keep those
+    # providers in the session verification/refresh stack while omitting them
+    # from /login, provider discovery, auto-SSO, and RFC 8252 broker selection.
+    # This is deliberately separate from supports_session: the latter answers
+    # "can this provider verify/refresh a Session?", while this flag answers
+    # "should a human be invited to start a browser login with it?".
+    supports_interactive_login: bool = True
 
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...

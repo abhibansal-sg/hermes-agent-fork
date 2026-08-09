@@ -6,9 +6,9 @@ import XCTest
 ///
 /// ## Root cause
 /// Before the fix, ``SessionStore/restAPI`` re-read ``KeychainService/loadToken``
-/// on each call. When ``ConnectionStore/currentToken`` was updated (re-pair,
-/// device-token upgrade, or a Keychain write that lagged behind the in-memory
-/// update) without the Keychain item keeping pace, ``restAPI`` sent the stale
+/// on each call. When ``ConnectionStore/currentToken`` was updated (for example,
+/// by re-pair while a Keychain write lagged behind the in-memory update) without
+/// the Keychain item keeping pace, ``restAPI`` sent the stale
 /// Keychain token on session-management REST calls (search / rename / archive /
 /// export) and received HTTP 401 -- while WS auth and transcript-fetch paths that
 /// correctly used ``connection?.rest``/``currentToken`` worked fine.

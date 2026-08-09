@@ -133,9 +133,9 @@ struct SettingsView: View {
 
     // MARK: Per-event push prefs (F2-A / A4)
 
-    /// The per-event push toggles. All default ON. A change re-POSTs
-    /// `/api/push/register` with the new `events` list via
-    /// ``PushRegistrar/reRegisterEvents()``. The `@AppStorage` default of `true`
+    /// The per-event alert toggles. All default ON. Changes apply locally now;
+    /// a future thin APNs provider may consume the same stable list. The
+    /// `@AppStorage` default of `true`
     /// matches ``DefaultsKeys/pushEventEnabled(_:_:)``'s "absent ⇒ on" semantics.
     @AppStorage(DefaultsKeys.pushEventApproval) private var notifyApproval = true
     @AppStorage(DefaultsKeys.pushEventClarify) private var notifyClarify = true
@@ -171,12 +171,6 @@ struct SettingsView: View {
     @State private var globalYoloPending = false
     /// User-visible error if the global escalation RPC fails.
     @State private var globalYoloError: String?
-    /// True while the server-side redacted debug bundle is being generated.
-    @State private var debugSharePending = false
-    /// Fetched debug-share result; drives the share/copy sheet.
-    @State private var debugShareResult: DebugShareReport?
-    /// User-visible error if debug-share generation fails.
-    @State private var debugShareError: String?
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -208,7 +202,7 @@ struct SettingsView: View {
             .scrollContentBackground(.hidden)
             .background(theme.bg)
             // PSF-04: use the standard navigationTitle so this root matches all
-            // pushed-stack panels (DevicesView, AboutPanel, etc.) — the system
+            // pushed-stack panels (AboutPanel, provider settings, etc.) — the system
             // renders the inline title consistently; the custom `.principal`
             // ToolbarItem it replaced was a bespoke re-implementation that differed
             // from the pushed views and produced mismatched title sizes on iOS 26.
@@ -253,18 +247,6 @@ struct SettingsView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(globalYoloError ?? "")
-            }
-            .alert("Debug Report Failed", isPresented: Binding(
-                get: { debugShareError != nil },
-                set: { if !$0 { debugShareError = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(debugShareError ?? "")
-            }
-            .sheet(item: $debugShareResult) { report in
-                DebugShareSheet(report: report)
-                    .hermesThemed(themeStore)
             }
         }
     }
@@ -506,20 +488,10 @@ struct SettingsView: View {
                 .listRowBackground(theme.card)
                 .accessibilityIdentifier("notificationPermissionState")
 
-                LabeledContent("Push token") {
-                    Text(Self.pushTokenRegistrationLabel(
-                        token: UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken)
-                    ))
-                    .foregroundStyle(theme.mutedFg)
-                }
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("pushTokenRegistrationState")
             }
 
-            // Per-event push prefs (A4): native Toggles, shown only when
-            // push is on (they have no effect otherwise). Each change re-POSTs
-            // /api/push/register with the new events list. Pure system Toggles —
-            // chrome via the system, identity via the .tint applied app-wide.
+            // Per-event local alert preferences. A future thin APNs provider may
+            // consume the same choices without changing their UI ownership.
             if PushRegistrar.shared.isEnabled && !pushUnsupported {
                 Toggle(isOn: $notifyApproval) {
                     SettingsRowLabel(icon: "checkmark.shield", title: "Approvals")
@@ -661,7 +633,6 @@ struct SettingsView: View {
                 panelLink(.cron)
                 panelLink(.skills)
                 panelLink(.learning)
-                panelLink(.artifacts)
                 panelLink(.webhooks)
             } header: {
                 Text("Agent & Panels")
@@ -669,13 +640,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Connection (server, devices, disconnect / forget)
-
-    /// The W3a Devices row pushes ``DevicesView`` (the native device list +
-    /// revoke + approval audit). Rendered ONLY when the connected gateway
-    /// advertises the `devices` capability AND a live REST client exists; on a
-    /// stock hermes-agent (`devices != .available`) it is absent and the
-    /// legacy shared token is untouched (W3a stock degradation).
+    // MARK: - Connection (server, offline, disconnect / forget)
     @ViewBuilder
     private var connectionSection: some View {
         Section {
@@ -688,26 +653,6 @@ struct SettingsView: View {
                 SettingsRowLabel(icon: "network", title: "Server")
             }
             .listRowBackground(theme.card)
-
-            if connectionStore.capabilities.devices == .available,
-               let rest = connectionStore.rest {
-                NavigationLink {
-                    DevicesView(
-                        rest: rest,
-                        serverURL: connectionStore.serverURLString,
-                        authenticator: LAContextAuthenticator()
-                    )
-                } label: {
-                    SettingsRow(icon: "iphone.and.arrow.forward", title: "Devices", value: nil)
-                }
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsDevices")
-
-                Text("Manage the devices paired with this server and review who approved what.")
-                    .font(.footnote)
-                    .foregroundStyle(theme.mutedFg)
-                    .listRowBackground(theme.card)
-            }
 
             Button {
                 Task {
@@ -749,12 +694,8 @@ struct SettingsView: View {
                             forgetAuthenticationError = result.message ?? "Authentication failed."
                             return
                         }
-                        let rest = connectionStore.rest
-                        let server = connectionStore.serverURLString
-                        let deviceId = DefaultsKeys.deviceId(server: server)
                         await connectionStore.forgetGateway(remoteCleanup: {
                             await PushRegistrar.shared.unregisterRememberedToken()
-                            if let rest, let deviceId { _ = try await rest.revokeDevice(id: deviceId) }
                         })
                         dismiss()
                     }
@@ -777,11 +718,9 @@ struct SettingsView: View {
     // MARK: - Models & Keys (model picker, provider keys, toolset keys)
 
     /// Whether the section would render at least one visible row. Avoids a
-    /// header-with-no-rows flash when disconnected and the plugin mount isn't
-    /// known available yet.
+    /// header-with-no-rows flash when disconnected.
     private var modelsAndKeysSectionVisible: Bool {
         if connectionStore.control != nil { return true }
-        if connectionStore.capabilities.pluginMount == .available, connectionStore.rest != nil { return true }
         #if DEBUG
         if Self.providerKeySurvivalSeedEnabled { return true }
         #endif
@@ -803,14 +742,9 @@ struct SettingsView: View {
         }
     }
 
-    /// The ABH-183 Model provider keys row — a single push to
-    /// ``ProviderListView`` (the provider universe + authenticated? + add-key /
-    /// custom-provider / disconnect affordances). Rendered ONLY when the
-    /// connected gateway advertises the plugin mount (these routes live on
-    /// `/api/plugins/hermes-mobile/providers`); on a stock hermes-agent
-    /// (`pluginMount != .available`) the row is absent (graceful stock
-    /// degradation). On a plugin-mount gateway that PREDATES the provider
-    /// routes, the list surfaces the 404 as an inline error.
+    /// Stock model-provider inventory plus built-in API-key save/disconnect.
+    /// Custom provider rows are read-only here; Desktop owns that richer native
+    /// custom-endpoint workflow until iOS adopts its model field contract.
     @ViewBuilder
     private var modelProviderRow: some View {
         #if DEBUG
@@ -832,13 +766,11 @@ struct SettingsView: View {
                 .font(.footnote)
                 .foregroundStyle(theme.mutedFg)
                 .listRowBackground(theme.card)
-        } else if connectionStore.capabilities.pluginMount == .available,
-                  let rest = connectionStore.rest {
+        } else if let rest = connectionStore.rest {
             liveModelProviderRow(rest: rest)
         }
         #else
-        if connectionStore.capabilities.pluginMount == .available,
-           let rest = connectionStore.rest {
+        if let rest = connectionStore.rest {
             liveModelProviderRow(rest: rest)
         }
         #endif
@@ -847,7 +779,7 @@ struct SettingsView: View {
     @ViewBuilder
     private func liveModelProviderRow(rest: RestClient) -> some View {
         NavigationLink {
-            ProviderListView(rest: rest) {
+            ProviderListView(rest: rest, gateway: connectionStore.client) {
                 // Re-resolve the running model + repopulate the Model
                 // picker so a newly-authenticated provider's models (or a
                 // just-disconnected provider's removal) is reflected.
@@ -889,16 +821,11 @@ struct SettingsView: View {
     }
     #endif
 
-    /// The ABH-262 Toolset keys row — a single push to ``ToolsetConfigView``
-    /// (web + image_gen credential state, set, and clear). Rendered ONLY when
-    /// the connected gateway advertises the plugin mount because the routes
-    /// live at `/api/plugins/hermes-mobile/toolsets/{name}/config`. Stored key
-    /// values are never returned by the gateway; the pushed form always
-    /// starts blank.
+    /// Stock Hermes toolset credentials. The panel uses the same redacted
+    /// `/api/tools/toolsets/*` and `/api/env` routes as Desktop.
     @ViewBuilder
     private var toolsetKeysRow: some View {
-        if connectionStore.capabilities.pluginMount == .available,
-           let rest = connectionStore.rest {
+        if let rest = connectionStore.rest {
             NavigationLink {
                 ToolsetConfigView(rest: rest)
                     .background(theme.bg)
@@ -945,30 +872,6 @@ struct SettingsView: View {
                 panelLink(.logs)
             }
 
-            // Debug share (ABH-223 — plugin-mount only).
-            if connectionStore.capabilities.pluginMount == .available,
-               connectionStore.rest != nil {
-                Button {
-                    generateDebugShare()
-                } label: {
-                    HStack(spacing: 12) {
-                        SettingsRowLabel(icon: "ladybug", title: "Share debug report")
-                        Spacer(minLength: 8)
-                        if debugSharePending {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                    }
-                }
-                .disabled(debugSharePending)
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsShareDebugReport")
-
-                Text("Generates a redacted support bundle on the server and opens a share/copy sheet.")
-                    .font(.footnote)
-                    .foregroundStyle(theme.mutedFg)
-                    .listRowBackground(theme.card)
-            }
         } header: {
             Text("Advanced")
         }
@@ -996,7 +899,7 @@ struct SettingsView: View {
     /// live control surface; `about` is the local version page (no control
     /// client needed) and is excluded from ``pushable``.
     private enum ControlPanel: String, Identifiable, Hashable {
-        case appearance, model, personality, usage, cron, skills, learning, gateway, artifacts, logs, webhooks, about
+        case appearance, model, personality, usage, cron, skills, learning, gateway, logs, webhooks, about
         var id: String { rawValue }
 
         var title: String {
@@ -1009,7 +912,6 @@ struct SettingsView: View {
             case .skills: return "Skills"
             case .learning: return "Learning Journey"
             case .gateway: return "Gateway Status"
-            case .artifacts: return "Artifacts"
             case .logs: return "System Logs"
             case .webhooks: return "Webhooks"
             case .about: return "About"
@@ -1026,7 +928,6 @@ struct SettingsView: View {
             case .skills: return "wand.and.stars"
             case .learning: return "sparkles"
             case .gateway: return "network"
-            case .artifacts: return "photo.on.rectangle.angled"
             case .logs: return "doc.text.magnifyingglass"
             // STR-338: verified present in the iOS 17 base SDK swiftinterface
             // (SF Symbols 5). Falls back conceptually to `link`/
@@ -1090,13 +991,6 @@ struct SettingsView: View {
                     LearningJourneyView(client: connectionStore.client)
                 case .gateway:
                     GatewayStatusView(control: control, connection: connectionStore)
-                case .artifacts:
-                    ArtifactsGalleryView(
-                        control: control,
-                        serverId: connectionStore.serverURLString,
-                        profileId: sessionStore.activeProfile,
-                        sessions: sessionStore
-                    )
                 case .logs:
                     // ABH-368: System log viewer. Uses the REST client (not the
                     // WS control client) — /api/logs is a stock GET route. Falls
@@ -1145,7 +1039,7 @@ struct SettingsView: View {
     /// Whether the connected gateway is known NOT to support push registration
     /// (stock server, E1). Only `.unavailable` disables the toggle.
     private var pushUnsupported: Bool {
-        connectionStore.capabilities.pushRegistry == .unavailable
+        false
     }
 
     /// Human-readable notification permission state for the honest push-status
@@ -1222,26 +1116,6 @@ struct SettingsView: View {
         }
     }
 
-    /// Generate the server-side redacted debug bundle and present the share sheet.
-    private func generateDebugShare() {
-        guard !debugSharePending else { return }
-        guard let rest = connectionStore.rest else {
-            debugShareError = "Reconnect to a server before generating a debug report."
-            return
-        }
-        debugSharePending = true
-        Task {
-            defer { debugSharePending = false }
-            do {
-                let report = try await rest.debugShareReport(
-                    reliabilityTrace: ReliabilityDiagnostics.shared.redactedJSON
-                )
-                debugShareResult = report
-            } catch {
-                debugShareError = "Couldn't generate debug report: \(error.localizedDescription)"
-            }
-        }
-    }
 }
 
 // MARK: - Native row primitives
@@ -1301,90 +1175,6 @@ private struct SettingsRow: View {
                     .truncationMode(.tail)
             }
         }
-    }
-}
-
-// MARK: - Debug-share sheet
-
-/// Result sheet for Settings → Share debug report.
-///
-/// Presents the redacted paste URLs returned by the server, a system ShareLink,
-/// and a copy fallback for users who need to paste the bundle into support chat.
-private struct DebugShareSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.hermesTheme) private var theme
-
-    let report: DebugShareReport
-    @State private var copied = false
-
-    var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    ForEach(report.sortedURLLabels, id: \.self) { label in
-                        if let url = report.urls[label], !url.isEmpty {
-                            LabeledContent(label) {
-                                Text(url)
-                                    .font(.footnote.monospaced())
-                                    .foregroundStyle(theme.mutedFg)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                    .textSelection(.enabled)
-                            }
-                            .listRowBackground(theme.card)
-                        }
-                    }
-                } header: {
-                    Text(report.redacted ? "Redacted debug report" : "Debug report")
-                } footer: {
-                    Text("Links auto-delete in \(Self.expiryText(report.autoDeleteSeconds)).")
-                }
-
-                if !report.failures.isEmpty {
-                    Section("Partial failures") {
-                        ForEach(report.failures, id: \.self) { failure in
-                            Text(failure)
-                                .foregroundStyle(theme.mutedFg)
-                                .listRowBackground(theme.card)
-                        }
-                    }
-                }
-
-                Section {
-                    ShareLink(item: report.shareText) {
-                        Label("Share links", systemImage: "square.and.arrow.up")
-                    }
-                    .disabled(report.shareText.isEmpty)
-                    .listRowBackground(theme.card)
-
-                    Button {
-                        UIPasteboard.general.string = report.shareText
-                        copied = true
-                    } label: {
-                        Label(copied ? "Copied" : "Copy links", systemImage: copied ? "checkmark" : "doc.on.doc")
-                    }
-                    .disabled(report.shareText.isEmpty)
-                    .listRowBackground(theme.card)
-                }
-            }
-            .listStyle(.insetGrouped)
-            .scrollContentBackground(.hidden)
-            .background(theme.bg)
-            .navigationTitle("Debug Report")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
-    }
-
-    private static func expiryText(_ seconds: Int) -> String {
-        let hours = seconds / 3600
-        if hours > 0 { return "\(hours)h" }
-        let minutes = max(1, seconds / 60)
-        return "\(minutes)m"
     }
 }
 
@@ -1952,7 +1742,7 @@ private final class SystemLogsStore: ObservableObject {
 
 // MARK: - ABH-262 toolset credential settings UI
 //
-// A plugin-mount Settings panel for non-model tool credentials (web and
+// A stock Hermes Settings panel for non-model tool credentials (web and
 // image_gen to start). The server is the source of truth and deliberately returns
 // only redacted `is_set` booleans, never secret values. This view preserves that
 // contract: configured credentials render as status chips only, and the edit form
@@ -2109,7 +1899,9 @@ struct ToolsetConfigView: View {
                             toolsetName: config.name,
                             toolsetDisplayName: config.displayName,
                             providerName: provider.name.isEmpty ? config.displayName : provider.name,
-                            providerTag: provider.tag,
+                            // Stock Hermes selects by the canonical provider
+                            // display name returned in this same matrix.
+                            providerTag: provider.name,
                             envVar: envVar
                         )
                     )
@@ -2276,7 +2068,7 @@ struct ToolsetConfigView: View {
         do {
             let refreshed = try await rest.selectToolsetProvider(
                 name: config.name,
-                provider: provider.tag
+                provider: provider.name
             )
             replaceConfig(refreshed)
             let providerName = provider.name.isEmpty ? config.displayName : provider.name

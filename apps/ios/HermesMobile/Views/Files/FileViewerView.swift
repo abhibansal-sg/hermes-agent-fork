@@ -2,8 +2,8 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-/// Native read-only text/image viewer for a single file fetched via
-/// `GET /api/fs/read` (Module F4A-A1). Handles all content outcomes:
+/// Native read-only text/image viewer for a single file fetched through stock
+/// Hermes filesystem routes. Handles all content outcomes:
 ///
 /// **Text** (`encoding == "utf-8"`, `content != nil`)
 ///   - Syntax-highlighted (language inferred from `path` extension via
@@ -41,7 +41,10 @@ import UniformTypeIdentifiers
 /// FULL NATIVE (UI-I): `ScrollView` + `Text` / `Image`; identity via `theme`/`tint`.
 struct FileViewerView: View {
     let rest: RestClient
+    /// Runtime id retained only for bounded blob-cache identity.
     let sessionId: String
+    /// Canonical cwd echoed by the active Hermes runtime.
+    let cwd: String
     /// Relative path under the session cwd.
     let path: String
     /// Called when the user taps "Use in Message". Receives the relative path
@@ -99,7 +102,7 @@ struct FileViewerView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
         .background(theme.bg)
-        .task(id: path) { await load() }
+        .task(id: cwd + "\u{1F}" + path) { await load() }
         .sheet(item: $shareURL) { payload in
             FileShareSheet(url: payload.url)
         }
@@ -454,7 +457,7 @@ struct FileViewerView: View {
             mode = isMarkdownFile ? .rendered : .source
         }
         do {
-            let result = try await rest.fsRead(sessionId: sessionId, path: path)
+            let result = try await rest.fsRead(cwd: cwd, path: path)
             phase = .loaded(result)
             // If this is an image file, kick off the image-data load immediately.
             if result.isImage {
@@ -476,7 +479,7 @@ struct FileViewerView: View {
     /// the normal file read.
     private func refreshDiff() async {
         do {
-            let result = try await rest.fsDiff(sessionId: sessionId, path: path)
+            let result = try await rest.fsDiff(cwd: cwd, path: path)
             diffText = result.hasChanges
                 ? FileViewerModeDetection.normalizedDiffText(result.diff)
                 : nil
@@ -488,11 +491,8 @@ struct FileViewerView: View {
         }
     }
 
-    /// Load image data: if the initial `fsRead` already returned a `data_url`
-    /// (patched gateway fast-path), decode it directly. Otherwise, issue a
-    /// second request with `&format=data_url` (the gateway-image path that
-    /// mirrors the desktop's `readFileDataUrl`). If neither yields image data,
-    /// set `.failed` with a user-facing message.
+    /// Load image data: use any normalized inline data URL, otherwise call stock
+    /// Hermes `read-data-url`. If neither yields image data, surface failure.
     private func loadImage(result: FSReadResult) async {
         imagePhase = .loading
 
@@ -516,7 +516,7 @@ struct FileViewerView: View {
 
         // Slow path: request the image bytes via the format=data_url param.
         do {
-            let imageResult = try await rest.fsReadAsDataURL(sessionId: sessionId, path: path)
+            let imageResult = try await rest.fsReadAsDataURL(cwd: cwd, path: path)
             if let dataURL = imageResult.dataURL, let decoded = await decodeDataURL(dataURL) {
                 imagePhase = .loaded(decoded.image)
                 // Prefer the freshest server-reported content identity.
@@ -635,7 +635,7 @@ struct FileViewerView: View {
                 Self.decodeDataURLToData(dataURL)
             }).value { return data }
         }
-        if let fetched = try? await rest.fsReadAsDataURL(sessionId: sessionId, path: path),
+        if let fetched = try? await rest.fsReadAsDataURL(cwd: cwd, path: path),
            let dataURL = fetched.dataURL {
             if let data = await Task.detached(operation: {
                 Self.decodeDataURLToData(dataURL)

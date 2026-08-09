@@ -66,6 +66,7 @@ struct WorkingDirPicker: View {
                 FileBrowserView(
                     rest: rest,
                     sessionId: sessionId,
+                    cwd: currentCwd,
                     mode: .pickDirectory,
                     onPick: onPick
                 )

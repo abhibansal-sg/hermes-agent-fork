@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
@@ -48,7 +48,6 @@ from fastapi.responses import JSONResponse, Response
 from hermes_cli.dashboard_auth import list_token_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, TokenPrincipal
-from hermes_cli.dashboard_auth.call_guard import guarded_call_next, scope_is_http
 
 _log = logging.getLogger(__name__)
 
@@ -56,70 +55,6 @@ _log = logging.getLogger(__name__)
 # itself here at import/startup; the seam only acts on registered paths.
 _token_routes: set[str] = set()
 _lock = threading.Lock()
-
-# Generic identity seams for machine credentials that need richer metadata
-# than TokenPrincipal carries (device name, token prefix, revocation state),
-# plus live-socket indexing for immediate revocation.
-TOKEN_AUTHENTICATORS: List[
-    Callable[[str], Optional[Dict[str, Any]]]
-] = []
-IDENTITY_VALIDATORS: List[Callable[[Dict[str, Any]], bool]] = []
-SOCKET_OBSERVERS: List[Callable[[str, Dict[str, Any], Any], None]] = []
-SESSION_OWNERSHIP_CHECKERS: List[
-    Callable[[Dict[str, Any], str], Optional[bool]]
-] = []
-
-
-def match_token(token: str) -> Optional[Dict[str, Any]]:
-    """Return the first registered rich identity for *token*, best-effort."""
-    if not token:
-        return None
-    for authenticator in list(TOKEN_AUTHENTICATORS):
-        try:
-            identity = authenticator(token)
-        except Exception:
-            _log.debug("token authenticator errored", exc_info=True)
-            continue
-        if isinstance(identity, dict):
-            return identity
-    return None
-
-
-def identity_active(identity: Any) -> bool:
-    """Return False only when a validator explicitly revokes an identity."""
-    if not isinstance(identity, dict):
-        return False
-    for validator in list(IDENTITY_VALIDATORS):
-        try:
-            if not validator(identity):
-                return False
-        except Exception:
-            _log.debug("identity validator errored", exc_info=True)
-    return True
-
-
-def notify_socket(action: str, identity: Dict[str, Any], ws: Any) -> None:
-    """Notify observers that an identity's live socket changed."""
-    for observer in list(SOCKET_OBSERVERS):
-        try:
-            observer(action, identity, ws)
-        except Exception:
-            _log.debug("socket observer errored", exc_info=True)
-
-
-def identity_owns_session(identity: Any, session_id: str) -> bool:
-    """Ask the identity provider whether *identity* owns *session_id*."""
-    if not isinstance(identity, dict) or not session_id:
-        return False
-    for checker in list(SESSION_OWNERSHIP_CHECKERS):
-        try:
-            result = checker(identity, session_id)
-        except Exception:
-            _log.debug("session ownership checker errored", exc_info=True)
-            continue
-        if result is not None:
-            return bool(result)
-    return False
 
 
 def register_token_route(path: str) -> None:
@@ -223,39 +158,16 @@ async def token_auth_middleware(
     Runs before the cookie/session gates (installed last in ``web_server.py``).
     The cookie gates honour ``request.state.token_authenticated`` and skip
     enforcement, so a token-authed request is never redirected to ``/login``.
-
-    Hardened per the daily-driver spec (N7):
-
-      * WebSocket scopes never traverse this seam. Starlette's
-        BaseHTTPMiddleware already routes non-``http`` scopes around the
-        dispatch; :func:`scope_is_http` pins that exemption locally so a
-        future rewiring as a general ASGI middleware cannot funnel WS
-        handshakes through bearer-token auth (a WS client that drops during
-        an HTTP-shaped auth check would surface ``WebSocketDisconnect`` as
-        an unhandled exception).
-      * Both ``call_next`` sites run through :func:`guarded_call_next`: a
-        downstream failure (including the ExceptionGroup shape Starlette's
-        middleware task group produces) becomes a 500 JSONResponse instead
-        of escaping the middleware stack and killing the ASGI worker. The
-        401 / 503 verdicts above are computed BEFORE ``call_next`` and are
-        byte-for-byte unchanged.
     """
-    if not scope_is_http(request):
-        return await call_next(request)
-
     path = request.url.path
     if not is_token_route(path):
-        return await guarded_call_next(
-            request, call_next, gate="token_auth_middleware"
-        )
+        return await call_next(request)
 
     principal, unreachable = authenticate_token(request)
     if principal is not None:
         request.state.token_principal = principal
         request.state.token_authenticated = True
-        return await guarded_call_next(
-            request, call_next, gate="token_auth_middleware"
-        )
+        return await call_next(request)
 
     if unreachable:
         audit_log(

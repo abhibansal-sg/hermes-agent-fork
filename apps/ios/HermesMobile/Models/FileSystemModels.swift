@@ -1,17 +1,14 @@
 import Foundation
 
-/// Decoded shapes for the patched gateway's two session-cwd file endpoints
-/// (`GET /api/fs/list`, `GET /api/fs/read`) and for the `complete.path` RPC the
-/// composer's @-file picker drives. Owned by Module F4A-A1 (composer / @-refs /
-/// file browser). The wire contract is the pinned F4A interface — these models
-/// match it field-for-field and are decoded with explicit `CodingKeys` (the
-/// snake_case wire keys are mapped here, NOT via `convertFromSnakeCase`, so a
-/// `RestClient.decode(strategy:)` choice can't double-transform them).
+/// Native presentation models for stock Hermes filesystem responses and the
+/// `complete.path` RPC used by the composer's @-file picker. `RestClient+FS`
+/// adapts stock desktop response shapes into these bounded models; none of this
+/// state is canonical file authority.
 
 // MARK: - /api/fs/list
 
-/// One entry returned by `GET /api/fs/list`. Directories sort before files;
-/// `size` is bytes (0 for dirs), `modified` is epoch seconds.
+/// One normalized directory entry. Stock list responses currently omit size and
+/// modified time, so those presentation fields default to zero/nil.
 struct FSEntry: Decodable, Equatable, Sendable, Identifiable {
     let name: String
     let isDir: Bool
@@ -32,9 +29,8 @@ struct FSEntry: Decodable, Equatable, Sendable, Identifiable {
     }
 }
 
-/// The `GET /api/fs/list` `200` body: the absolute resolved `root`, the relative
-/// `path` listed, the sorted `entries`, and a `truncated` flag set when the
-/// directory exceeded the server's 1000-entry cap.
+/// Normalized list result: canonical runtime root, UI-relative path, entries,
+/// and optional truncation metadata.
 struct FSListResult: Decodable, Equatable, Sendable {
     let root: String
     let path: String
@@ -64,7 +60,7 @@ struct FSListResult: Decodable, Equatable, Sendable {
     }
 }
 
-// MARK: - /api/fs/read
+// MARK: - Stock filesystem read adapter
 
 /// How the gateway classified the bytes it read.
 enum FSEncoding: String, Decodable, Sendable {
@@ -74,7 +70,7 @@ enum FSEncoding: String, Decodable, Sendable {
     case binary
 }
 
-/// The `GET /api/fs/read` `200` body. `content` is the file text for `utf-8`
+/// Normalized read result. `content` is the file text for `utf-8`
 /// and `nil` for `binary`. `truncated` is true when a large-but-text file was
 /// cut to the read cap (the server truncates rather than `413`-ing text).
 /// `dataURL` carries an optional `data:<mime>;base64,…` string the patched
@@ -90,8 +86,8 @@ struct FSReadResult: Decodable, Equatable, Sendable {
     let encoding: FSEncoding
     let content: String?
     let truncated: Bool
-    /// `data:<mime>;base64,…` — present when the server chose to inline the
-    /// file bytes as a data URL (image-optimised path). The viewer renders this
+    /// `data:<mime>;base64,…` — present after a stock `read-data-url` request.
+    /// The viewer renders this
     /// as an inline `<Image>` rather than falling back to "Binary file".
     let dataURL: String?
 
@@ -167,9 +163,8 @@ struct FSReadResult: Decodable, Equatable, Sendable {
 
 // MARK: - /api/fs/diff
 
-/// The `GET /api/fs/diff` `200` body: a working-tree-vs-HEAD diff for one
-/// sandboxed session-cwd path. Clean tracked files, missing paths, and non-git
-/// directories return an empty diff with `hasChanges == false`.
+/// Normalized stock `/api/git/file-diff` result. Clean tracked files, missing
+/// paths, and non-git directories return an empty diff.
 struct FSDiffResult: Decodable, Equatable, Sendable {
     let path: String
     let diff: String

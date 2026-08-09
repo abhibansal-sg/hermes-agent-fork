@@ -164,68 +164,18 @@ actor CacheStore {
         }
     }
 
-    /// Apply one server snapshot/delta and its opaque cursor indivisibly.
-    /// Repeated/older revisions are idempotent; equal-revision server upserts do
-    /// not overwrite a responding/failed overlay.
-    func applyPendingAttention(_ envelope: PendingAttentionEnvelope, scope: CacheScope) throws -> AttentionSnapshot {
+    /// A process restart loses the live gateway waiter that made a prompt
+    /// actionable. Stock Hermes has no durable pending-attention snapshot, so
+    /// restored rows must be presentation history only until a fresh WebSocket
+    /// request re-arms them.
+    func expireRestoredAttention(scope: CacheScope) throws -> AttentionSnapshot {
         try db.write { db in
-            let priorMeta = try Self.attentionMetadata(scope: scope, db: db)
-            let protected: [String: PersistedAttentionItem] = (envelope.reset
-                && (priorMeta == nil || priorMeta?.serverInstanceId == envelope.serverInstanceId))
-                ? Dictionary(uniqueKeysWithValues: try Self.attentionItems(scope: scope, db: db)
-                    .filter { $0.state == .responding || $0.state == .failedRetryable || $0.state.isTerminal }
-                    .map { ($0.id, $0) })
-                : [:]
-            if envelope.reset || priorMeta?.serverInstanceId != envelope.serverInstanceId {
-                try db.execute(
-                    sql: "DELETE FROM pending_attention_cache WHERE serverId=? AND profileId=?",
-                    arguments: [scope.serverId, scope.profileId]
-                )
+            let items = try Self.attentionItems(scope: scope, db: db)
+            for var item in items where item.state.contributesToPendingCount {
+                item.state = .expired
+                item.updatedAt = Date().timeIntervalSince1970
+                try Self.saveAttentionItem(item, scope: scope, db: db)
             }
-
-            var highWater = (priorMeta?.serverInstanceId == envelope.serverInstanceId)
-                ? (priorMeta?.revision ?? 0) : 0
-            for record in envelope.upserts {
-                highWater = max(highWater, record.revision)
-                if let local = protected[record.id], local.revision == 0 || local.revision >= record.revision {
-                    try Self.saveAttentionItem(local, scope: scope, db: db)
-                    continue
-                }
-                let incoming = PersistedAttentionItem(server: record)
-                if let existing = try Self.attentionItem(id: record.id, scope: scope, db: db) {
-                    guard record.revision >= existing.revision else { continue }
-                    if record.revision == existing.revision,
-                       existing.state == .responding || existing.state == .failedRetryable || existing.state.isTerminal {
-                        continue
-                    }
-                }
-                try Self.saveAttentionItem(incoming, scope: scope, db: db)
-            }
-
-            for tombstone in envelope.tombstones {
-                highWater = max(highWater, tombstone.revision)
-                guard var existing = try Self.attentionItem(id: tombstone.id, scope: scope, db: db),
-                      tombstone.revision >= existing.revision else { continue }
-                existing.revision = tombstone.revision
-                existing.state = tombstone.status == "expired" ? .expired : .resolvedElsewhere
-                existing.updatedAt = tombstone.deletedAt
-                try Self.saveAttentionItem(existing, scope: scope, db: db)
-            }
-
-            try db.execute(
-                sql: """
-                    INSERT INTO attention_reconciliation_meta
-                    (serverId,profileId,serverInstanceId,cursor,revision,updatedAt)
-                    VALUES (?,?,?,?,?,?)
-                    ON CONFLICT(serverId,profileId) DO UPDATE SET
-                      serverInstanceId=excluded.serverInstanceId,
-                      cursor=excluded.cursor,
-                      revision=excluded.revision,
-                      updatedAt=excluded.updatedAt
-                    """,
-                arguments: [scope.serverId, scope.profileId, envelope.serverInstanceId,
-                            envelope.cursor, highWater, Date().timeIntervalSince1970]
-            )
             return try Self.attentionSnapshot(scope: scope, db: db)
         }
     }
@@ -307,23 +257,8 @@ actor CacheStore {
         )
     }
 
-    private static func attentionMetadata(scope: CacheScope, db: Database) throws -> AttentionReconciliationMetadata? {
-        guard let row = try Row.fetchOne(
-            db,
-            sql: "SELECT serverInstanceId,cursor,revision,updatedAt FROM attention_reconciliation_meta WHERE serverId=? AND profileId=?",
-            arguments: [scope.serverId, scope.profileId]
-        ) else { return nil }
-        return AttentionReconciliationMetadata(
-            serverInstanceId: row["serverInstanceId"], cursor: row["cursor"],
-            revision: row["revision"], updatedAt: row["updatedAt"]
-        )
-    }
-
     private static func attentionSnapshot(scope: CacheScope, db: Database) throws -> AttentionSnapshot {
-        AttentionSnapshot(
-            items: try attentionItems(scope: scope, db: db),
-            metadata: try attentionMetadata(scope: scope, db: db)
-        )
+        AttentionSnapshot(items: try attentionItems(scope: scope, db: db))
     }
 
     func saveLastOpenedSession(_ identity: CacheIdentity, manifestScope: CacheScope) throws {

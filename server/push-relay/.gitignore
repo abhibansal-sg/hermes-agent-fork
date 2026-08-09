@@ -1,7 +1,0 @@
-.venv/
-.venv313/
-data/
-*.db
-.pytest_cache/
-__pycache__/
-*.pyc

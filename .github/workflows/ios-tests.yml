@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - "apps/ios/**"
+      - "scripts/ios-build.sh"
       - ".github/workflows/ios-tests.yml"
 
 permissions:
@@ -53,8 +54,7 @@ jobs:
       - name: Build and test (focused suites)
         run: |
           set -o pipefail
-          xcodebuild test \
-            -project apps/ios/HermesMobile.xcodeproj \
+          scripts/ios-build.sh test \
             -scheme HermesMobile \
             -destination "platform=iOS Simulator,name=${{ steps.dest.outputs.device }}" \
             -only-testing:HermesMobileTests \

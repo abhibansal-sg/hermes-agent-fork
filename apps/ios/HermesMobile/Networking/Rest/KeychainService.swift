@@ -113,6 +113,10 @@ enum KeychainService {
         guard let data = value.data(using: .utf8) else {
             throw KeychainError.encodingFailed
         }
+        try saveData(data, account: account)
+    }
+
+    private static func saveData(_ data: Data, account: String) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -143,6 +147,11 @@ enum KeychainService {
     }
 
     private static func loadValue(account: String) -> String? {
+        guard let data = loadData(account: account) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func loadData(account: String) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -152,12 +161,8 @@ enum KeychainService {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess,
-              let data = item as? Data,
-              let value = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-        return value
+        guard status == errSecSuccess, let data = item as? Data else { return nil }
+        return data
     }
 
     private static func deleteValue(account: String) {

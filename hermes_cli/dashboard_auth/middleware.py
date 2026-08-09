@@ -22,14 +22,16 @@ from typing import Awaitable, Callable
 from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from hermes_cli.dashboard_auth import list_session_providers
+from hermes_cli.dashboard_auth import (
+    list_interactive_providers,
+    list_session_providers,
+)
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
     ProviderError,
     RefreshExpiredError,
 )
-from hermes_cli.dashboard_auth.call_guard import guarded_call_next, scope_is_http
 from hermes_cli.dashboard_auth.cookies import (
     clear_sso_attempt_cookie,
     read_session_cookies,
@@ -50,10 +52,14 @@ _log = logging.getLogger(__name__)
 _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/auth/login",
     "/auth/callback",
+    "/auth/native/authorize",
+    "/auth/native/token",
+    "/auth/native/refresh",
     "/auth/password-login",
     "/auth/logout",
     "/login",
     "/api/auth/providers",
+    "/api/mcp/oauth/callback/",
     "/assets/",
     "/favicon.ico",
     "/ds-assets/",
@@ -88,27 +94,6 @@ def _client_ip(request: Request) -> str:
     if fwd:
         return fwd.split(",")[0].strip()
     return request.client.host if request.client else ""
-
-
-def _device_token_auth(request: Request) -> bool:
-    """Authenticate an API request through a registered rich-token matcher."""
-    if not request.url.path.startswith("/api/"):
-        return False
-
-    session_header = request.headers.get("X-Hermes-Session-Token", "")
-    auth = request.headers.get("authorization", "")
-    candidates = [session_header] if session_header else []
-    if auth.lower().startswith("bearer "):
-        candidates.append(auth.split(" ", 1)[1])
-
-    from hermes_cli.dashboard_auth.token_auth import match_token
-
-    for candidate in candidates:
-        identity = match_token(candidate)
-        if identity is not None:
-            request.state.device = identity
-            return True
-    return False
 
 
 def _ordered_session_providers(
@@ -221,9 +206,10 @@ def _auto_sso_response(request: Request) -> Response | None:
         clear_sso_attempt_cookie(resp, prefix=prefix_from_request(request))
         return resp
 
-    # list_session_providers() already filters on supports_session=True, so
-    # token-only credentials (drain/service providers) are never candidates.
-    providers = list_session_providers()
+    # Only providers that expose a human login belong in auto-SSO. Native
+    # credential providers remain in the verification/refresh stack but must
+    # never redirect a browser into a login flow they do not implement.
+    providers = list_interactive_providers()
     if len(providers) != 1:
         # Zero → nothing to redirect to. Two+ → user must choose at /login.
         return None
@@ -296,6 +282,48 @@ def _safe_next_target(request: Request) -> str:
     return quote(target, safe="")
 
 
+def _extract_bearer(request: Request) -> str:
+    """Return the ``Authorization: Bearer <token>`` value, or ""."""
+    auth = request.headers.get("authorization", "")
+    parts = auth.split(" ", 1)
+    if len(parts) == 2 and parts[0].strip().lower() == "bearer":
+        return parts[1].strip()
+    return ""
+
+
+def _verify_bearer(request: Request, *, access_token: str):
+    """Verify a native-app bearer access token via the session-provider stack.
+
+    Returns the :class:`Session` on success, or ``None`` if no provider
+    recognises the token (expired/invalid/unknown). Mirrors the cookie path's
+    verify loop, including the "one provider unreachable ⇒ don't force
+    re-login" semantics: a transient IDP outage returns a 503 rather than a
+    401, so the desktop retries instead of dropping the user to full re-login.
+    Unlike the cookie path there is no server-side refresh — the desktop owns
+    its refresh token and rotates via ``/auth/native/refresh``.
+    """
+    unreachable_provider: str | None = None
+    for provider in list_session_providers():
+        try:
+            session = provider.verify_session(access_token=access_token)
+        except ProviderError as e:
+            _log.warning(
+                "dashboard-auth: provider %r unreachable during bearer verify: %s",
+                provider.name, e,
+            )
+            if unreachable_provider is None:
+                unreachable_provider = provider.name
+            continue
+        if session is not None:
+            return session
+    if unreachable_provider is not None:
+        # Signal transient outage to the caller via a sentinel exception the
+        # middleware turns into 503. Raising keeps the "don't logout on a
+        # flaky IDP" contract identical to the cookie path.
+        raise ProviderError(unreachable_provider)
+    return None
+
+
 async def gated_auth_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
@@ -304,43 +332,49 @@ async def gated_auth_middleware(
 
     No-op pass-through in loopback mode so the legacy auth_middleware can
     handle those binds via ``_SESSION_TOKEN``.
-
-    Hardened per the daily-driver spec (N7): WebSocket scopes never enter
-    the gate (Starlette's BaseHTTPMiddleware routes non-``http`` scopes
-    around the dispatch; :func:`scope_is_http` pins that exemption here),
-    and every ``call_next`` site runs through :func:`guarded_call_next` so
-    a downstream failure becomes a 500 JSONResponse instead of escaping the
-    middleware stack as an ExceptionGroup and killing the ASGI worker. The
-    401 / 503 / redirect verdicts computed before ``call_next`` are
-    unchanged.
     """
-    if not scope_is_http(request):
-        return await call_next(request)
-
     if not getattr(request.app.state, "auth_required", False):
-        return await guarded_call_next(
-            request, call_next, gate="gated_auth_middleware"
-        )
+        return await call_next(request)
 
     # A request already authenticated by the token-auth seam (a service caller
     # on a registered token route) carries ``token_authenticated`` — it is NOT
     # a cookie session and must not be bounced to /login. Pass it through; the
     # seam already attached ``request.state.token_principal``.
     if getattr(request.state, "token_authenticated", False):
-        return await guarded_call_next(
-            request, call_next, gate="gated_auth_middleware"
-        )
+        return await call_next(request)
 
     path = request.url.path
     if _path_is_public(path):
-        return await guarded_call_next(
-            request, call_next, gate="gated_auth_middleware"
-        )
+        return await call_next(request)
 
-    if _device_token_auth(request):
-        return await guarded_call_next(
-            request, call_next, gate="gated_auth_middleware"
-        )
+    # RFC 8252 native-app bearer path (goal: no session cookies). The desktop
+    # authenticates REST with ``Authorization: Bearer <access_token>`` — the
+    # SAME provider-minted access token the cookie flow stores in
+    # ``hermes_session_at``. Verify it with the identical ``verify_session``
+    # provider stack and attach the Session; on success we're done, with no
+    # cookie set or read. A missing/expired/invalid bearer falls through to
+    # the cookie path (a request may legitimately carry neither). Token
+    # rotation for this path is the desktop's job via /auth/native/refresh —
+    # the gate never sets a cookie here, so the transparent cookie-rotation
+    # below must not run for a bearer caller.
+    bearer = _extract_bearer(request)
+    if bearer:
+        try:
+            bearer_session = _verify_bearer(request, access_token=bearer)
+        except ProviderError as e:
+            # At least one provider's IDP/JWKS was unreachable and none
+            # verified the token — transient outage, not bad credentials.
+            return JSONResponse(
+                {"detail": f"Auth provider {str(e)!r} unreachable"},
+                status_code=503,
+            )
+        if bearer_session is not None:
+            request.state.session = bearer_session
+            return await call_next(request)
+        # A bearer was presented but didn't verify (expired/invalid/unknown).
+        # Return the structured 401 so the desktop knows to refresh or
+        # re-login, rather than falling through to the cookie/login redirect.
+        return _unauth_response(request, reason="invalid_or_expired_session")
 
     at, _rt = read_session_cookies(request)
     provider_hint = read_session_provider(request)
@@ -440,13 +474,7 @@ async def gated_auth_middleware(
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
             request.state.session = new_session
-            # Guarded: a downstream crash must surface as a 500 JSONResponse,
-            # NOT escape the middleware stack. The rotated cookies are still
-            # persisted below even on the 500 fallback — skipping them would
-            # replay a rotated refresh token and trip reuse detection.
-            response = await guarded_call_next(
-                request, call_next, gate="gated_auth_middleware"
-            )
+            response = await call_next(request)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
             # back is mandatory: a stale RT cookie would replay a rotated
@@ -493,9 +521,7 @@ async def gated_auth_middleware(
         return response
 
     request.state.session = session
-    response = await guarded_call_next(
-        request, call_next, gate="gated_auth_middleware"
-    )
+    response = await call_next(request)
     if not provider_hint and session.provider:
         from hermes_cli.dashboard_auth.cookies import detect_https
         from hermes_cli.dashboard_auth.prefix import prefix_from_request

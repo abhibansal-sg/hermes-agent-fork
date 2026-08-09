@@ -1,1 +1,0 @@
-"""Hermes Mobile push relay."""

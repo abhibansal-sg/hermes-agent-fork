@@ -29,11 +29,34 @@ struct TranscriptPageFetch: Sendable {
     }
 }
 
+/// Test-injectable target-window projection used by jump-to-message UI tests.
+/// Production target resolution stays on stock Hermes search/session paging.
 struct TranscriptAroundFetch: Sendable {
     let messages: [StoredMessage]
     let oldestId: Int?
     let hasMoreBefore: Bool
     let containsTarget: Bool
+}
+
+/// Stock Hermes recent transcript window. The UI keeps only this bounded page;
+/// canonical history remains in Hermes' session database.
+func fetchTranscriptPage(
+    rest: RestClient,
+    sessionId: String,
+    limit: Int,
+    before: Int? = nil,
+    shape: String? = nil
+) async -> TranscriptPageFetch? {
+    _ = before
+    _ = shape
+    return await fetchStockTranscriptPage(
+        rest: rest,
+        sessionId: sessionId,
+        profile: nil,
+        limit: limit,
+        offset: 0,
+        latest: true
+    )
 }
 
 /// Stock gateway transcript page shared by open, backfill, and load-earlier.
@@ -42,7 +65,8 @@ func fetchStockTranscriptPage(
     sessionId: String,
     profile: String?,
     limit: Int,
-    offset: Int
+    offset: Int,
+    latest: Bool = false
 ) async -> TranscriptPageFetch? {
     let encodedId = sessionId.addingPercentEncoding(
         withAllowedCharacters: .urlPathAllowed
@@ -51,6 +75,9 @@ func fetchStockTranscriptPage(
         URLQueryItem(name: "limit", value: String(max(1, limit))),
         URLQueryItem(name: "offset", value: String(max(0, offset))),
     ]
+    if latest {
+        query.append(URLQueryItem(name: "order", value: "latest"))
+    }
     if let profile, !profile.isEmpty {
         query.append(URLQueryItem(name: "profile", value: profile))
     }
@@ -69,7 +96,9 @@ func fetchStockTranscriptPage(
         return TranscriptPageFetch(
             messages: messages,
             oldestId: messages.first?.wireId,
-            hasMoreBefore: pageOffset > 0 && !messages.isEmpty,
+            hasMoreBefore: latest
+                ? messages.count >= max(1, limit)
+                : pageOffset > 0 && !messages.isEmpty,
             sessionId: root["session_id"]?.stringValue,
             offset: pageOffset
         )
@@ -243,43 +272,9 @@ func fetchBoundedStockTranscript(
     return Array(all[start...])
 }
 
-/// Plugin-only target-centered transcript fetch for jump/search/artifact opens.
-/// Returns the target ± radius without forcing a full transcript load.
-func fetchTranscriptAround(
-    rest: RestClient,
-    sessionId: String,
-    around messageId: Int,
-    radius: Int
-) async -> TranscriptAroundFetch? {
-    guard rest.pathStyle == .plugin else { return nil }
-    let encodedId = sessionId.addingPercentEncoding(
-        withAllowedCharacters: .urlPathAllowed
-    ) ?? sessionId
-    let path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages/around"
-        + "?around=\(messageId)&radius=\(max(0, radius))"
-    do {
-        let data = try await rest.get(path: path)
-        let root = try rest.decodeJSONValue(from: data, context: "messagesAround")
-        guard let array = root["messages"]?.arrayValue else { return nil }
-        let page = root["page"]
-        return TranscriptAroundFetch(
-            messages: array.compactMap(StoredMessage.init(json:)),
-            oldestId: page?["oldest_id"]?.intValue,
-            hasMoreBefore: page?["has_more_before"]?.boolValue ?? false,
-            containsTarget: page?["contains_target"]?.boolValue ?? false
-        )
-    } catch {
-        return nil
-    }
-}
-
 /// Subsystem logger for transcript reconciliation. Backfill failures used to be
 /// swallowed by a bare `catch`; they now surface here and in DEBUG diagnostics.
 private let chatLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "ChatStore")
-
-private struct GateResponseDeliveryError: LocalizedError {
-    var errorDescription: String? { "Couldn't send that response. Try again." }
-}
 
 #if DEBUG
 /// DEBUG-only record of a single `isStreaming` write. Every write stamps its
@@ -2643,12 +2638,14 @@ final class ChatStore {
         let submissionSelection = sessions?.selectionGeneration
         let priorBindingMode: SessionBindingMode?
         if presentsInActiveChat {
+            priorBindingMode = try await sessions?.beginPromptSubmission(
+                runtimeID: runtimeSessionID
+            )
             prepareOutboxSubmission(job: job, remotePaths: remotePaths)
             pendingReconnectReconcileID = nil
             beginLocalTurn()
             setStreaming(true, reason: "outbox.submit")
             lastError = nil
-            priorBindingMode = sessions?.beginPromptSubmission(runtimeID: runtimeSessionID)
         } else {
             priorBindingMode = nil
         }
@@ -2684,7 +2681,7 @@ final class ChatStore {
                 }
                 submittedRuntimeID = recoveredRuntimeID
                 if presentsInActiveChat {
-                    _ = sessions?.beginPromptSubmission(runtimeID: recoveredRuntimeID)
+                    _ = try await sessions?.beginPromptSubmission(runtimeID: recoveredRuntimeID)
                 }
                 receipt = try await issueSubmit(runtimeID: recoveredRuntimeID)
             }
@@ -3162,8 +3159,7 @@ final class ChatStore {
 
     private func sendGateResponse(
         method: String,
-        params: JSONValue,
-        overREST: (RestClient) async -> RestClient.ApprovalRespondOutcome
+        params: JSONValue
     ) async throws {
         #if DEBUG
         if let gateResponseRPC {
@@ -3171,8 +3167,8 @@ final class ChatStore {
             return
         }
         #endif
-        guard let rest = connection?.rest else { throw GatewayError.notConnected }
-        guard await overREST(rest) != .failed else { throw GateResponseDeliveryError() }
+        guard let client else { throw GatewayError.notConnected }
+        _ = try await client.requestRaw(method, params: params)
     }
 
     /// Answer a pending approval (`approval.respond`) and clear it after ACK.
@@ -3191,12 +3187,7 @@ final class ChatStore {
                     "session_id": .string(sessionId),
                     "choice": .string(choice),
                     "all": .bool(all),
-                ]),
-                overREST: { rest in
-                    await rest.respondToApproval(
-                        sessionId: sessionId, approve: approve, all: all
-                    )
-                }
+                ])
             )
             if pendingApproval == pending {
                 pendingApproval = nil
@@ -3230,14 +3221,7 @@ final class ChatStore {
         do {
             try await sendGateResponse(
                 method: "clarify.respond",
-                params: .object(params),
-                overREST: { rest in
-                    await rest.respondToClarification(
-                        sessionId: sessionId,
-                        requestId: requestId,
-                        answer: answer
-                    )
-                }
+                params: .object(params)
             )
             // Echo only while the same gate is still visible in its owning
             // transcript. If the user switched during the await, consuming the
@@ -3280,13 +3264,20 @@ final class ChatStore {
         let cwd = WorkingDirectory.absolutePath(root: root, relative: relativePath)
         lastError = nil
         do {
-            _ = try await client.requestRaw(
+            let info = try await client.requestRaw(
                 "session.cwd.set",
                 params: .object([
                     "session_id": .string(sessionId),
                     "cwd": .string(cwd),
                 ])
             )
+            // A session switch may complete while the RPC is in flight. Never
+            // let the old runtime's returned cwd become the new chat's state.
+            guard activeSessionId == sessionId else { return false }
+            // The RPC result is the same canonical `session.info` payload the
+            // gateway broadcasts. Apply it immediately so stock filesystem
+            // reads never depend on event-delivery timing.
+            connection?.applySessionInfo(info)
             return true
         } catch {
             lastError = WorkingDirectory.mapSetError(error).message
@@ -4416,18 +4407,11 @@ final class ChatStore {
         }
     }
 
-    /// The injected target-centered jump fetch, or the plugin REST route.
+    /// Target-centered loading is test-injectable only. Production uses stock
+    /// search/session paging and never invents a second transcript endpoint.
     private var resolvedTranscriptAroundFetch: ((String, Int, Int) async -> TranscriptAroundFetch?)? {
         if let transcriptAroundFetch { return transcriptAroundFetch }
-        guard let rest = connection?.rest else { return nil }
-        return { sessionId, messageId, radius in
-            await fetchTranscriptAround(
-                rest: rest,
-                sessionId: sessionId,
-                around: messageId,
-                radius: radius
-            )
-        }
+        return nil
     }
 
     /// The injected `transcriptPageFetch` test seam, or the default that

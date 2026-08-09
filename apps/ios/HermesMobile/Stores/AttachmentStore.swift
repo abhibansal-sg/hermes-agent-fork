@@ -2,8 +2,9 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-/// Owns the composer's pending image attachments and drives the two-step
-/// upload → attach flow (`POST /api/upload` then the `image.attach` RPC).
+/// Owns the composer's pending image attachments and sends them through stock
+/// Hermes `image.attach_bytes`. The gateway remains the sole attachment owner;
+/// no plugin upload or duplicate file store participates in the write path.
 ///
 /// Any picked image — including HEIC from the photo picker, which the gateway
 /// rejects — is normalised to JPEG (≤ 0.85 quality, longest side ≤ 2048px) the
@@ -25,7 +26,7 @@ final class AttachmentStore {
         /// A small preview for the composer strip (may be nil if decode failed,
         /// though `add(data:)` rejects images it can't decode).
         var thumbnail: UIImage?
-        /// Normalised JPEG bytes ready for `POST /api/upload`.
+        /// Normalised JPEG bytes ready for `image.attach_bytes`.
         let jpegData: Data
         var state: State = .ready
     }
@@ -152,10 +153,8 @@ final class AttachmentStore {
 
     // MARK: - Non-image file attachments (W25 files-phase-1)
     //
-    // Images ride the multipart `POST /api/upload` → `image.attach` path above,
-    // which the gateway restricts to a small image-extension whitelist. Arbitrary
-    // files (PDF, CSV, source, archives, …) are 415'd by that route, so they take
-    // the gateway's `file.attach` RPC instead: the bytes are base64-inlined as a
+    // Images ride stock `image.attach_bytes`. Arbitrary files (PDF, CSV, source,
+    // archives, …) take the gateway's `file.attach` RPC instead: the bytes are base64-inlined as a
     // `data:<mime>;base64,…` payload, the gateway materialises the file inside the
     // session workspace, and it returns a workspace-relative `@file:` reference
     // that the composer appends to the prompt (the same ref surface the file
@@ -207,6 +206,11 @@ final class AttachmentStore {
     /// `image.attach_bytes` path).
     nonisolated static func fileDataURL(_ data: Data, mimeType: String) -> String {
         "data:\(mimeType);base64,\(data.base64EncodedString())"
+    }
+
+    /// Raw base64 payload expected by stock `image.attach_bytes`.
+    nonisolated static func imageContentBase64(_ data: Data) -> String {
+        data.base64EncodedString()
     }
 
     /// Read a picked file's bytes for attachment, enforcing ``maxFileAttachmentBytes``
@@ -318,10 +322,10 @@ final class AttachmentStore {
 
     // MARK: - Upload + attach
 
-    /// Upload every pending attachment, bind it to the session, and return the
-    /// server-local upload paths that were attached in send order.
+    /// Attach every pending image through stock Hermes and return the canonical
+    /// gateway-local image paths in send order.
     ///
-    /// For each pending image: `rest.upload` → `image.attach {session_id, path}`.
+    /// For each pending image: `image.attach_bytes {session_id, content_base64}`.
     /// A successfully attached image is removed from `pending` as it completes,
     /// so a retry after a mid-batch failure only re-sends what's left. Throws
     /// with a readable message on the first failure (the offending attachment is
@@ -331,9 +335,6 @@ final class AttachmentStore {
     func uploadAndAttach(sessionId: String?, connection: ConnectionStore) async throws -> [String] {
         let trimmedSession = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmedSession.isEmpty else {
-            throw AttachmentError.notConfigured
-        }
-        guard let rest = connection.rest else {
             throw AttachmentError.notConfigured
         }
         let client = connection.client
@@ -347,20 +348,25 @@ final class AttachmentStore {
             pending[index].state = .uploading
 
             do {
-                let upload = try await rest.upload(
-                    data: jpeg,
-                    filename: "\(UUID().uuidString).jpg",
-                    mimeType: "image/jpeg"
-                )
-                _ = try await client.requestRaw(
-                    "image.attach",
+                let contentBase64 = await Task.detached(priority: .userInitiated) {
+                    Self.imageContentBase64(jpeg)
+                }.value
+                let result = try await client.requestRaw(
+                    "image.attach_bytes",
                     params: .object([
                         "session_id": .string(trimmedSession),
-                        "path": .string(upload.path),
+                        "content_base64": .string(contentBase64),
+                        "filename": .string("\(id.uuidString).jpg"),
                     ]),
-                    timeout: .seconds(30)
+                    timeout: .seconds(60)
                 )
-                attachedPaths.append(upload.path)
+                guard let attachedPath = result["path"]?.stringValue,
+                      !attachedPath.isEmpty else {
+                    throw AttachmentError.failed(
+                        "The gateway did not return an attached image path."
+                    )
+                }
+                attachedPaths.append(attachedPath)
                 // Success: drop it so a partial-batch retry doesn't double-attach.
                 pending.removeAll { $0.id == id }
             } catch {
@@ -368,6 +374,9 @@ final class AttachmentStore {
                     ?? error.localizedDescription
                 if let failIndex = pending.firstIndex(where: { $0.id == id }) {
                     pending[failIndex].state = .failed(message)
+                }
+                if let attachmentError = error as? AttachmentError {
+                    throw attachmentError
                 }
                 throw AttachmentError.failed(message)
             }
