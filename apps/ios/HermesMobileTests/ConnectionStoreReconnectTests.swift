@@ -87,8 +87,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         connection._restOverrideForTesting = RestClient(
             baseURL: URL(string: "https://stub.invalid")!,
             token: "stub",
-            session: URLSession(configuration: config),
-            pathStyle: .legacy
+            session: URLSession(configuration: config)
         )
         return (connection, sessions, chat)
     }

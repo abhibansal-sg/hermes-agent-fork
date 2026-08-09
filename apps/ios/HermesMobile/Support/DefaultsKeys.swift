@@ -177,8 +177,8 @@ enum DefaultsKeys {
         defaults.object(forKey: key) == nil ? true : defaults.bool(forKey: key)
     }
 
-    /// The wire `events` list for `/api/push/register`, built from the five
-    /// toggles. Order is stable (`approval`, `clarify`, `turn_complete`,
+    /// Stable enabled-event list for local alerts and a future thin APNs
+    /// provider. Order is stable (`approval`, `clarify`, `turn_complete`,
     /// `turn_error`, `background_done`) so the body is deterministic for tests
     /// and access-log assertions.
     static func pushEventList(_ defaults: UserDefaults = .standard) -> [String] {

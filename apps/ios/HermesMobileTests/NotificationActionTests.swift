@@ -636,11 +636,3 @@ final class PushRegistrarEnvDedupeTests: XCTestCase {
         )
     }
 }
-
-final class LiveActivityOutcomeTests: XCTestCase {
-    func testLiveActivityOutcomeCasesAreDistinct() {
-        XCTAssertNotEqual(RestClient.LiveActivityTokenOutcome.success, .notDeployed)
-        XCTAssertNotEqual(RestClient.LiveActivityTokenOutcome.success, .failed)
-        XCTAssertNotEqual(RestClient.LiveActivityTokenOutcome.notDeployed, .failed)
-    }
-}

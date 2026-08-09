@@ -94,52 +94,6 @@ final class SettingsL07Tests: XCTestCase {
         )
     }
 
-    // MARK: - ApprovalAuditView load-more boundary
-
-    /// The `hasMore` flag should be `true` iff the fetched count equals the
-    /// page limit — the signal that there are probably more records on the server.
-    func testHasMoreTrueWhenCountEqualsPageLimit() {
-        XCTAssertTrue(
-            hasMoreAfterFetch(count: 50, limit: 50),
-            "hasMore should be true when count == limit (truncation possible)"
-        )
-    }
-
-    func testHasMoreFalseWhenCountBelowPageLimit() {
-        XCTAssertFalse(
-            hasMoreAfterFetch(count: 49, limit: 50),
-            "hasMore should be false when count < limit (full result returned)"
-        )
-    }
-
-    func testHasMoreFalseWhenCountIsZero() {
-        XCTAssertFalse(
-            hasMoreAfterFetch(count: 0, limit: 50),
-            "hasMore must be false for an empty result"
-        )
-    }
-
-    func testHasMoreTrueAtMaxLimit() {
-        XCTAssertTrue(
-            hasMoreAfterFetch(count: 500, limit: 500),
-            "hasMore should be true when count == maxLimit"
-        )
-    }
-
-    /// Pure helper: mirrors the `hasMore` logic from ``ApprovalAuditView``.
-    private func hasMoreAfterFetch(count: Int, limit: Int) -> Bool {
-        count >= limit
-    }
-
-    // MARK: - DevicesView current-device marking (regression pin)
-
-    func testIsCurrentDeviceMatchesRecordedId() {
-        XCTAssertTrue(DevicesView.isCurrentDevice("dev_1", recordedDeviceId: "dev_1"))
-        XCTAssertFalse(DevicesView.isCurrentDevice("dev_1", recordedDeviceId: "dev_2"))
-        XCTAssertFalse(DevicesView.isCurrentDevice("dev_1", recordedDeviceId: nil))
-        XCTAssertFalse(DevicesView.isCurrentDevice("dev_1", recordedDeviceId: ""))
-    }
-
     // MARK: - voiceAutoTTS (STR-533 default-OFF ambient read-aloud toggle)
 
     func testVoiceAutoTTSDefaultsOff() {

@@ -20,7 +20,7 @@ final class RestClientLiveTests: XCTestCase {
         )
         TranscriptPageStubProtocol.requestedPath = nil
         TranscriptPageStubProtocol.requestedQuery = nil
-        let rest = transcriptPageStubClient(pathStyle: .plugin)
+        let rest = transcriptPageStubClient()
 
         let page = await fetchTranscriptPage(rest: rest, sessionId: "s 1", limit: 50, before: 42)
 
@@ -37,7 +37,7 @@ final class RestClientLiveTests: XCTestCase {
             200
         )
         TranscriptPageStubProtocol.requestedPath = nil
-        let rest = transcriptPageStubClient(pathStyle: .legacy)
+        let rest = transcriptPageStubClient()
 
         let page = await fetchTranscriptPage(rest: rest, sessionId: "s1", limit: 50)
 
@@ -52,7 +52,7 @@ final class RestClientLiveTests: XCTestCase {
         )
         TranscriptPageStubProtocol.requestedPath = nil
         TranscriptPageStubProtocol.requestedQuery = nil
-        let rest = transcriptPageStubClient(pathStyle: .plugin)
+        let rest = transcriptPageStubClient()
 
         let page = await fetchStockTranscriptPage(
             rest: rest,
@@ -131,14 +131,13 @@ final class RestClientLiveTests: XCTestCase {
 
     // MARK: - Test fixtures
 
-    private func transcriptPageStubClient(pathStyle: APIPathStyle) -> RestClient {
+    private func transcriptPageStubClient() -> RestClient {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [TranscriptPageStubProtocol.self]
         return RestClient(
             baseURL: URL(string: "http://127.0.0.1:9119")!,
             token: "test-token",
-            session: URLSession(configuration: config),
-            pathStyle: pathStyle
+            session: URLSession(configuration: config)
         )
     }
 }

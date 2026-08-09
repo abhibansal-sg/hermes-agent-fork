@@ -480,3 +480,27 @@ Client verification evidence:
 - Existing session-switch and gate-identity fences remain in place after each RPC await.
   The complete Swift 6 application and unit-test targets build for testing through the safe
   wrapper.
+
+## H6f thin-edge and legacy plugin cleanup result
+
+- Removed the legacy mobile path-family resolver and mount probe. `RestClient` now speaks
+  stock Hermes routes directly; the capability cache contains only stock filesystem/profile
+  probes and passively observed stock event features.
+- Removed plugin-owned device issuance/list/revocation, foreground-device tracking, approval
+  audit, debug-share, custom-provider mutation, push registration, and Live Activity token
+  routes together with their mounted iOS panels and obsolete tests. No replacement device,
+  audit, debug-bundle, push-registry, or custom-provider authority was introduced.
+- Notifications remain on-device, driven by canonical live WebSocket events and the user's
+  existing event filters. Live Activities remain local ActivityKit presentation. Neither
+  claims remote delivery authority; optional remote alerts/actions are deferred to the
+  approved thin APNs provider.
+- Removed plugin pending-attention delta/tombstone/cursor reconciliation models. The retained
+  GRDB prompt rows are bounded presentation cache only, and every restored actionable row is
+  expired before display unless a fresh live Hermes request re-arms it.
+- Production iOS now has exactly two explicit mobile-plugin paths: native provider bootstrap
+  exchange (the irreducible credential provider) and a documented read-only legacy attachment
+  fallback. All current writes, live actions, transcript/search/file state, provider/toolset
+  settings, and workflow ordering use stock Hermes authority.
+- The complete Swift 6 application and unit-test targets build for testing through the safe
+  wrapper after project regeneration. Runtime simulator execution remains blocked by the
+  host CoreSimulator `ENOMEM` condition recorded above.

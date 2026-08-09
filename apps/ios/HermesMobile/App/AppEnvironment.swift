@@ -249,10 +249,6 @@ final class AppEnvironment {
             }
             var patch = WidgetSnapshotWriter.Patch()
             patch.pendingAttentionCount = .set(snapshot.pendingCount)
-            if let metadata = snapshot.metadata {
-                patch.serverRevision = .set(String(metadata.revision))
-                patch.fetchedAt = .set(Date(timeIntervalSince1970: metadata.updatedAt))
-            }
             WidgetSnapshotWriter.write(patch)
         }
         // ConnectionStore's event router also fans approval/clarify/complete to
@@ -316,7 +312,7 @@ final class AppEnvironment {
         chatStore.onTurnStart = { [weak sessionStore] in
             let title = sessionStore?.activeSummary?.displayTitle ?? "Hermes"
             // Pass the runtime session id so the LA push-token registration can
-            // key the gateway's /api/push/live-activity registry by session (A3).
+            // key the on-device Live Activity by session.
             LiveActivityManager.shared.start(
                 sessionTitle: title,
                 sessionId: sessionStore?.activeRuntimeId

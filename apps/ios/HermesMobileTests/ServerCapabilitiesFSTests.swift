@@ -2,7 +2,7 @@ import XCTest
 @testable import HermesMobile
 
 /// Capability-matrix coverage: filesystem and profiles are stock probes;
-/// plugin mount owns only the remaining legacy upload/device features.
+/// broad mobile-plugin capabilities stay unavailable without a probe.
 @MainActor
 final class ServerCapabilitiesFSTests: XCTestCase {
 
@@ -47,15 +47,11 @@ final class ServerCapabilitiesFSTests: XCTestCase {
 
         await caps.probe(serverURL: "http://gateway.test", rest: rest, force: true)
 
-        XCTAssertEqual(caps.pluginMount, .unavailable)
-        XCTAssertEqual(caps.upload, .unavailable)
         XCTAssertEqual(caps.fs, .available)
-        XCTAssertEqual(caps.devices, .unavailable)
         XCTAssertEqual(caps.profiles, .unavailable)
         XCTAssertEqual(
             Set(CapabilityMatrixProtocol.paths),
             [
-                "/api/plugins/hermes-mobile/devices",
                 "/api/fs/default-cwd",
                 "/api/profiles/sessions",
             ]
@@ -84,10 +80,7 @@ private final class CapabilityMatrixProtocol: URLProtocol, @unchecked Sendable {
 
         let status: Int
         let body: String
-        if path == "/api/plugins/hermes-mobile/devices" {
-            status = 404
-            body = #"{"detail":"not found"}"#
-        } else if path == "/api/fs/default-cwd" {
+        if path == "/api/fs/default-cwd" {
             status = 200
             body = #"{"cwd":"/workspace","branch":"main"}"#
         } else {

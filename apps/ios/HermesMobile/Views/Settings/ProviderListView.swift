@@ -617,12 +617,8 @@ struct CustomProviderAPIModeEditState: Equatable {
 }
 
 /// Register a custom OpenAI- or Anthropic-compatible provider (Tier B): name,
-/// base_url, api_mode picker, and a key. The entered key is held in `@State`
-/// only until Save, which writes it to the Keychain transiently, POSTs it once
-/// via ``RestClient/addCustomProvider(name:baseURL:apiMode:apiKey:)``, then
-/// deletes the Keychain copy. On 200 with a definitive provider validation
-/// reject, the sheet stays open and shows the provider's detail; otherwise the
-/// callback fires with the new provider row and the view dismisses.
+/// base_url, api_mode picker, and a key. The form is currently read-only at save:
+/// Hermes Desktop owns the required stock custom-provider catalog workflow.
 ///
 /// Presented as a sheet (it's a create form, not a list push) — mirrors the
 /// ManualTokenPromptView sheet presentation. Cancel simply dismisses (no state
@@ -634,8 +630,7 @@ struct CustomProviderView: View {
     /// ABH-257: when non-nil, the form opens in EDIT/ROTATE mode — name is LOCKED
     /// (read-only), base_url + api_mode are pre-filled from the existing row, and
     /// the api_key field is blank (the user re-enters it to rotate). When nil,
-    /// the form is a bare create (the original flow). Save POSTs to the same
-    /// `/providers/custom` upsert endpoint either way (the server upserts by name).
+    /// the form is a bare create (the original flow).
     let existing: ProviderRow?
 
     @Environment(\.hermesTheme) private var theme

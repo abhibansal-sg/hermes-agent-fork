@@ -47,8 +47,6 @@ final class BatchGTests: XCTestCase {
         await cold.probe(serverURL: url, rest: rest, force: true)
         XCTAssertNotEqual(cold.fs, .available,
                           "a forced re-probe must not resurrect the pre-restart snapshot")
-        XCTAssertNotEqual(cold.upload, .available)
-
         // Judge round: the entirely-INCONCLUSIVE forced probe must not have
         // poisoned the disk cache with all-unknowns — a later unforced probe
         // (fresh launch) still restores the last CONCLUSIVE snapshot.

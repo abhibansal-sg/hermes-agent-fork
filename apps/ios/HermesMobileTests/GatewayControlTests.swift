@@ -225,8 +225,7 @@ final class GatewayControlTests: XCTestCase {
         return RestClient(
             baseURL: URL(string: "http://127.0.0.1:9119")!,
             token: "test-token",
-            session: URLSession(configuration: config),
-            pathStyle: .legacy
+            session: URLSession(configuration: config)
         )
     }
 }

@@ -30,11 +30,10 @@ extension RestClient {
     /// persisted paths are outside stock `/api/media` roots. No new writes use
     /// this endpoint; it can be removed after the supported-client migration window.
     func attachmentData(name: String) async throws -> Data {
-        guard pathStyle == .plugin else {
-            throw RestError.badStatus(404, body: "plugin path style not active")
-        }
         let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
-        return try await get(path: "\(mobileAPIPrefix)/attachments/\(encodedName)")
+        return try await get(
+            path: "/api/plugins/hermes-mobile/attachments/\(encodedName)"
+        )
     }
 
 }

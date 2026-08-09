@@ -5,10 +5,8 @@ import XCTest
 ///
 /// Pins the five ``RestClient`` webhook methods against the stock gateway
 /// contract (`hermes_cli/web_server.py`):
-///   1. every call site hangs off ABSOLUTE `/api/webhooks…` with the right HTTP
-///      method — and, crucially, is INDEPENDENT of the client's ``APIPathStyle``
-///      (these are stock routes, not the plugin mount, so `.plugin` must NOT
-///      rewrite them under `/api/plugins/hermes-mobile`),
+///   1. every call site hangs off absolute `/api/webhooks…` with the right HTTP
+///      method,
 ///   2. the wire shapes decode into ``WebhookRoute`` / ``WebhooksListResult`` /
 ///      ``WebhookEnableResult`` with the server's defaults (absent `enabled` →
 ///      `true`, absent `deliver` → `"log"`, redacted `secret_set`),
@@ -56,15 +54,14 @@ final class RestClientWebhooksTests: XCTestCase {
         override func stopLoading() {}
     }
 
-    private func makeClient(style: APIPathStyle = .legacy, script: [(Data, Int)]) -> RestClient {
+    private func makeClient(script: [(Data, Int)]) -> RestClient {
         RecordingProtocol.reset(script: script)
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [RecordingProtocol.self]
         return RestClient(
             baseURL: URL(string: "https://gw.example:9119")!,
             token: "tok",
-            session: URLSession(configuration: config),
-            pathStyle: style
+            session: URLSession(configuration: config)
         )
     }
 
@@ -87,28 +84,28 @@ final class RestClientWebhooksTests: XCTestCase {
 
         // Assert BOTH families resolve to the SAME absolute /api/webhooks paths —
         // the stock-route posture (never rewritten under the plugin mount).
-        for style in [APIPathStyle.legacy, .plugin] {
-            var client = makeClient(style: style, script: [(listBody, 200)])
+        for _ in 0..<1 {
+            var client = makeClient(script: [(listBody, 200)])
             _ = try await client.listWebhooks()
             XCTAssertEqual(recordedPaths, ["/api/webhooks"])
             XCTAssertEqual(recordedMethods, ["GET"])
 
-            client = makeClient(style: style, script: [(enableBody, 200)])
+            client = makeClient(script: [(enableBody, 200)])
             _ = try await client.enableWebhooks()
             XCTAssertEqual(recordedPaths, ["/api/webhooks/enable"])
             XCTAssertEqual(recordedMethods, ["POST"])
 
-            client = makeClient(style: style, script: [(createBody, 200)])
+            client = makeClient(script: [(createBody, 200)])
             _ = try await client.createWebhook(name: "gh")
             XCTAssertEqual(recordedPaths, ["/api/webhooks"])
             XCTAssertEqual(recordedMethods, ["POST"])
 
-            client = makeClient(style: style, script: [(deleteBody, 200)])
+            client = makeClient(script: [(deleteBody, 200)])
             _ = try await client.deleteWebhook(name: "gh")
             XCTAssertEqual(recordedPaths, ["/api/webhooks/gh"])
             XCTAssertEqual(recordedMethods, ["DELETE"])
 
-            client = makeClient(style: style, script: [(toggleBody, 200)])
+            client = makeClient(script: [(toggleBody, 200)])
             _ = try await client.setWebhookEnabled(name: "gh", enabled: false)
             XCTAssertEqual(recordedPaths, ["/api/webhooks/gh/enabled"])
             XCTAssertEqual(recordedMethods, ["PUT"])

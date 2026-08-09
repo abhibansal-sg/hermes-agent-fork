@@ -46,8 +46,7 @@ final class SearchPaginationTests: XCTestCase {
         config.protocolClasses = [SearchStubProtocol.self]
         return RestClient(
             baseURL: baseURL, token: token,
-            session: URLSession(configuration: config),
-            pathStyle: .legacy
+            session: URLSession(configuration: config)
         )
     }
 

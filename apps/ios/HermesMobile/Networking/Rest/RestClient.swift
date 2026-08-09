@@ -24,32 +24,6 @@ enum RestError: Error, LocalizedError, Sendable {
     }
 }
 
-/// Which REST path family the gateway serves for the remaining MOBILE endpoint
-/// group (devices / approvals / push). The ABH-88 de-patch moved these
-/// from legacy top-level routes to the hermes-mobile plugin mount; the app
-/// probes which family the server speaks (``ServerCapabilities/pluginMount``)
-/// and pins the result per server. Core endpoints (`/api/sessions`,
-/// `/api/status`, the WS protocol, …) never moved and are unaffected.
-enum APIPathStyle: String, Sendable, Codable {
-    /// Legacy top-level paths (`/api/upload`, `/api/devices`, …) —
-    /// pre-de-patch gateways (e.g. the live dashboard until its redeploy).
-    case legacy
-    /// Plugin mount (`/api/plugins/hermes-mobile/…`) — de-patched gateways.
-    case plugin
-
-    /// The other family — used by the self-healing 404 retries on background
-    /// flows (push/Live-Activity registration, notification-action respond).
-    var alternate: APIPathStyle { self == .plugin ? .legacy : .plugin }
-
-    /// The path prefix the MOBILE endpoint group hangs off in this family.
-    var mobileAPIPrefix: String {
-        switch self {
-        case .legacy: return "/api"
-        case .plugin: return "/api/plugins/hermes-mobile"
-        }
-    }
-}
-
 /// Stateless HTTP client for the hermes gateway's REST surface.
 ///
 /// Every request applies the gateway's loopback Host override and uses either
@@ -69,19 +43,13 @@ struct RestClient: Sendable {
     let token: String
     let session: URLSession
     private let providerCredentials: NativeCredentialController?
-    /// Path family for the remaining MOBILE endpoint group (see ``APIPathStyle``).
-    /// Defaults to `.legacy` so an un-migrated construction site keeps today's
-    /// behavior; ``ConnectionStore`` passes the probed style.
-    let pathStyle: APIPathStyle
     let connectionMode: ConnectionMode
     /// - Parameters:
     ///   - baseURL: The gateway base, e.g. `https://host[:port]`.
     ///   - token: The session token sent as `X-Hermes-Session-Token`.
-    ///   - pathStyle: Path family for the mobile endpoint group.
     init(
         baseURL: URL,
         token: String,
-        pathStyle: APIPathStyle = .legacy,
         connectionMode: ConnectionMode = .sharedDashboard
     ) {
         let config = URLSessionConfiguration.ephemeral
@@ -91,7 +59,6 @@ struct RestClient: Sendable {
             baseURL: baseURL,
             token: token,
             session: URLSession(configuration: config),
-            pathStyle: pathStyle,
             connectionMode: connectionMode,
             providerCredentials: nil
         )
@@ -101,7 +68,6 @@ struct RestClient: Sendable {
         baseURL: URL,
         providerCredential: ProviderCredentialBundle,
         controller: NativeCredentialController,
-        pathStyle: APIPathStyle = .legacy,
         connectionMode: ConnectionMode = .remoteURL
     ) {
         let config = URLSessionConfiguration.ephemeral
@@ -111,7 +77,6 @@ struct RestClient: Sendable {
             baseURL: baseURL,
             token: providerCredential.accessToken,
             session: URLSession(configuration: config),
-            pathStyle: pathStyle,
             connectionMode: connectionMode,
             providerCredentials: controller
         )
@@ -124,14 +89,12 @@ struct RestClient: Sendable {
         baseURL: URL,
         token: String,
         session: URLSession,
-        pathStyle: APIPathStyle = .legacy,
         connectionMode: ConnectionMode = .sharedDashboard
     ) {
         self.init(
             baseURL: baseURL,
             token: token,
             session: session,
-            pathStyle: pathStyle,
             connectionMode: connectionMode,
             providerCredentials: nil
         )
@@ -143,14 +106,12 @@ struct RestClient: Sendable {
         providerCredential: ProviderCredentialBundle,
         controller: NativeCredentialController,
         session: URLSession,
-        pathStyle: APIPathStyle = .legacy,
         connectionMode: ConnectionMode = .remoteURL
     ) {
         self.init(
             baseURL: baseURL,
             token: providerCredential.accessToken,
             session: session,
-            pathStyle: pathStyle,
             connectionMode: connectionMode,
             providerCredentials: controller
         )
@@ -160,32 +121,15 @@ struct RestClient: Sendable {
         baseURL: URL,
         token: String,
         session: URLSession,
-        pathStyle: APIPathStyle,
         connectionMode: ConnectionMode,
         providerCredentials: NativeCredentialController?
     ) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
-        self.pathStyle = pathStyle
         self.connectionMode = connectionMode
         self.providerCredentials = providerCredentials
     }
-
-    /// A copy of this client speaking the given path family (same session).
-    func withPathStyle(_ style: APIPathStyle) -> RestClient {
-        RestClient(
-            baseURL: baseURL,
-            token: token,
-            session: session,
-            pathStyle: style,
-            connectionMode: connectionMode,
-            providerCredentials: providerCredentials
-        )
-    }
-
-    /// Prefix for the MOBILE endpoint group under this client's path family.
-    var mobileAPIPrefix: String { pathStyle.mobileAPIPrefix }
 
     private static let timeout: TimeInterval = 15
 
@@ -329,35 +273,6 @@ struct RestClient: Sendable {
         case unavailable
         /// Any other status or a transport error — can't decide from this probe.
         case inconclusive
-    }
-
-    /// Side-effect-free probe of the plugin mount itself (ABH-88): `GET
-    /// /api/plugins/hermes-mobile/devices` — an ABSOLUTE path, independent of
-    /// this client's ``pathStyle``. A de-patched gateway returns `200` with a
-    /// well-formed `{"devices":[…]}` body; a pre-de-patch gateway has no plugin mount and returns
-    /// `404`/`405`. Drives ``ServerCapabilities/pluginMount``, which selects
-    /// the path family every OTHER mobile call uses.
-    func probePluginMountEndpoint() async -> UploadProbeResult {
-        let request = makeRequest(
-            path: "/api/plugins/hermes-mobile/devices", method: "GET"
-        )
-        do {
-            let (data, http) = try await authorizedDataResponse(for: request)
-            switch http.statusCode {
-            case 200:
-                if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   object["devices"] is [Any] {
-                    return .available
-                }
-                return .inconclusive
-            case 404, 405:
-                return .unavailable
-            default:
-                return .inconclusive
-            }
-        } catch {
-            return .inconclusive
-        }
     }
 
     // MARK: - Request plumbing

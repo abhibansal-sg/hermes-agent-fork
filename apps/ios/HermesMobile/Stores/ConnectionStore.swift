@@ -45,7 +45,6 @@ final class ConnectionStore {
     /// production path calls ``SpotlightIndexer.clearAll`` directly.
     static var spotlightClearAllForTesting: (() -> Void)?
     #endif
-    private var phoneForegroundUpdateTask: Task<Void, Never>?
 
     /// UI-facing connection lifecycle.
     enum Phase: Equatable {
@@ -617,7 +616,6 @@ final class ConnectionStore {
                 baseURL: baseURL,
                 providerCredential: providerCredentialSnapshot,
                 controller: nativeCredentialController,
-                pathStyle: capabilities.resolvedPathStyle,
                 connectionMode: mode
             )
         }
@@ -625,21 +623,14 @@ final class ConnectionStore {
         return RestClient(
             baseURL: baseURL,
             token: token,
-            pathStyle: capabilities.resolvedPathStyle,
             connectionMode: mode
         )
     }
 
-    /// Declare which stored session this phone is visibly watching. The plugin
-    /// keeps this ephemeral and clears it when the authenticated socket drops.
+    /// Compatibility hook retained for session-navigation call sites. Stock
+    /// Hermes already owns watch/takeover state on the live WebSocket.
     func updatePhoneForeground(_ storedSessionId: String?) {
-        guard let rest else { return }
-        let previous = phoneForegroundUpdateTask
-        phoneForegroundUpdateTask = Task {
-            await previous?.value
-            guard !Task.isCancelled else { return }
-            try? await rest.setDeviceForeground(storedSessionId: storedSessionId)
-        }
+        _ = storedSessionId
     }
 
     /// Wait until session-list refresh has a usable transport, or until the
@@ -716,7 +707,6 @@ final class ConnectionStore {
                 baseURL: baseURL,
                 providerCredential: providerCredentialSnapshot,
                 controller: nativeCredentialController,
-                pathStyle: capabilities.resolvedPathStyle,
                 connectionMode: mode
             )
         }
@@ -724,7 +714,6 @@ final class ConnectionStore {
         return RestClient(
             baseURL: baseURL,
             token: token,
-            pathStyle: capabilities.resolvedPathStyle,
             connectionMode: mode
         )
     }
@@ -952,15 +941,6 @@ final class ConnectionStore {
     /// marker for an explicit user re-attempt after cleanup.
     private var deviceIssueLimitReachedServers = Set<String>()
 
-    /// Per-server single-flight guard for silent shared-token → device-token
-    /// upgrades (STR-546/STR-512). Multiple reconnect/configure paths can
-    /// overlap for the same active server; only one `/devices/issue` request
-    /// may be in flight for a server at a time, and joiners await that same
-    /// operation instead of minting a second device token. Cleared on every
-    /// exit path (success, typed 409, generic failure, Keychain-write
-    /// failure) so a later legitimate retry is never permanently suppressed.
-    private var autoUpgradeIssueTasks: [String: Task<IssuedDevice, Error>] = [:]
-
     /// WS-RECONNECT-SOFTEN (a) — delay before `recoverActiveSession`'s
     /// background capability/profile/auto-upgrade burst fires after a
     /// (re)connect, so it lands slightly AFTER the user-visible hydration
@@ -987,15 +967,6 @@ final class ConnectionStore {
     /// is taken in production (the nil-check is free). Set by unit tests to
     /// make the loop deterministic without a live socket.
     var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
-
-    #if DEBUG
-    /// DEBUG-only test seam for deterministic single-flight auto-upgrade tests
-    /// (STR-546): when non-nil, replaces the live `rest.issueDevice(name:)`
-    /// call so a test can delay/observe the issue round-trip without a live
-    /// server (e.g. suspend it to prove two overlapping callers share one
-    /// invocation). `nil` in production (the nil-check is free).
-    var issueDeviceRPC: (@Sendable (_ rest: RestClient, _ name: String) async throws -> IssuedDevice)?
-    #endif
 
     #if DEBUG
     /// Injectable configure status probe (tests). When non-nil, replaces the live
@@ -2955,91 +2926,7 @@ final class ConnectionStore {
     /// telemetered, written to UserDefaults, or held in a `@Snapshotable`
     /// accessor. Only the non-secret `device_id` is persisted to UserDefaults.
     func autoUpgradeToDeviceTokenIfNeeded(serverURL: String) async {
-        let generation = connectionGeneration
-        // Provider sessions already have stable client ownership and rotating
-        // stock credentials; the legacy plugin device-token migration does not
-        // apply and must never create a second credential authority.
-        guard nativeCredentialController == nil else { return }
-        // The server must advertise the capability — never issue against a stock
-        // gateway (it has no route) or on an unsettled/flaky probe.
-        guard capabilities.devices == .available else { return }
-        // Already holding a device token for this server (prior upgrade or a v2
-        // QR) → nothing to do.
-        guard DefaultsKeys.deviceId(server: serverURL) == nil else { return }
-        // A prior 409 is not transient; retrying it on every reconnect produces
-        // the silent-forever loop ABH-254 is fixing. The existing offline banner's
-        // Retry action re-enters `configure()`, which clears this suppression so a
-        // user can re-attempt after revoking an unused device.
-        guard !deviceIssueLimitReachedServers.contains(serverURL) else { return }
-        // Must still be the active configuration with a live token + REST client.
-        guard serverURLString == serverURL, let rest else { return }
-
-        // STR-546/STR-512: single-flight the actual issue call per server.
-        // Overlapping auto-upgrade attempts for the same server (e.g. the
-        // initial connect racing a reconnect-loop retry) join the same
-        // in-flight `Task` instead of each minting their own device token —
-        // an unshared second issue would silently orphan the first and
-        // silently consume a second slot against the 64-device cap
-        // (STR-512). Cleared via `defer` on every exit from this function so
-        // a later legitimate retry (after a failure or a Keychain-write
-        // failure clears `device_id`) is never permanently suppressed.
-        let issueTask: Task<IssuedDevice, Error>
-        if let inFlight = autoUpgradeIssueTasks[serverURL] {
-            issueTask = inFlight
-        } else {
-            #if DEBUG
-            let issueDeviceRPC = issueDeviceRPC
-            #endif
-            issueTask = Task { [rest] in
-                #if DEBUG
-                if let issueDeviceRPC {
-                    return try await issueDeviceRPC(rest, Self.deviceNameHint)
-                }
-                #endif
-                return try await rest.issueDevice(name: Self.deviceNameHint)
-            }
-            autoUpgradeIssueTasks[serverURL] = issueTask
-        }
-        defer { autoUpgradeIssueTasks[serverURL] = nil }
-
-        let issued: IssuedDevice
-        do {
-            issued = try await issueTask.value
-        } catch DeviceIssueError.limitReached(let maxDevices) {
-            handleDeviceLimitReached(serverURL: serverURL, maxDevices: maxDevices)
-            return
-        } catch {
-            // Keep the shared token silently (no regression). A later connect
-            // retries. Never log the error path with a token — `issueDevice`
-            // surfaces only a status/transport error, never the token itself.
-            return
-        }
-
-        // The connection may have changed (disconnect / re-configure to another
-        // server) while the issue round-trip was in flight; only swap if we are
-        // STILL configured against the same server with the same shared token we
-        // started from. (A v2 QR re-pair mid-flight would have recorded a
-        // device_id, caught by the guard re-check below.)
-        guard isCurrentGeneration(generation),
-              nativeCredentialController == nil,
-              serverURLString == serverURL,
-              DefaultsKeys.deviceId(server: serverURL) == nil else { return }
-
-        // Persist the device token to the Keychain (overwrites the shared token in
-        // the per-server item) and re-point the in-memory token before reconnecting.
-        do {
-            try KeychainService.saveToken(issued.token, server: serverURL)
-        } catch {
-            // Keychain write failed — keep the shared token (still valid). Do NOT
-            // record the device_id, so a later connect retries cleanly.
-            return
-        }
-        currentToken = issued.token
-        DefaultsKeys.setDeviceId(issued.deviceId, server: serverURL)
-        // The live socket authenticated with the old shared token. Close it so
-        // the existing reconnect loop immediately reopens with the device token;
-        // foreground push suppression is intentionally tied to that live socket.
-        await client.disconnect()
+        _ = serverURL
     }
 
     #if DEBUG
@@ -3052,13 +2939,6 @@ final class ConnectionStore {
     var recordedDeviceIdForCurrentServer: String? {
         DefaultsKeys.deviceId(server: serverURLString)
     }
-    /// DEBUG-only observability: whether the Settings Devices section would render
-    /// for the current connection (`devices == .available`). The integration
-    /// gate's stock-degradation step asserts this is `false` on a stock server.
-    var devicesSectionVisible: Bool {
-        capabilities.devices == .available
-    }
-
     /// DEBUG-only test seam: seed the in-memory connection state as if a prior
     /// `configure()` succeeded (stable URL + token stored, `hasConnected` true)
     /// then arm and fire the reconnect loop. Exercises the restart-survival path

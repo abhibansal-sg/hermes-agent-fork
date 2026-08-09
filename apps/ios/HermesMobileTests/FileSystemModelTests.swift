@@ -49,8 +49,7 @@ final class FileSystemModelTests: XCTestCase {
         return RestClient(
             baseURL: URL(string: "https://gw.example:9119")!,
             token: "tok",
-            session: URLSession(configuration: config),
-            pathStyle: .plugin
+            session: URLSession(configuration: config)
         )
     }
 
