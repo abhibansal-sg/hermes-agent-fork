@@ -1,4 +1,6 @@
 import XCTest
+import SwiftUI
+import UIKit
 @testable import HermesMobile
 
 /// D1 (build125 render surgery): the streaming bubble must re-parse only the
@@ -21,6 +23,7 @@ final class StreamingSegmentCacheTests: XCTestCase {
     /// (adjacent `.prose` split at a blank line flattens to the same block list).
     private enum RenderUnit: Equatable {
         case paragraph(String)
+        case heading(MessageBubble.MarkdownHeading)
         case table(MessageBubble.MarkdownTable)
         case blockquote(String)
         case alert(MessageBubble.MarkdownAlert)
@@ -59,6 +62,7 @@ final class StreamingSegmentCacheTests: XCTestCase {
     private func unit(for block: MessageBubble.MarkdownBlock) -> RenderUnit {
         switch block {
         case .paragraph(let text): return .paragraph(text)
+        case .heading(let heading): return .heading(heading)
         case .table(let table): return .table(table)
         case .blockquote(let text): return .blockquote(text)
         case .alert(let alert): return .alert(alert)
@@ -125,6 +129,105 @@ final class StreamingSegmentCacheTests: XCTestCase {
 
     func testGFMTableAndListStreamEquivalently() {
         assertStreamRenderEquivalent("Report:\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- one\n- two\n\ndone")
+    }
+
+    func testHeadingStreamsEquivalently() {
+        assertStreamRenderEquivalent("## Streamed **heading**\n\nBody")
+    }
+
+    private func makeStyle() -> ProseFlowStyle {
+        let bodyFont = SelectableTextView.font(textStyle: .body, serif: true)
+        return ProseFlowStyle(
+            bodyFont: bodyFont,
+            monoFont: .monospacedSystemFont(ofSize: bodyFont.pointSize, weight: .regular),
+            fg: .label,
+            mutedFg: .secondaryLabel,
+            linkColor: .link,
+            quoteBackground: UIColor.systemGray.withAlphaComponent(0.18),
+            taskCheckTint: .systemGreen,
+            lineSpacing: 3.5,
+            paragraphSpacing: 12
+        )
+    }
+
+    /// ATX heading markers are syntax, not visible transcript content. This
+    /// exercises the exact parser-to-selectable-prose path used by chat.
+    func testATXHeadingDoesNotExposeMarkersInRenderedProse() {
+        let pieces = ProseFlowBuilder.pieces(
+            body: "## Release notes",
+            style: makeStyle(),
+            linkColor: .blue
+        )
+
+        guard case .prose(let attributed) = pieces.first else {
+            return XCTFail("heading must remain part of the selectable prose flow")
+        }
+        XCTAssertEqual(attributed.string, "Release notes")
+        XCTAssertFalse(attributed.string.contains("##"))
+    }
+
+    func testHeadingParserPreservesLevelsAndInlineMarkdown() {
+        let blocks = MessageBubble.markdownBlocks("""
+        # **Primary** `code`
+
+        ## Secondary
+
+        ###### Small
+
+        Setext primary
+        ===
+        """)
+
+        XCTAssertEqual(blocks, [
+            .heading(.init(level: 1, text: "**Primary** `code`")),
+            .heading(.init(level: 2, text: "Secondary")),
+            .heading(.init(level: 6, text: "Small")),
+            .heading(.init(level: 1, text: "Setext primary")),
+        ])
+    }
+
+    func testHeadingUsesSemanticFontAndPreservesInlineTraits() {
+        let pieces = ProseFlowBuilder.pieces(
+            body: "## **Release** `v146` [notes](https://example.com)",
+            style: makeStyle(),
+            linkColor: .blue
+        )
+        guard case .prose(let attributed) = pieces.first else {
+            return XCTFail("heading must render as selectable prose")
+        }
+
+        let text = attributed.string as NSString
+        XCTAssertEqual(text as String, "Release v146 notes")
+        let releaseRange = text.range(of: "Release")
+        guard let releaseFont = attributed.attribute(
+            .font,
+            at: releaseRange.location,
+            effectiveRange: nil
+        ) as? UIFont else {
+            return XCTFail("heading text must carry its semantic font")
+        }
+        XCTAssertTrue(releaseFont.fontDescriptor.symbolicTraits.contains(.traitBold))
+        XCTAssertGreaterThan(releaseFont.pointSize, makeStyle().bodyFont.pointSize)
+
+        let codeRange = text.range(of: "v146")
+        let codeFont = attributed.attribute(.font, at: codeRange.location, effectiveRange: nil) as? UIFont
+        XCTAssertTrue(codeFont?.fontDescriptor.symbolicTraits.contains(.traitMonoSpace) == true)
+
+        let linkRange = text.range(of: "notes")
+        XCTAssertEqual(
+            (attributed.attribute(.link, at: linkRange.location, effectiveRange: nil) as? URL)?.absoluteString,
+            "https://example.com"
+        )
+        XCTAssertEqual(
+            attributed.attribute(.accessibilityTextHeadingLevel, at: 0, effectiveRange: nil) as? Int,
+            2
+        )
+    }
+
+    func testLegacyRollbackParserAlsoRemovesATXMarkers() {
+        XCTAssertEqual(MessageBubble.legacyMarkdownBlocks("## Legacy ##"), [
+            .heading(.init(level: 2, text: "Legacy")),
+        ])
     }
 
     func testMarkdownImageInProseStreamsEquivalently() {

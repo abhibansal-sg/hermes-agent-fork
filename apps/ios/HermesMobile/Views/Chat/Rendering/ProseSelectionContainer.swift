@@ -166,6 +166,8 @@ enum ProseFlowBuilder {
         switch block {
         case .paragraph(let text):
             return inlineParagraph(text, style: style, linkColor: linkColor, paragraph: baseParagraph(style: style))
+        case .heading(let heading):
+            return headingBlock(heading, style: style, linkColor: linkColor)
         case .listItems(let items):
             return listItems(items, style: style, linkColor: linkColor)
         case .taskItems(let items):
@@ -178,6 +180,27 @@ enum ProseFlowBuilder {
             // Tables are flushed as island pieces and never reach here.
             return NSAttributedString()
         }
+    }
+
+    private static func headingBlock(
+        _ heading: MessageBubble.MarkdownHeading,
+        style: ProseFlowStyle,
+        linkColor: Color
+    ) -> NSAttributedString {
+        let font = headingFont(level: heading.level)
+        let monoFont = UIFont.monospacedSystemFont(ofSize: font.pointSize, weight: .semibold)
+        let bridged = ProseInlineBridge.attributedString(
+            from: RenderCache.prose(heading.text, linkColor: linkColor),
+            style: style,
+            defaultFont: font,
+            codeFont: monoFont
+        )
+        guard bridged.length > 0 else { return bridged }
+        bridged.addAttributes([
+            .paragraphStyle: baseParagraph(style: style),
+            .accessibilityTextHeadingLevel: heading.level,
+        ], range: NSRange(location: 0, length: bridged.length))
+        return bridged
     }
 
     /// Inline-markdown paragraph with the given paragraph style.
@@ -382,6 +405,20 @@ enum ProseFlowBuilder {
         return UIFont(descriptor: descriptor, size: font.pointSize)
     }
 
+    private static func headingFont(level: Int) -> UIFont {
+        let textStyle: UIFont.TextStyle = switch level {
+        case 1: .title1
+        case 2: .title2
+        case 3: .title3
+        case 4: .headline
+        case 5: .subheadline
+        default: .footnote
+        }
+        let preferred = UIFont.preferredFont(forTextStyle: textStyle)
+        let descriptor = preferred.fontDescriptor.withDesign(.serif) ?? preferred.fontDescriptor
+        return semibold(UIFont(descriptor: descriptor, size: preferred.pointSize))
+    }
+
     private static func markerMonospacedDigit(_ font: UIFont) -> UIFont {
         let mono = UIFont.monospacedDigitSystemFont(ofSize: font.pointSize, weight: .semibold)
         guard let descriptor = mono.fontDescriptor.withDesign(.serif) else { return mono }
@@ -416,7 +453,9 @@ enum ProseInlineBridge {
     static func attributedString(
         from source: AttributedString,
         style: ProseFlowStyle,
-        defaultColor: UIColor? = nil
+        defaultColor: UIColor? = nil,
+        defaultFont: UIFont? = nil,
+        codeFont: UIFont? = nil
     ) -> NSMutableAttributedString {
         let base = defaultColor ?? style.fg
         let result = NSMutableAttributedString()
@@ -424,12 +463,12 @@ enum ProseInlineBridge {
             let text = String(source[run.range].characters)
             guard !text.isEmpty else { continue }
 
-            var font = style.bodyFont
+            var font = defaultFont ?? style.bodyFont
             if let intent = run.inlinePresentationIntent {
                 var traits: UIFontDescriptor.SymbolicTraits = []
                 if intent.contains(.stronglyEmphasized) { traits.insert(.traitBold) }
                 if intent.contains(.emphasized) { traits.insert(.traitItalic) }
-                if intent.contains(.code) { font = style.monoFont }
+                if intent.contains(.code) { font = codeFont ?? style.monoFont }
                 if !traits.isEmpty,
                    let descriptor = font.fontDescriptor.withSymbolicTraits(font.fontDescriptor.symbolicTraits.union(traits)) {
                     font = UIFont(descriptor: descriptor, size: font.pointSize)
