@@ -2456,10 +2456,10 @@ final class SessionStore {
     /// a slow response can never overwrite a newer list.
     ///
     /// When multi-profile is available, every selector scope fetches the
-    /// cross-profile aggregate (`GET /api/profiles/sessions?profile=all`) so each
-    /// row carries its authoritative `profile` tag; Default and named scopes then
-    /// filter client-side via ``visibleSessions``. The dormant single-profile case
-    /// alone uses the existing `GET /api/sessions` path, byte-for-byte unchanged.
+    /// profile-aware rail. All Profiles requests `profile=all`; Default and named
+    /// scopes request their concrete profile so Hermes applies the bounded window
+    /// within that authority. The dormant single-profile case alone uses the
+    /// existing `GET /api/sessions` path, byte-for-byte unchanged.
     /// Foreground refresh remains non-throwing and keeps its existing API.
     func refresh() async {
         _ = await refreshOutcome()
@@ -2600,7 +2600,11 @@ final class SessionStore {
                 let fetched: [SessionSummary]
                 if railQuery.kind == .aggregate {
                     fetched = try await rest.profileSessions(
-                        profile: DefaultsKeys.allProfilesScope,
+                        // Concrete selectors must be scoped by Hermes before its
+                        // bounded window is applied. Fetching `all` and filtering
+                        // locally lets newer rows from other profiles crowd the
+                        // selected profile out of the response entirely.
+                        profile: railQuery.activeProfile,
                         limit: limit,
                         order: order,
                         excludeSource: Self.recentsExcludeSources

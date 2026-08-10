@@ -60,7 +60,16 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     /// reconcile, ``ChatStore`` keeps that UUID so the visible bubble does not
     /// remount, and records the canonical UUID here. Later reconciles can then
     /// match the same authority row instead of appending a duplicate.
-    let canonicalID: UUID?
+    var canonicalID: UUID?
+    /// Whether the authoritative seeded identity came from the legacy
+    /// timestamp/index fallback because the gateway supplied no stable wire id.
+    /// Only these adopted rows are eligible for bounded-window alias recovery.
+    let usesPositionalSeedIdentity: Bool
+    /// Original gateway transcript timestamp, when supplied. Unlike the display
+    /// timestamp this stays nil for legacy rows that omitted one, allowing
+    /// positional alias recovery to reject equal-content turns whose authority
+    /// timestamps prove they are distinct.
+    var authoritativeSeedTimestamp: Double?
     let role: ChatRole
     /// Stable durable-outbox identity for optimistic user echoes. Nil for
     /// server-seeded/legacy rows.
@@ -100,6 +109,8 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     init(
         id: UUID = UUID(),
         canonicalID: UUID? = nil,
+        usesPositionalSeedIdentity: Bool = false,
+        authoritativeSeedTimestamp: Double? = nil,
         role: ChatRole,
         clientMessageID: String? = nil,
         parts: [ChatMessagePart] = [],
@@ -116,6 +127,8 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     ) {
         self.id = id
         self.canonicalID = canonicalID
+        self.usesPositionalSeedIdentity = usesPositionalSeedIdentity
+        self.authoritativeSeedTimestamp = authoritativeSeedTimestamp
         self.role = role
         self.clientMessageID = clientMessageID
         self.isStreaming = isStreaming

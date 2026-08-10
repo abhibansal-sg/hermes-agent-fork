@@ -736,6 +736,55 @@ final class ProfilesTests: XCTestCase {
         XCTAssertEqual(sessions.lastSessionRailDiagnostics?.displayedCount, 129)
     }
 
+    func testSelectedDefaultProfileScopesServerWindowBeforeGlobalCap() async throws {
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+        defer {
+            UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+            ProfileRailRequestStubProtocol.requestedURL = nil
+        }
+
+        ProfileRailRequestStubProtocol.requestedURL = nil
+        ProfileRailRequestStubProtocol.responseData = Data(
+            #"{"sessions":[],"total":129,"profile_totals":{"default":129},"limit":200,"offset":0,"errors":[]}"#.utf8
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProfileRailRequestStubProtocol.self]
+        let rest = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: configuration)
+        )
+
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        sessions.attach(connection: connection, chat: chat)
+        connection._restOverrideForTesting = rest
+        connection.capabilities._seedProfilesCapabilityForTesting(.available)
+        sessions._seedProfilesForTesting([
+            ProfileSummary(name: "default", isDefault: true, description: nil),
+            ProfileSummary(name: "work", isDefault: false, description: nil),
+        ])
+        sessions.activeProfile = SessionStore.defaultProfileName
+
+        await sessions.refresh()
+
+        let requestedURL = try XCTUnwrap(ProfileRailRequestStubProtocol.requestedURL)
+        let components = try XCTUnwrap(
+            URLComponents(url: requestedURL, resolvingAgainstBaseURL: false)
+        )
+        let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap {
+            item in item.value.map { (item.name, $0) }
+        })
+        XCTAssertEqual(components.path, "/api/profiles/sessions")
+        XCTAssertEqual(
+            query["profile"],
+            "default",
+            "Hermes must apply its 200-row window inside Default, never across All profiles"
+        )
+        XCTAssertEqual(query["limit"], "200")
+    }
+
     /// Regression for the production cold-connect race: hydration can start the
     /// stock/default rail while the profiles capability is still unknown. Once
     /// profile discovery proves an aggregate rail is available, that provisional
@@ -883,4 +932,27 @@ private actor SessionRailFetchGate {
     }
 
     func requestedQueries() -> [SessionRailQuery] { queries }
+}
+
+private final class ProfileRailRequestStubProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var responseData = Data()
+    nonisolated(unsafe) static var requestedURL: URL?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.requestedURL = request.url
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.responseData)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

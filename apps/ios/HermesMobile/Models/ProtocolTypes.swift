@@ -150,9 +150,10 @@ struct ProfileSummary: Decodable, Identifiable, Sendable, Equatable {
 }
 
 /// Wrapper for `GET /api/profiles/sessions` (`web_server.py:1734-1741`) — the
-/// cross-profile aggregate rail used ONLY when the active scope is "All profiles"
-/// AND multi-profile is available. Single-profile / default scope keeps using the
-/// existing `GET /api/sessions`, so the dormant path is byte-for-byte unchanged.
+/// profile-aware rail used when multi-profile is available. "All profiles"
+/// requests the cross-profile aggregate; Default and named selectors request an
+/// authoritative profile-scoped window. Stock gateways keep using the existing
+/// `GET /api/sessions`, so the dormant path is byte-for-byte unchanged.
 ///
 /// Decoded via `.convertFromSnakeCase`: `profile_totals` → ``profileTotals``. Each
 /// `sessions` row is a ``SessionSummary`` carrying the handler's `profile` tag

@@ -40,13 +40,14 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
     }
 
     private func storedMessage(
-        role: String, text: String, wireId: Int? = nil
+        role: String, text: String, wireId: Int? = nil, timestamp: Double? = nil
     ) -> StoredMessage {
         var json: [String: JSONValue] = [
             "role": .string(role),
             "content": .string(text),
         ]
         if let wireId { json["id"] = .number(Double(wireId)) }
+        if let timestamp { json["timestamp"] = .number(timestamp) }
         return StoredMessage(json: .object(json))!
     }
 
@@ -288,6 +289,274 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
         )
         XCTAssertEqual(assistants.first?.id, live.id)
         XCTAssertEqual(assistants.first?.text, "authoritative final")
+    }
+
+    func testLegacyWindowShiftKeepsAdoptedCompletionSingleWithoutWireIDs() async throws {
+        let firstFetch = expectation(description: "first legacy transcript fetched")
+        var fetchCount = 0
+        let (chat, _) = makeStore { _ in
+            fetchCount += 1
+            if fetchCount == 1 {
+                firstFetch.fulfill()
+                return [
+                    self.storedMessage(role: "system", text: "head row that will drop"),
+                    self.storedMessage(
+                        role: "user", text: "persistent context prompt", wireId: 100
+                    ),
+                    self.storedMessage(
+                        role: "assistant", text: "persistent context answer", wireId: 101
+                    ),
+                    self.storedMessage(role: "user", text: "prompt before drop"),
+                    self.storedMessage(role: "assistant", text: "authoritative final"),
+                ]
+            }
+            // A real bounded-tail advance drops leading rows and appends a new
+            // turn. The adopted answer remains in-window but shifts index and is
+            // no longer trailing on either side.
+            return [
+                self.storedMessage(
+                    role: "user", text: "persistent context prompt", wireId: 100
+                ),
+                self.storedMessage(
+                    role: "assistant", text: "persistent context answer", wireId: 101
+                ),
+                self.storedMessage(role: "user", text: "prompt before drop"),
+                self.storedMessage(role: "assistant", text: "authoritative final"),
+                self.storedMessage(role: "user", text: "later prompt"),
+                self.storedMessage(role: "assistant", text: "later answer"),
+            ]
+        }
+        let live = beginLocalPartialTurn(chat)
+
+        chat.handle(event: localFrame(
+            type: "message.complete",
+            payload: ["text": "frame final", "status": "complete"]
+        ))
+        await fulfillment(of: [firstFetch], timeout: 1)
+        for _ in 0..<5 { await Task.yield() }
+
+        let firstCanonicalID = try XCTUnwrap(
+            chat.messages.first(where: { $0.id == live.id })?.canonicalID
+        )
+        XCTAssertEqual(chat.messages.filter { $0.role == .assistant }.count, 2)
+
+        await chat.reconcileAuthoritativeTranscript(surfaceFailure: false)
+        await chat.reconcileAuthoritativeTranscript(surfaceFailure: false)
+
+        let assistants = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(
+            assistants.count,
+            3,
+            "the shifted adopted final and the genuinely new answer must each appear once"
+        )
+        XCTAssertEqual(assistants[1].id, live.id)
+        XCTAssertEqual(assistants[1].text, "authoritative final")
+        XCTAssertEqual(assistants.last?.text, "later answer")
+        XCTAssertNotEqual(
+            assistants[1].canonicalID,
+            firstCanonicalID,
+            "the adopted row should advance to the shifted positional authority alias"
+        )
+    }
+
+    func testLegacyFallbackDoesNotAdoptOlderIdenticalAssistantPayload() async {
+        let fetched = expectation(description: "new turn transcript fetched")
+        let (chat, _) = makeStore { _ in
+            fetched.fulfill()
+            return [
+                self.storedMessage(role: "user", text: "new distinct prompt"),
+                self.storedMessage(role: "assistant", text: "Done"),
+            ]
+        }
+        let olderID = UUID()
+        chat.messages = [
+            ChatMessage(
+                id: olderID,
+                canonicalID: UUID(),
+                usesPositionalSeedIdentity: true,
+                role: .assistant,
+                text: "Done"
+            ),
+            ChatMessage(role: .user, text: "new distinct prompt"),
+        ]
+
+        chat.handle(event: localFrame(type: "message.start", payload: ["role": "assistant"]))
+        chat.handle(event: localFrame(type: "message.delta", payload: ["text": "Done"]))
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #endif
+        let live = chat.messages.last(where: { $0.role == .assistant })!
+        XCTAssertNotEqual(live.id, olderID)
+
+        chat.handle(event: localFrame(
+            type: "message.complete",
+            payload: ["text": "Done", "status": "complete"]
+        ))
+        await fulfillment(of: [fetched], timeout: 1)
+        for _ in 0..<5 { await Task.yield() }
+
+        let assistants = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(
+            assistants.count,
+            2,
+            "union retains the older settled answer while adding the distinct new turn"
+        )
+        XCTAssertTrue(assistants.contains(where: { $0.id == olderID }))
+        XCTAssertEqual(
+            assistants.last?.id,
+            live.id,
+            "a later identical answer must adopt its own live bubble, never an older positional alias"
+        )
+        XCTAssertNotEqual(assistants.last?.id, olderID)
+    }
+
+    func testLegacyFallbackRequiresMatchingUserTurnForPassiveIdenticalAnswer() {
+        let (chat, _) = makeStore()
+        let olderID = UUID()
+        chat.messages = [
+            ChatMessage(role: .user, text: "old prompt"),
+            ChatMessage(
+                id: olderID,
+                canonicalID: UUID(),
+                usesPositionalSeedIdentity: true,
+                role: .assistant,
+                text: "Done"
+            ),
+        ]
+
+        chat.seed(from: [
+            storedMessage(role: "user", text: "new distinct prompt"),
+            storedMessage(role: "assistant", text: "Done"),
+        ], policy: .union)
+
+        XCTAssertEqual(
+            chat.messages.filter { $0.role == .user }.map(\.text),
+            ["old prompt", "new distinct prompt"]
+        )
+        let assistants = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(
+            assistants.count,
+            2,
+            "equal assistant text from a different offline turn must remain a distinct answer"
+        )
+        XCTAssertTrue(assistants.contains(where: { $0.id == olderID }))
+        XCTAssertTrue(assistants.contains(where: { $0.id != olderID && $0.text == "Done" }))
+    }
+
+    func testLegacyFallbackDoesNotAliasRepeatedUserWithoutMatchingAnswer() {
+        let (chat, _) = makeStore()
+        let olderUserID = UUID()
+        chat.messages = [
+            ChatMessage(
+                id: olderUserID,
+                canonicalID: UUID(),
+                usesPositionalSeedIdentity: true,
+                role: .user,
+                text: "continue"
+            ),
+            ChatMessage(role: .assistant, text: "old answer"),
+        ]
+
+        chat.seed(from: [
+            storedMessage(role: "user", text: "continue"),
+            storedMessage(role: "assistant", text: "different new answer"),
+        ], policy: .union)
+
+        let users = chat.messages.filter { $0.role == .user }
+        XCTAssertEqual(users.count, 2)
+        XCTAssertTrue(users.contains(where: { $0.id == olderUserID }))
+        XCTAssertTrue(users.contains(where: { $0.id != olderUserID && $0.text == "continue" }))
+        XCTAssertEqual(
+            chat.messages.filter { $0.role == .assistant }.map(\.text),
+            ["old answer", "different new answer"]
+        )
+    }
+
+    func testLegacyFallbackUsesAuthorityTimestampsForIdenticalTurns() {
+        let (chat, _) = makeStore()
+        let olderUserID = UUID()
+        let olderAssistantID = UUID()
+        chat.messages = [
+            ChatMessage(
+                id: olderUserID,
+                canonicalID: UUID(),
+                usesPositionalSeedIdentity: true,
+                authoritativeSeedTimestamp: 100,
+                role: .user,
+                text: "continue"
+            ),
+            ChatMessage(
+                id: olderAssistantID,
+                canonicalID: UUID(),
+                usesPositionalSeedIdentity: true,
+                authoritativeSeedTimestamp: 101,
+                role: .assistant,
+                text: "Done"
+            ),
+        ]
+
+        chat.seed(from: [
+            storedMessage(role: "user", text: "continue", timestamp: 200),
+            storedMessage(role: "assistant", text: "Done", timestamp: 201),
+        ], policy: .union)
+
+        let users = chat.messages.filter { $0.role == .user }
+        let assistants = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(users.count, 2)
+        XCTAssertEqual(assistants.count, 2)
+        XCTAssertTrue(users.contains(where: { $0.id == olderUserID }))
+        XCTAssertTrue(assistants.contains(where: { $0.id == olderAssistantID }))
+        XCTAssertTrue(users.contains(where: { $0.id != olderUserID && $0.text == "continue" }))
+        XCTAssertTrue(assistants.contains(where: { $0.id != olderAssistantID && $0.text == "Done" }))
+    }
+
+    func testLegacyToolOnlySyntheticRowKeepsAdoptedIdentityAcrossTailShift() throws {
+        let toolRow = StoredMessage(
+            role: "assistant",
+            content: .string(""),
+            timestamp: 11,
+            toolCalls: [WireToolCall(callId: "legacy-tool", name: "shell")],
+            finishReason: "tool_calls"
+        )
+        let first = ChatStore.toChatMessages([
+            StoredMessage(role: "system", content: .string("head row that will drop")),
+            StoredMessage(role: "user", content: .string("context prompt"), timestamp: 1),
+            StoredMessage(role: "assistant", content: .string("context answer"), timestamp: 2),
+            StoredMessage(role: "user", content: .string("run the tool"), timestamp: 10),
+            toolRow,
+        ])
+        let canonical = try XCTUnwrap(first.last(where: { !$0.tools.isEmpty }))
+        XCTAssertTrue(canonical.usesPositionalSeedIdentity)
+        XCTAssertEqual(canonical.authoritativeSeedTimestamp, 11)
+
+        let runtimeID = UUID()
+        let adopted = ChatMessage(
+            id: runtimeID,
+            canonicalID: canonical.id,
+            usesPositionalSeedIdentity: canonical.usesPositionalSeedIdentity,
+            authoritativeSeedTimestamp: canonical.authoritativeSeedTimestamp,
+            role: .assistant,
+            parts: canonical.parts,
+            timestamp: canonical.timestamp
+        )
+        let (chat, _) = makeStore()
+        chat.messages = first.map { $0.id == canonical.id ? adopted : $0 }
+
+        let shifted = ChatStore.toChatMessages([
+            StoredMessage(role: "user", content: .string("context prompt"), timestamp: 1),
+            StoredMessage(role: "assistant", content: .string("context answer"), timestamp: 2),
+            StoredMessage(role: "user", content: .string("run the tool"), timestamp: 10),
+            toolRow,
+            StoredMessage(role: "user", content: .string("later prompt"), timestamp: 20),
+            StoredMessage(role: "assistant", content: .string("later answer"), timestamp: 21),
+        ])
+        chat.seed(normalized: shifted, policy: .union)
+        chat.seed(normalized: shifted, policy: .union)
+
+        let toolRows = chat.messages.filter { !$0.tools.isEmpty }
+        XCTAssertEqual(toolRows.count, 1)
+        XCTAssertEqual(toolRows.first?.id, runtimeID)
+        XCTAssertEqual(toolRows.first?.tools.first?.id, "legacy-tool")
     }
 
     func testRepeatedUnionReconcileKeepsAdoptedUserEchoSingle() {
