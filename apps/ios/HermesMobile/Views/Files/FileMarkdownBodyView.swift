@@ -70,6 +70,15 @@ struct FileMarkdownBodyView: View {
                 .lineSpacing(Self.proseLineSpacing)
                 .perfTextSelection()
                 .frame(maxWidth: .infinity, alignment: .leading)
+        case .heading(let heading):
+            Text(RenderCache.prose(heading.text, linkColor: theme.midground))
+                .font(Self.headingFont(level: heading.level))
+                .fontWeight(heading.level <= 2 ? .bold : .semibold)
+                .foregroundStyle(theme.fg)
+                .lineSpacing(Self.proseLineSpacing)
+                .perfTextSelection()
+                .accessibilityHeading(Self.accessibilityHeadingLevel(heading.level))
+                .frame(maxWidth: .infinity, alignment: .leading)
         case .table(let table):
             MarkdownTableBlockView(table: table)
         case .blockquote(let text):
@@ -80,6 +89,28 @@ struct FileMarkdownBodyView: View {
             MarkdownTaskListView(items: items)
         case .listItems(let items):
             MarkdownListBlockView(items: items)
+        }
+    }
+
+    private static func headingFont(level: Int) -> Font {
+        switch level {
+        case 1: .system(.title, design: .serif)
+        case 2: .system(.title2, design: .serif)
+        case 3: .system(.title3, design: .serif)
+        case 4: .system(.headline, design: .serif)
+        case 5: .system(.subheadline, design: .serif)
+        default: .system(.footnote, design: .serif)
+        }
+    }
+
+    private static func accessibilityHeadingLevel(_ level: Int) -> AccessibilityHeadingLevel {
+        switch level {
+        case 1: .h1
+        case 2: .h2
+        case 3: .h3
+        case 4: .h4
+        case 5: .h5
+        default: .h6
         }
     }
 }

@@ -10,6 +10,7 @@ enum StandardsMarkdownBlockParser {
     typealias TableModel = MessageBubble.MarkdownTable
     typealias TaskItem = MessageBubble.MarkdownTaskItem
     typealias ListItemModel = MessageBubble.MarkdownListItem
+    typealias HeadingModel = MessageBubble.MarkdownHeading
 
     static func parse(_ source: String) -> [Block] {
         guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
@@ -27,6 +28,10 @@ enum StandardsMarkdownBlockParser {
                 return [.alert(alert)]
             }
             return body.isEmpty ? [] : [.blockquote(body)]
+        }
+        if let heading = markup as? Markdown.Heading {
+            let text = inlineText(heading.inlineChildren)
+            return text.isEmpty ? [] : [.heading(HeadingModel(level: heading.level, text: text))]
         }
         if let list = markup as? OrderedList {
             return blocks(from: flatten(list, level: sourceIndentationLevel(list)))
@@ -59,7 +64,13 @@ enum StandardsMarkdownBlockParser {
         // outside its parent table. Re-parent its inline children into a standalone
         // paragraph so emphasis, links, code, and escapes survive for the existing
         // inline renderer without invoking the unsupported cell formatter.
-        let paragraph = Paragraph(Array(cell.inlineChildren))
+        inlineText(cell.inlineChildren)
+    }
+
+    /// Format inline children without asking `MarkupFormatter` to re-emit the
+    /// enclosing block's syntax marker (for example `##` on an ATX heading).
+    private static func inlineText(_ children: some Sequence<InlineMarkup>) -> String {
+        let paragraph = Paragraph(Array(children))
         return trimmed(paragraph.format())
     }
 

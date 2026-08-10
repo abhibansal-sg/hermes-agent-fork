@@ -1134,6 +1134,11 @@ struct MessageBubble: View {
         let level: Int
     }
 
+    struct MarkdownHeading: Equatable, Sendable {
+        let level: Int
+        let text: String
+    }
+
     enum MarkdownAlertKind: String, Equatable, Sendable {
         case note
         case tip
@@ -1178,6 +1183,7 @@ struct MessageBubble: View {
 
     enum MarkdownBlock: Equatable, Sendable {
         case paragraph(String)
+        case heading(MarkdownHeading)
         case table(MarkdownTable)
         case blockquote(String)
         case alert(MarkdownAlert)
@@ -1223,6 +1229,13 @@ struct MessageBubble: View {
                 continue
             }
 
+            if let heading = legacyATXHeading(line) {
+                flushParagraph()
+                blocks.append(.heading(heading))
+                index += 1
+                continue
+            }
+
             if let table = markdownTable(startingAt: index, lines: lines) {
                 flushParagraph()
                 blocks.append(.table(table.table))
@@ -1261,6 +1274,27 @@ struct MessageBubble: View {
 
         flushParagraph()
         return blocks
+    }
+
+    /// Keep the one-release rollback parser visually compatible with the
+    /// standards parser for ordinary ATX headings. The standards parser remains
+    /// authoritative for the full CommonMark grammar.
+    private static func legacyATXHeading(_ line: String) -> MarkdownHeading? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let characters = Array(trimmed)
+        let markerCount = characters.prefix { $0 == "#" }.count
+        guard (1...6).contains(markerCount) else { return nil }
+        guard characters.count == markerCount || characters[markerCount].isWhitespace else { return nil }
+
+        var body = String(characters.dropFirst(markerCount))
+            .trimmingCharacters(in: .whitespaces)
+        if let closingStart = body.range(
+            of: #"\s+#+\s*$"#,
+            options: .regularExpression
+        ) {
+            body.removeSubrange(closingStart.lowerBound..<body.endIndex)
+        }
+        return MarkdownHeading(level: markerCount, text: body)
     }
 
     nonisolated static func accessibilityTextForMarkdown(_ text: String) -> String {
