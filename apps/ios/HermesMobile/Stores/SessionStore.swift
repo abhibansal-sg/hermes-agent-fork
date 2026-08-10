@@ -996,9 +996,9 @@ final class SessionStore {
     }
 
     /// `true` when the active scope is the cross-profile aggregate ("All
-    /// profiles"): the sentinel `"all"` or an empty/blank pref. Drives the rail's
-    /// choice between `GET /api/profiles/sessions?profile=all` (aggregate) and the
-    /// existing `GET /api/sessions` (single/default).
+    /// profiles"): the sentinel `"all"` or an empty/blank pref. Specific scopes
+    /// still use the aggregate endpoint when multi-profile is available, then
+    /// project their tagged rows client-side.
     var isAllProfilesScope: Bool {
         let trimmed = activeProfile.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty || trimmed == DefaultsKeys.allProfilesScope
@@ -1023,27 +1023,22 @@ final class SessionStore {
 
     /// Whether the rail should fetch the cross-profile aggregate
     /// (`GET /api/profiles/sessions?profile=all`) instead of the existing
-    /// `GET /api/sessions`. True only when multi-profile is available AND the scope
-    /// is NOT the default profile: both the aggregate ("all") scope and a specific
-    /// named scope fetch the aggregate (so rows carry their `profile` tag) and
-    /// ``visibleSessions`` filters a named scope client-side. The DEFAULT profile
-    /// scope (and every dormant / stock-gateway case) keeps the existing
-    /// `GET /api/sessions` path byte-for-byte.
+    /// `GET /api/sessions`. Whenever multi-profile is available, every scope—All,
+    /// Default, or named—uses the same authoritative tagged rail and
+    /// ``visibleSessions`` applies the selected projection. Only dormant / stock
+    /// gateways retain the legacy `GET /api/sessions` path.
     var usesAggregateRail: Bool {
         currentSessionRailQuery.kind == .aggregate
     }
 
     /// Snapshot the complete presentation scope before a session-list request.
-    /// The active profile participates even though every non-default profile
+    /// The active profile participates even though every profile-capable scope
     /// uses the same aggregate endpoint, because the client-side projection is
     /// different and a late response must not cross that selection boundary.
     var currentSessionRailQuery: SessionRailQuery {
         let trimmed = activeProfile.trimmingCharacters(in: .whitespacesAndNewlines)
         let scope = trimmed.isEmpty ? DefaultsKeys.allProfilesScope : trimmed
-        let kind: SessionRailQuery.Kind = isMultiProfileAvailable
-            && scope != Self.defaultProfileName
-            ? .aggregate
-            : .stock
+        let kind: SessionRailQuery.Kind = isMultiProfileAvailable ? .aggregate : .stock
         return SessionRailQuery(kind: kind, activeProfile: scope)
     }
 
@@ -1873,8 +1868,8 @@ final class SessionStore {
 
     /// Pure profile-scope filter applied by ``visibleSessions``. DORMANT unless
     /// `multiAvailable` (no stale `scope` can hide rows on a stock gateway). When
-    /// available and a SPECIFIC profile scope is active, only rows whose `profile`
-    /// matches survive; the aggregate ("all") / default scope keeps every row.
+    /// available and a SPECIFIC profile scope is active, only rows whose normalized
+    /// `profile` matches survive; the aggregate ("all") scope keeps every row.
     /// Factored out (and `internal`) so the filter is unit-testable without a
     /// live connection.
     static func filterByProfile(
@@ -1882,10 +1877,12 @@ final class SessionStore {
         scope: String,
         multiAvailable: Bool
     ) -> [SessionSummary] {
-        guard let name = profileParam(scope: scope, multiAvailable: multiAvailable) else {
+        guard multiAvailable else { return rows }
+        let requested = scope.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !requested.isEmpty, requested != DefaultsKeys.allProfilesScope else {
             return rows
         }
-        return rows.filter { $0.profile == name }
+        return rows.filter { Self.normalizedProfileID($0.profile) == requested }
     }
 
     /// Offline rows are filtered by the selected profile even before the live
@@ -2458,12 +2455,11 @@ final class SessionStore {
     /// request (token value smaller than the one that ran last) is discarded so
     /// a slow response can never overwrite a newer list.
     ///
-    /// When multi-profile is available and the active scope is not the default
-    /// profile, the rail fetches the cross-profile aggregate
-    /// (`GET /api/profiles/sessions?profile=all`) so each row carries its `profile`
-    /// tag (a named scope then filters client-side via ``visibleSessions``).
-    /// Otherwise — the dormant single-profile case AND the default-profile scope —
-    /// it uses the existing `GET /api/sessions` path, byte-for-byte unchanged.
+    /// When multi-profile is available, every selector scope fetches the
+    /// cross-profile aggregate (`GET /api/profiles/sessions?profile=all`) so each
+    /// row carries its authoritative `profile` tag; Default and named scopes then
+    /// filter client-side via ``visibleSessions``. The dormant single-profile case
+    /// alone uses the existing `GET /api/sessions` path, byte-for-byte unchanged.
     /// Foreground refresh remains non-throwing and keeps its existing API.
     func refresh() async {
         _ = await refreshOutcome()
@@ -2595,9 +2591,10 @@ final class SessionStore {
             return .success
         }
 
-        // One bounded stock snapshot. The aggregate profile rail is retained
-        // when available; every other configuration uses the stock recent-list
-        // endpoint. Older sessions remain discoverable through search.
+        // One bounded authoritative snapshot. Profile-capable gateways always use
+        // the tagged aggregate rail so Default and named selectors describe the
+        // same rows/counts as All Profiles. Stock gateways retain the legacy
+        // recent-list endpoint. Older sessions remain discoverable through search.
         if let rest = connection?.rest {
             do {
                 let fetched: [SessionSummary]

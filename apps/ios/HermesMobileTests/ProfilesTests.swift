@@ -290,12 +290,17 @@ final class ProfilesTests: XCTestCase {
         XCTAssertEqual(filtered.map(\.id), ["a", "b"])
     }
 
-    func testProfileFilterDefaultScopeKeepsEveryRow() {
-        // The default scope is the aggregate-equivalent for filtering: it keeps
-        // every row (the default's sessions live in the shared home).
-        let rows = [row("a", profile: "work"), row("b", profile: "default")]
+    func testProfileFilterDefaultScopeKeepsOnlyDefaultRows() {
+        // On a profile-capable gateway Default uses the aggregate rail, so the
+        // projection must retain explicit/default-compatible untagged rows and
+        // reject every named-profile row.
+        let rows = [
+            row("work", profile: "work"),
+            row("default", profile: "default"),
+            row("legacy-default", profile: nil),
+        ]
         let filtered = SessionStore.filterByProfile(rows, scope: "default", multiAvailable: true)
-        XCTAssertEqual(filtered.map(\.id), ["a", "b"])
+        XCTAssertEqual(filtered.map(\.id), ["default", "legacy-default"])
     }
 
     func testDrawerProfileGroupsDefaultFirstThenAlphabetic() {
@@ -690,6 +695,45 @@ final class ProfilesTests: XCTestCase {
         XCTAssertFalse(store.isMultiProfileAvailable)
         XCTAssertFalse(store.usesAggregateRail)
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+    }
+
+    func testSelectedDefaultProfileUsesAggregateRailAndKeepsAllDefaultChats() async {
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+        defer { UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile) }
+
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        sessions.attach(connection: connection, chat: chat)
+        connection.capabilities._seedProfilesCapabilityForTesting(.available)
+        sessions._seedProfilesForTesting([
+            ProfileSummary(name: "default", isDefault: true, description: nil),
+            ProfileSummary(name: "work", isDefault: false, description: nil),
+        ])
+        sessions.activeProfile = SessionStore.defaultProfileName
+
+        let defaultRows = (1...129).map { index in
+            row("default-\(index)", profile: "default", source: "app")
+        }
+        let otherRows = (1...7).map { index in
+            row("work-\(index)", profile: "work", source: "app")
+        }
+        var requestedQuery: SessionRailQuery?
+        sessions.sessionsFetchForRail = { query in
+            requestedQuery = query
+            return (defaultRows + otherRows, defaultRows.count + otherRows.count)
+        }
+
+        await sessions.refresh()
+
+        XCTAssertEqual(
+            requestedQuery,
+            SessionRailQuery(kind: .aggregate, activeProfile: SessionStore.defaultProfileName)
+        )
+        XCTAssertEqual(sessions.visibleSessions.count, 129)
+        XCTAssertEqual(Set(sessions.visibleSessions.map(\.profile)), ["default"])
+        XCTAssertEqual(sessions.lastSessionRailDiagnostics?.profileRejectedCount, 7)
+        XCTAssertEqual(sessions.lastSessionRailDiagnostics?.displayedCount, 129)
     }
 
     /// Regression for the production cold-connect race: hydration can start the
