@@ -338,6 +338,47 @@ final class ProfilesTests: XCTestCase {
         XCTAssertTrue(SessionStore.isProfileGroupCollapsed("zeta", collapsed: empty, expanded: empty, profileMap: map))
     }
 
+    func testActiveNonDefaultProfileExpandsByDefault() {
+        let map = profileMap(("default", true), ("work", false))
+        XCTAssertFalse(SessionStore.isProfileGroupCollapsed(
+            "work", collapsed: [], expanded: [], profileMap: map,
+            activeProfile: "work"
+        ))
+    }
+
+    func testExplicitlyCollapsedPreviewStillContainsActiveSession() {
+        let rows = (1...5).map { row("work-\($0)", profile: "work") }
+        let preview = SessionStore.drawerCollapsedProfilePreview(
+            rows,
+            activeScopedIdentity: rows[4].scopedIdentity
+        )
+
+        XCTAssertEqual(preview.map(\.id), ["work-1", "work-2", "work-5"])
+    }
+
+    func testProjectOpenedSessionOverlaysDrawerCandidatesUntilRailCatchesUp() {
+        let sessions = SessionStore()
+        let recent = SessionSummary(
+            id: "recent", title: "Recent", preview: nil, startedAt: 1,
+            messageCount: 2, source: "desktop", lastActive: 10, cwd: nil
+        )
+        let projectSession = SessionSummary(
+            id: "project-session", title: "Project chat", preview: nil, startedAt: 2,
+            messageCount: 2, source: "desktop", lastActive: 20, cwd: "/project"
+        )
+        sessions.sessions = [recent]
+
+        sessions.open(projectSession, bindRuntime: false)
+
+        XCTAssertEqual(sessions.activeSummary?.scopedIdentity, projectSession.scopedIdentity)
+        let drawerRows = sessions.drawerSourceGroups().flatMap(\.sessions)
+        XCTAssertTrue(drawerRows.contains { $0.scopedIdentity == projectSession.scopedIdentity })
+        XCTAssertEqual(
+            drawerRows.filter { $0.scopedIdentity == projectSession.scopedIdentity }.count,
+            1
+        )
+    }
+
     func testExplicitExpandSurvivesDefaultRule() {
         let map = profileMap(("default", true), ("alpha", false))
         // The user expanded "alpha": an explicit-expand must beat the default-collapsed rule.
