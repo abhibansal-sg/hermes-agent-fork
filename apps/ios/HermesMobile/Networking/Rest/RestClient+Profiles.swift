@@ -79,10 +79,10 @@ extension RestClient {
 
     /// `GET /api/profiles/sessions?profile=…&limit=…&offset=…&order=…&archived=…`
     /// → the cross-profile aggregate rail wrapper. `profile="all"` aggregates
-    /// across every profile; a specific name resolves that one. Called ONLY when
-    /// `profiles == .available` AND the active scope is "All profiles"; the
-    /// single-profile / default scope keeps using the existing `GET /api/sessions`
-    /// (so the dormant path is byte-for-byte the shipped fetch).
+    /// across every profile; a specific name resolves that one. Called when
+    /// `profiles == .available`: All uses the aggregate value, while Default and
+    /// named selectors request their authoritative profile-scoped window. A
+    /// gateway without profile capability keeps using `GET /api/sessions`.
     ///
     /// The server is STRICT on a bad/unknown profile name (`400`/`404`); those map
     /// to ``RestError/badStatus`` for the caller to surface inline.

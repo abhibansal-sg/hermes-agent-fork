@@ -2773,6 +2773,9 @@ final class ChatStore {
             guard existing.text != display else { return }
             messages[index] = ChatMessage(
                 id: existing.id,
+                canonicalID: existing.canonicalID,
+                usesPositionalSeedIdentity: existing.usesPositionalSeedIdentity,
+                authoritativeSeedTimestamp: existing.authoritativeSeedTimestamp,
                 role: .user,
                 clientMessageID: clientMessageID,
                 text: display,
@@ -3623,8 +3626,18 @@ final class ChatStore {
             return
         }
 
+        let positionalAliases = Self.positionalAliasMatches(
+            existing: messages,
+            incoming: incoming
+        )
         var existingByID: [UUID: ChatMessage] = [:]
-        for message in messages { existingByID[message.id] = message }
+        var existingByCanonicalID: [UUID: ChatMessage] = [:]
+        for message in messages {
+            existingByID[message.id] = message
+            if let canonicalID = message.canonicalID {
+                existingByCanonicalID[canonicalID] = message
+            }
+        }
 
         var reconnectConsumed = false
         let reconnectRow: ChatMessage? = reconnectID.flatMap { existingByID[$0] }
@@ -3641,11 +3654,25 @@ final class ChatStore {
         var retiredExistingIDs: Set<UUID> = []
 
         for newMessage in incoming {
-            if var existing = existingByID[newMessage.id] {
+            let identityMatch = existingByID[newMessage.id]
+                ?? existingByCanonicalID[newMessage.id]
+            let fallbackMatch = identityMatch == nil
+                ? positionalAliases[newMessage.id]
+                : nil
+            if var existing = identityMatch ?? fallbackMatch {
                 // Same identity across reseeds — keep the slot, update content in
                 // place so SwiftUI diffs the parts rather than remounting the row.
+                // Older gateways can omit stable wire ids, making a bounded
+                // transcript window shift the positional seeded UUID. In that
+                // case the adopted row's authoritative payload is the stable
+                // fallback identity; advance its canonical alias to the newest
+                // positional UUID for subsequent reconciles.
+                if fallbackMatch != nil {
+                    existing.canonicalID = newMessage.id
+                }
                 existing.parts = newMessage.parts
                 existing.isStreaming = newMessage.isStreaming
+                existing.authoritativeSeedTimestamp = newMessage.authoritativeSeedTimestamp
                 existing.timestamp = newMessage.timestamp
                 existing.presentation = newMessage.presentation
                 updatedByID[existing.id] = existing
@@ -3681,6 +3708,9 @@ final class ChatStore {
                 consumedIDs.insert(reconnect.id)
                 let adopted = ChatMessage(
                     id: reconnect.id,
+                    canonicalID: newMessage.id,
+                    usesPositionalSeedIdentity: newMessage.usesPositionalSeedIdentity,
+                    authoritativeSeedTimestamp: newMessage.authoritativeSeedTimestamp,
                     role: newMessage.role,
                     parts: newMessage.parts,
                     isStreaming: newMessage.isStreaming,
@@ -3701,6 +3731,9 @@ final class ChatStore {
                 consumedIDs.insert(echo.id)
                 let adopted = ChatMessage(
                     id: echo.id,
+                    canonicalID: newMessage.id,
+                    usesPositionalSeedIdentity: newMessage.usesPositionalSeedIdentity,
+                    authoritativeSeedTimestamp: newMessage.authoritativeSeedTimestamp,
                     role: newMessage.role,
                     clientMessageID: echo.clientMessageID,
                     parts: newMessage.parts,
@@ -3806,6 +3839,170 @@ final class ChatStore {
         messages = rebuilt
     }
 
+    /// Match adopted positional aliases across a bounded legacy transcript slide.
+    /// A longest-common-subsequence alignment preserves order and surrounding
+    /// turn context, so repeated payloads such as "Done" pair with the correct
+    /// occurrence instead of an older/newer legitimate turn. Walking backward
+    /// makes a repeated suffix prefer the newest occurrence when an older one
+    /// has fallen out of the server window.
+    nonisolated private static func positionalAliasMatches(
+        existing: [ChatMessage],
+        incoming: [ChatMessage]
+    ) -> [UUID: ChatMessage] {
+        guard existing.contains(where: {
+            $0.canonicalID != nil && $0.usesPositionalSeedIdentity
+        }), incoming.contains(where: \.usesPositionalSeedIdentity) else { return [:] }
+
+        var lengths = Array(
+            repeating: Array(repeating: 0, count: incoming.count + 1),
+            count: existing.count + 1
+        )
+        for existingIndex in existing.indices {
+            for incomingIndex in incoming.indices {
+                if hasSameAuthoritativePayload(
+                    existing[existingIndex], incoming[incomingIndex]
+                ) {
+                    lengths[existingIndex + 1][incomingIndex + 1] =
+                        lengths[existingIndex][incomingIndex] + 1
+                } else {
+                    lengths[existingIndex + 1][incomingIndex + 1] = max(
+                        lengths[existingIndex][incomingIndex + 1],
+                        lengths[existingIndex + 1][incomingIndex]
+                    )
+                }
+            }
+        }
+
+        var matchedPairs: [(existing: Int, incoming: Int)] = []
+        var existingIndex = existing.count
+        var incomingIndex = incoming.count
+        while existingIndex > 0, incomingIndex > 0 {
+            let existingRow = existing[existingIndex - 1]
+            let incomingRow = incoming[incomingIndex - 1]
+            if hasSameAuthoritativePayload(existingRow, incomingRow),
+               lengths[existingIndex][incomingIndex] ==
+                    lengths[existingIndex - 1][incomingIndex - 1] + 1 {
+                matchedPairs.append((existingIndex - 1, incomingIndex - 1))
+                existingIndex -= 1
+                incomingIndex -= 1
+            } else if lengths[existingIndex - 1][incomingIndex]
+                        > lengths[existingIndex][incomingIndex - 1] {
+                existingIndex -= 1
+            } else {
+                incomingIndex -= 1
+            }
+        }
+
+        let incomingIndexByExisting = Dictionary(
+            uniqueKeysWithValues: matchedPairs.map { ($0.existing, $0.incoming) }
+        )
+        func followingAssistantIndex(in rows: [ChatMessage], after index: Int) -> Int? {
+            guard index + 1 < rows.count else { return nil }
+            for candidate in (index + 1)..<rows.count {
+                if rows[candidate].role == .user { return nil }
+                if rows[candidate].role == .assistant { return candidate }
+            }
+            return nil
+        }
+        var aliases: [UUID: ChatMessage] = [:]
+        for pair in matchedPairs {
+            let existingRow = existing[pair.existing]
+            let incomingRow = incoming[pair.incoming]
+            guard existingRow.canonicalID != nil,
+                  existingRow.usesPositionalSeedIdentity,
+                  incomingRow.usesPositionalSeedIdentity else { continue }
+
+            let companion: (existing: Int, incoming: Int)
+            switch existingRow.role {
+            case .assistant:
+                // A common payload such as "Done" is not a turn identity. Only
+                // alias an assistant when its preceding user boundary also
+                // aligned to the same incoming turn. This distinguishes a moved
+                // row from a new offline/desktop turn with coincidentally equal
+                // assistant text.
+                guard let existingUserIndex = existing[..<pair.existing]
+                    .lastIndex(where: { $0.role == .user }),
+                      let incomingUserIndex = incoming[..<pair.incoming]
+                    .lastIndex(where: { $0.role == .user }),
+                      incomingIndexByExisting[existingUserIndex] == incomingUserIndex
+                else { continue }
+                companion = (existingUserIndex, incomingUserIndex)
+            case .user:
+                // Prompts such as "continue" are equally non-unique. Validate
+                // the following assistant boundary as the other half of the
+                // aligned turn before reusing an adopted user echo.
+                guard let existingAssistantIndex = followingAssistantIndex(
+                    in: existing, after: pair.existing
+                ), let incomingAssistantIndex = followingAssistantIndex(
+                    in: incoming, after: pair.incoming
+                ), incomingIndexByExisting[existingAssistantIndex] == incomingAssistantIndex
+                else { continue }
+                companion = (existingAssistantIndex, incomingAssistantIndex)
+            case .system, .tool:
+                continue
+            }
+
+            let companionExisting = existing[companion.existing]
+            let companionIncoming = incoming[companion.incoming]
+            let hasTimestampAnchor = (
+                existingRow.authoritativeSeedTimestamp != nil
+                    && incomingRow.authoritativeSeedTimestamp != nil
+            ) || (
+                companionExisting.authoritativeSeedTimestamp != nil
+                    && companionIncoming.authoritativeSeedTimestamp != nil
+            )
+            let hasExternalContextAnchor = matchedPairs.contains {
+                $0.existing != pair.existing && $0.existing != companion.existing
+            }
+            guard hasTimestampAnchor || hasExternalContextAnchor else {
+                // With no timestamps and no aligned row outside this turn, an
+                // identical prompt+answer pair is indistinguishable from a new
+                // repeated turn. Preserve both rather than collapsing history.
+                continue
+            }
+            aliases[incomingRow.id] = existingRow
+        }
+        return aliases
+    }
+
+    /// Identity-free equality used by the legacy-window sequence alignment.
+    /// Seeded part ids incorporate the transcript array index, so they change
+    /// when a bounded window slides; compare the ordered payload while ignoring
+    /// only those wrapper ids.
+    nonisolated private static func hasSameAuthoritativePayload(
+        _ lhs: ChatMessage,
+        _ rhs: ChatMessage
+    ) -> Bool {
+        guard lhs.role == rhs.role,
+              lhs.presentation == rhs.presentation,
+              lhs.parts.count == rhs.parts.count else { return false }
+        if let lhsTimestamp = lhs.authoritativeSeedTimestamp,
+           let rhsTimestamp = rhs.authoritativeSeedTimestamp,
+           abs(lhsTimestamp - rhsTimestamp) > 0.001 {
+            return false
+        }
+
+        return zip(lhs.parts, rhs.parts).allSatisfy { left, right in
+            switch (left, right) {
+            case let (.reasoning(_, leftText), .reasoning(_, rightText)),
+                 let (.text(_, leftText), .text(_, rightText)),
+                 let (.warning(_, leftText), .warning(_, rightText)):
+                return leftText == rightText
+            case let (
+                .tools(_, leftTools, leftCollapsed, leftElapsed),
+                .tools(_, rightTools, rightCollapsed, rightElapsed)
+            ):
+                return leftTools == rightTools
+                    && leftCollapsed == rightCollapsed
+                    && leftElapsed == rightElapsed
+            case let (.usage(_, leftStats), .usage(_, rightStats)):
+                return leftStats == rightStats
+            default:
+                return false
+            }
+        }
+    }
+
     /// The existing user row a UNION reseed's user row adopts onto (QA-2 R15) —
     /// the optimistic echo for the SAME prompt, whose runtime id the gateway
     /// wire id never matches. Rows with a `clientMessageID` take precedence.
@@ -3818,7 +4015,10 @@ final class ChatStore {
         let text = incoming.text
         guard !text.isEmpty else { return nil }
         func matches(_ message: ChatMessage) -> Bool {
-            message.role == .user && !skipping.contains(message.id) && message.text == text
+            message.role == .user
+                && message.canonicalID == nil
+                && !skipping.contains(message.id)
+                && message.text == text
         }
         return messages.first(where: { matches($0) && $0.clientMessageID != nil })
             ?? messages.first(where: { matches($0) })
@@ -3915,6 +4115,8 @@ final class ChatStore {
                 let key = Self.seedMessageID(timestamp: ts, index: index, role: .assistant)
                 let message = ChatMessage(
                     id: ChatMessage.deterministicID(seedKey: key),
+                    usesPositionalSeedIdentity: true,
+                    authoritativeSeedTimestamp: ts,
                     role: .assistant,
                     parts: [.tools(id: pendingTools[0].id, tools: pendingTools, collapsed: false, turnElapsed: nil)],
                     timestamp: ts.map { Date(timeIntervalSince1970: $0) } ?? Date()
@@ -4087,6 +4289,7 @@ final class ChatStore {
                     if currentHasTool || activeHasTool {
                         result[active].appendSeedParts(rowParts)
                         if let ts = row.timestamp {
+                            result[active].authoritativeSeedTimestamp = ts
                             result[active].timestamp = Date(timeIntervalSince1970: ts)
                         }
                         continue
@@ -4099,7 +4302,10 @@ final class ChatStore {
             // Emit a fresh message.
             let presentation = Self.seedPresentation(role: role, stored: row, display: display)
             let message = ChatMessage(
-                id: ChatMessage.deterministicID(seedKey: baseID), role: role,
+                id: ChatMessage.deterministicID(seedKey: baseID),
+                usesPositionalSeedIdentity: row.wireId == nil,
+                authoritativeSeedTimestamp: row.timestamp,
+                role: role,
                 // R4b (I5 write-local-first / I8): a write-local-first cache row
                 // carries the send's cmid — thread it onto the painted row so the
                 // authoritative user message (same cmid) adopts it IN PLACE after
