@@ -189,6 +189,7 @@ final class SessionStore {
         cancelEnsureRuntime()
         cancelRuntimeBinding()
         cancelWatchPolling()
+        drawerLiveStatuses.removeAll()
     }
 
     /// A runtime id belongs to one WebSocket generation only. Keep the durable
@@ -202,6 +203,7 @@ final class SessionStore {
         cancelEnsureRuntime()
         cancelRuntimeBinding()
         cancelWatchPolling()
+        drawerLiveStatuses.removeAll()
     }
 
     /// A different gateway is a different cache and runtime namespace. Do not
@@ -219,6 +221,8 @@ final class SessionStore {
         activeRuntimeEpoch = nil
         activeStoredId = nil
         activeStoredProfile = nil
+        activePresentationSummary = nil
+        drawerLiveStatuses.removeAll()
         chat?.resetPromptReceiptObservation()
         chat?.reset()
         transcriptPaintedStoredId = nil
@@ -331,6 +335,10 @@ final class SessionStore {
     /// Profile component of the durable selection identity. Stored session ids
     /// are not globally unique across an aggregate multi-profile drawer.
     private(set) var activeStoredProfile: String?
+    /// One bounded fallback row for a session opened outside the global recent
+    /// rail (for example from Project detail). Hermes remains authoritative; this
+    /// row is never persisted and is replaced on the next selection.
+    private(set) var activePresentationSummary: SessionSummary?
     /// Key used for the local, not-yet-materialized chat draft. This intentionally
     /// matches ChatView's transcript `.id` fallback so the stable overlay composer
     /// and transcript agree on the draft-chat identity.
@@ -364,16 +372,22 @@ final class SessionStore {
     /// as ``composerDrafts``. This intentionally stores only cursor + original
     /// draft snapshot, never a persisted prompt ring.
     private var composerHistoryBrowses: [String: ComposerPromptHistory.State] = [:]
-    /// The summary for the active session, if it's present in the loaded list.
-    /// Used by app-side glue (e.g. the Live Activity title); `nil` for a session
-    /// not yet in `sessions` (a brand-new create the list hasn't refreshed onto).
+    /// The authoritative rail row for the active session, falling back to the one
+    /// bounded presentation row captured at `open(_:)` while the rail catches up.
     var activeSummary: SessionSummary? {
         guard let id = activeStoredId else { return nil }
-        return sessions.first {
+        if let authoritative = sessions.first(where: {
             $0.id == id
                 && (activeStoredProfile == nil
                     || selectedProfileID(for: $0) == activeStoredProfile)
+        }) {
+            return authoritative
         }
+        guard let fallback = activePresentationSummary,
+              fallback.id == id,
+              activeStoredProfile == nil
+                || selectedProfileID(for: fallback) == activeStoredProfile else { return nil }
+        return fallback
     }
 
     func isActive(_ summary: SessionSummary) -> Bool {
@@ -821,7 +835,29 @@ final class SessionStore {
     /// already went further in STR-996 by grouping at all — so this is the
     /// mobile-chosen "few": compact enough that several collapsed groups fit the
     /// drawer, enough to preview recent activity. Tunable.
-    static let drawerCollapsedProfilePreviewCount = 3
+    nonisolated static let drawerCollapsedProfilePreviewCount = 3
+
+    /// Keep a collapsed group compact without allowing the selected chat to
+    /// disappear from its own profile. Recency order is preserved; when the
+    /// active row falls outside the bounded prefix it replaces the final row.
+    nonisolated static func drawerCollapsedProfilePreview(
+        _ rows: [SessionSummary],
+        activeScopedIdentity: String?,
+        limit: Int = drawerCollapsedProfilePreviewCount
+    ) -> [SessionSummary] {
+        guard limit > 0 else { return [] }
+        var preview = Array(rows.prefix(limit))
+        guard let activeScopedIdentity,
+              !preview.contains(where: { $0.scopedIdentity == activeScopedIdentity }),
+              let active = rows.first(where: { $0.scopedIdentity == activeScopedIdentity })
+        else { return preview }
+        if preview.count == limit {
+            preview[preview.index(before: preview.endIndex)] = active
+        } else {
+            preview.append(active)
+        }
+        return preview
+    }
 
     /// Effective collapsed state for an All Profiles group. Derives from the
     /// default rule (collapse every group EXCEPT the default/active profile)
@@ -832,7 +868,8 @@ final class SessionStore {
             profile,
             collapsed: collapsedProfiles,
             expanded: expandedProfiles,
-            profileMap: profileSummaryMap
+            profileMap: profileSummaryMap,
+            activeProfile: activeStoredProfile
         )
     }
 
@@ -843,10 +880,14 @@ final class SessionStore {
         _ profile: String,
         collapsed: Set<String>,
         expanded: Set<String>,
-        profileMap: [String: ProfileSummary]
+        profileMap: [String: ProfileSummary],
+        activeProfile: String? = nil
     ) -> Bool {
         if expanded.contains(profile) { return false }
         if collapsed.contains(profile) { return true }
+        if normalizedDrawerProfile(activeProfile) == normalizedDrawerProfile(profile) {
+            return false
+        }
         return !isDefaultDrawerProfile(profile, profileMap: profileMap)
     }
 
@@ -1024,6 +1065,10 @@ final class SessionStore {
     /// pulsing dot next to a row whose conversation moved in the last few
     /// seconds for turns observed by this connection.
     private(set) var lastActivityAt: [String: Date] = [:]
+    /// Native `session.active_list` projection keyed by the same scoped identity
+    /// as drawer rows. It is transient presentation state, refreshed only while
+    /// the drawer is visible and cleared on transport/scope teardown.
+    private(set) var drawerLiveStatuses: [String: DrawerSessionStatus] = [:]
     /// FIX 6a — un-observed shadow of the most-recent stamp time per id, used purely
     /// to COALESCE the per-delta `lastActivityAt` write (skip a re-stamp within
     /// ``liveStampCoalesce``). `@ObservationIgnored` so consulting/updating it never
@@ -1230,6 +1275,48 @@ final class SessionStore {
         return .found(WatchedLiveSession(activeItem: live))
     }
 
+    /// Refresh the drawer's transient status projection from stock Hermes.
+    /// The view owns cadence/visibility; this method performs exactly one native
+    /// inventory read and never creates, resumes, or takes over a runtime.
+    func refreshDrawerLiveStatuses() async {
+        let workGeneration = connectionWorkGeneration
+        do {
+            let result: SessionActiveListResult
+            if let activeListRPC {
+                result = try await activeListRPC()
+            } else {
+                guard let client, connection?.isTransportReady == true else {
+                    drawerLiveStatuses.removeAll()
+                    return
+                }
+                result = try await client.request(
+                    "session.active_list", params: .object([:])
+                )
+            }
+            guard connectionWorkGeneration == workGeneration else { return }
+            var next: [String: DrawerSessionStatus] = [:]
+            for live in result.sessions {
+                guard let identity = scopedSessionIdentity(
+                    forStoredID: live.sessionKey,
+                    runtimeID: live.id
+                ) else { continue }
+                next[identity] = DrawerSessionStatus(stockStatus: live.status)
+            }
+            drawerLiveStatuses = next
+        } catch let GatewayError.rpc(code, _) where code == -32601 {
+            // Older gateways fall back to the recent-event indicator.
+            drawerLiveStatuses.removeAll()
+        } catch {
+            // Never let a stale Working/Needs-attention label outlive Hermes'
+            // current inventory. A later visible-drawer poll repopulates it.
+            drawerLiveStatuses.removeAll()
+        }
+    }
+
+    func clearDrawerLiveStatuses() {
+        drawerLiveStatuses.removeAll()
+    }
+
     /// Mirror the stock client's foreground active-list observation without
     /// taking ownership. This only restores a missed live start for the session
     /// already on screen; idle/absent rows never trigger session.resume.
@@ -1264,16 +1351,19 @@ final class SessionStore {
                           chat?.settleWatchOnlyTurn(runtimeId: live.id) == true {
                     markTurnCompleted(storedId: storedID, runtimeId: live.id)
                     await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
+                    await refresh()
                 } else if mode == .drive,
                           chat?.settleLocalTurn(runtimeId: live.id) == true {
                     markTurnCompleted(storedId: storedID, runtimeId: live.id)
                     await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
+                    await refresh()
                 }
             case .absent:
                 guard sessionBinding?.mode == .watch,
                       chat?.settleWatchOnlyTurn(runtimeId: activeRuntimeId) == true else { return }
                 markTurnCompleted(storedId: storedID, runtimeId: activeRuntimeId)
                 await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
+                await refresh()
             case .unsupported:
                 return
             }
@@ -1442,34 +1532,48 @@ final class SessionStore {
               activeStoredId == storedID,
               activeRuntimeId == runtimeID else { return false }
         do {
-            guard case .found(let live) = try await inspectLiveSession(
+            let inspection = try await inspectLiveSession(
                 storedID: storedID, compactSnapshot: true
             )
-            else { return false }
             guard sessionBinding?.mode == .watch,
                   activeStoredId == storedID,
                   activeRuntimeId == runtimeID else { return false }
-            if live.id != runtimeID {
-                bindSession(
-                    storedID: storedID, runtimeID: live.id,
-                    mode: .watch, generation: nil
-                )
+            switch inspection {
+            case .found(let live):
+                if live.id != runtimeID {
+                    bindSession(
+                        storedID: storedID, runtimeID: live.id,
+                        mode: .watch, generation: nil
+                    )
+                }
+                connection?.applySessionModel(live.model)
+                guard let snapshot = live.snapshot else { return false }
+                if let info = snapshot.info { connection?.applyRuntimeInfo(info) }
+                if snapshot.snapshotRunning == true {
+                    await chat?.reconcileLiveTurnStatus(
+                        runtimeId: live.id,
+                        snapshotRunning: true,
+                        inflight: snapshot.inflight,
+                        watchOnly: true
+                    )
+                } else if chat?.settleWatchOnlyTurn(runtimeId: live.id) == true {
+                    markTurnCompleted(storedId: storedID, runtimeId: live.id)
+                    await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
+                    await refresh()
+                }
+                return true
+            case .absent:
+                if chat?.settleWatchOnlyTurn(runtimeId: runtimeID) == true {
+                    markTurnCompleted(storedId: storedID, runtimeId: runtimeID)
+                    await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
+                    await refresh()
+                }
+                // Keep observing the selected stored session at the idle cadence;
+                // a desktop may resume it again without the phone navigating.
+                return true
+            case .unsupported:
+                return false
             }
-            connection?.applySessionModel(live.model)
-            guard let snapshot = live.snapshot else { return false }
-            if let info = snapshot.info { connection?.applyRuntimeInfo(info) }
-            if snapshot.snapshotRunning == true {
-                await chat?.reconcileLiveTurnStatus(
-                    runtimeId: live.id,
-                    snapshotRunning: true,
-                    inflight: snapshot.inflight,
-                    watchOnly: true
-                )
-            } else if chat?.settleWatchOnlyTurn(runtimeId: live.id) == true {
-                markTurnCompleted(storedId: storedID, runtimeId: live.id)
-                await chat?.reconcileAuthoritativeTranscript(surfaceFailure: false)
-            }
-            return true
         } catch {
             // A transient timeout must not permanently stop observation. The
             // loop is already cadence-limited; reconnect/scope teardown cancels
@@ -1976,7 +2080,12 @@ final class SessionStore {
     /// ``recentsExcludeSources`` before they ever populate `sessions`, so the
     /// drawer only advertises source groups it can actually fill.
     private var drawerSourceCandidateSessions: [SessionSummary] {
-        let scoped = Self.filterByProfile(sessions, scope: activeProfile, multiAvailable: isMultiProfileAvailable)
+        var rows = sessions
+        if let activeSummary,
+           !rows.contains(where: { $0.scopedIdentity == activeSummary.scopedIdentity }) {
+            rows.append(activeSummary)
+        }
+        let scoped = Self.filterByProfile(rows, scope: activeProfile, multiAvailable: isMultiProfileAvailable)
             .filter { Self.drawerSourceKind(for: $0) != nil }
         return Self.sortedByActivity(scoped)
     }
@@ -2778,7 +2887,12 @@ final class SessionStore {
         runtimeID: String? = nil
     ) -> String? {
         guard usesAggregateRail else { return id }
-        let matches = sessions.filter { $0.id == id }
+        var rows = sessions
+        if let activePresentationSummary,
+           !rows.contains(where: { $0.scopedIdentity == activePresentationSummary.scopedIdentity }) {
+            rows.append(activePresentationSummary)
+        }
+        let matches = rows.filter { $0.id == id }
         if activeStoredId == id,
            runtimeID != nil,
            runtimeID == activeRuntimeId,
@@ -3331,6 +3445,7 @@ final class SessionStore {
         }
         let drawerIntentPending = pendingDrawerReveal != nil
         activeStoredProfile = selectedProfileID(for: summary)
+        activePresentationSummary = summary
         if reusableDrive {
             activeStoredId = summary.id
         } else {
@@ -3555,6 +3670,7 @@ final class SessionStore {
         activeRuntimeEpoch = nil
         activeStoredId = nil
         activeStoredProfile = nil
+        activePresentationSummary = nil
         resetComposerHistoryBrowse()
         connection?.updatePhoneForeground(nil)
         chat?.reset()
@@ -4829,6 +4945,15 @@ final class SessionStore {
         return Date().timeIntervalSince(at) < Self.liveWindow
     }
 
+    /// Native status when available, with the ten-second observed-event pulse as
+    /// a compatibility fallback only. No client-authored "done" state exists.
+    func drawerStatus(for summary: SessionSummary) -> DrawerSessionStatus? {
+        if let status = drawerLiveStatuses[sessionListIdentity(summary)] {
+            return status
+        }
+        return isLive(summary) ? .recentActivity : nil
+    }
+
     /// Whether a stored session id is currently within the live window.
     func isLive(storedSessionId id: String) -> Bool {
         guard let identity = scopedSessionIdentity(forStoredID: id),
@@ -4963,6 +5088,7 @@ final class SessionStore {
         activeRuntimeEpoch = nil
         activeStoredId = nil
         activeStoredProfile = nil
+        activePresentationSummary = nil
         chat?.reset()
         chat?.discardPendingGates()
         transcriptPaintedStoredId = nil

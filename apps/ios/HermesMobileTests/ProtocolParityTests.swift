@@ -218,6 +218,10 @@ final class ProtocolParityTests: XCTestCase {
                 "action_revision": .number(4),
             ]).decoded(as: SessionOpenResult.self)!
         }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("watch snapshot must not resume the runtime")
+            throw GatewayError.notConnected
+        }
         var takeoverRuntime: String?
         sessions.takeoverRPC = { runtimeID in takeoverRuntime = runtimeID }
         sessions.open(SessionSummary(
@@ -250,7 +254,15 @@ final class ProtocolParityTests: XCTestCase {
                 "action_revision": .number(4),
             ]).decoded(as: SessionOpenResult.self)!
         }
-        sessions.takeoverRPC = { _ in try await Task.sleep(for: .milliseconds(50)) }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("watch snapshot must not resume the runtime")
+            throw GatewayError.notConnected
+        }
+        let takeoverStarted = expectation(description: "takeover started")
+        sessions.takeoverRPC = { _ in
+            takeoverStarted.fulfill()
+            try await Task.sleep(for: .milliseconds(50))
+        }
         sessions.open(SessionSummary(
             id: "stored-desktop", title: "Desktop", preview: nil,
             startedAt: 1, messageCount: 1, source: nil, lastActive: 1, cwd: nil
@@ -260,7 +272,7 @@ final class ProtocolParityTests: XCTestCase {
         let takeover = Task {
             try await sessions.beginPromptSubmission(runtimeID: "runtime-desktop")
         }
-        await Task.yield()
+        await fulfillment(of: [takeoverStarted], timeout: 1)
         sessions.startDraft()
 
         do {
@@ -343,6 +355,78 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertTrue(SessionActiveItem.Status.starting.isRunning)
         XCTAssertTrue(SessionActiveItem.Status.waiting.isRunning)
         XCTAssertTrue(SessionActiveItem.Status.working.isRunning)
+    }
+
+    func testStockActiveStatusesMapToDrawerPresentation() {
+        XCTAssertEqual(DrawerSessionStatus(stockStatus: .idle), .idle)
+        XCTAssertEqual(DrawerSessionStatus(stockStatus: .starting), .starting)
+        XCTAssertEqual(DrawerSessionStatus(stockStatus: .working), .working)
+        XCTAssertEqual(DrawerSessionStatus(stockStatus: .waiting), .needsAttention)
+        XCTAssertEqual(DrawerSessionStatus.needsAttention.accessibilityLabel, "Needs attention")
+    }
+
+    func testDrawerStatusRefreshUsesNativeActiveListInventory() async {
+        let sessions = SessionStore()
+        let working = SessionSummary(
+            id: "stored-working", title: "Working", preview: nil,
+            startedAt: 1, messageCount: 2, source: "desktop",
+            lastActive: 1, cwd: nil
+        )
+        let waiting = SessionSummary(
+            id: "stored-waiting", title: "Waiting", preview: nil,
+            startedAt: 1, messageCount: 2, source: "desktop",
+            lastActive: 1, cwd: nil
+        )
+        sessions.sessions = [working, waiting]
+        sessions.activeListRPC = {
+            SessionActiveListResult(sessions: [
+                SessionActiveItem(
+                    id: "runtime-working", sessionKey: "stored-working",
+                    status: .working, model: nil
+                ),
+                SessionActiveItem(
+                    id: "runtime-waiting", sessionKey: "stored-waiting",
+                    status: .waiting, model: nil
+                ),
+            ])
+        }
+
+        await sessions.refreshDrawerLiveStatuses()
+
+        XCTAssertEqual(sessions.drawerStatus(for: working), .working)
+        XCTAssertEqual(sessions.drawerStatus(for: waiting), .needsAttention)
+    }
+
+    func testRepeatedStockWatchSnapshotGrowsSameAssistantRow() async {
+        let (chat, _) = makeStore()
+        let first = SessionInflightTurn(
+            user: "build the feature", assistant: "working", streaming: true
+        )
+        let second = SessionInflightTurn(
+            user: "build the feature", assistant: "working on it", streaming: true
+        )
+
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: activeRuntime,
+            snapshotRunning: true,
+            inflight: first,
+            watchOnly: true
+        )
+        let assistantID = try? XCTUnwrap(chat.messages.last?.id)
+
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: activeRuntime,
+            snapshotRunning: true,
+            inflight: second,
+            watchOnly: true
+        )
+
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant])
+        XCTAssertEqual(chat.messages.filter { $0.role == .user }.count, 1)
+        XCTAssertEqual(chat.messages.last?.id, assistantID)
+        XCTAssertEqual(chat.messages.last?.text, "working on it")
+        XCTAssertTrue(chat.messages.last?.isStreaming == true)
+        XCTAssertFalse(chat.localTurnInFlight)
     }
 
     func testPassiveOpenUsesStockWatchSnapshotWithoutResume() async {
@@ -449,6 +533,71 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertFalse(chat.localTurnInFlight)
         XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
         XCTAssertEqual(chat.messages.last?.text, "finished")
+        await sessions.closeActive()
+    }
+
+    func testAbsentStockWatchSettlesAndRefreshesCanonicalRail() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        let selected = SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: "working",
+            startedAt: 1, messageCount: 2, source: "desktop",
+            lastActive: 1, cwd: nil
+        )
+        sessions.sessions = [selected]
+        sessions.transcriptFetch = { _ in [] }
+        chat.backfillFetch = { _ in [
+            StoredMessage(role: "user", content: .string("build the feature")),
+            StoredMessage(role: "assistant", content: .string("finished")),
+        ] }
+        var watchCalls = 0
+        sessions.watchRPC = { _ in
+            watchCalls += 1
+            if watchCalls > 1 {
+                throw GatewayError.rpc(code: 4001, message: "session not found")
+            }
+            return JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "running": .bool(true),
+                "status": .string("working"),
+                "inflight": .object([
+                    "user": .string("build the feature"),
+                    "assistant": .string("working"),
+                    "streaming": .bool(true),
+                ]),
+                "messages": .array([]),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("watch snapshot must not resume the runtime")
+            throw GatewayError.notConnected
+        }
+        var railRefreshes = 0
+        sessions.sessionsFetch = {
+            railRefreshes += 1
+            return ([SessionSummary(
+                id: "stored-desktop", title: "Desktop", preview: "finished",
+                startedAt: 1, messageCount: 3, source: "desktop",
+                lastActive: 2, cwd: nil
+            )], 1)
+        }
+
+        sessions.open(selected)
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertTrue(chat.isStreaming)
+
+        _ = await sessions.refreshWatchedSessionOnce(
+            storedID: "stored-desktop", runtimeID: "runtime-desktop"
+        )
+
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertEqual(chat.messages.last?.text, "finished")
+        XCTAssertEqual(railRefreshes, 1)
+        XCTAssertEqual(sessions.sessions.first?.preview, "finished")
         await sessions.closeActive()
     }
 

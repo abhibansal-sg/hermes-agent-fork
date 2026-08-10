@@ -1393,10 +1393,18 @@ final class ChatStore {
         // `active_list` is a read-only liveness poll, not a new turn. Once the
         // selected stream already owns this runtime, restoring the snapshot
         // again would rotate the local token and clear the subagent tree on
-        // every poll. Keep the live projection intact; the websocket remains
-        // the source of deltas for the turn already on screen.
+        // every poll. Keep the live projection intact. A passive stock watch has
+        // no event fan-out, so its cumulative assistant snapshot is the native
+        // source of progress and must update the existing row in place.
         if isStreaming, streamOwner == currentSelectionOwner {
-            if watchOnly == watchOnlyStream { return }
+            if watchOnly == watchOnlyStream {
+                if watchOnly,
+                   let assistant = inflight?.assistant,
+                   !assistant.isEmpty {
+                    mutateStreaming { $0.applyFinalText(assistant) }
+                }
+                return
+            }
         }
         restoreInflightTurn(inflight, watchRuntimeId: watchOnly ? runtimeId : nil)
     }

@@ -53,17 +53,16 @@ enum DrawerSourceGlyph {
 /// title (15 semibold, `fg`), preview (13, `mutedFg`, **1 line**), relative
 /// time (11, `mutedFg`) and a source GLYPH (no message count, no capsule).
 ///
-/// A live-pulse dot (theme `midground`) appears when ``isLive`` is `true` —
-/// fed by `SessionStore.isLive(_:)` (an observed event for this stored session
-/// arrived <10s ago; B3 owns the registry, B1 consumes it).
+/// The leading marker and status label consume the transient
+/// ``DrawerSessionStatus`` projection. Stock Hermes statuses win; recent event
+/// activity is used only as an older-gateway compatibility fallback.
 struct DrawerSessionRow: View {
     @Environment(\.hermesTheme) private var theme
 
     let summary: SessionSummary
     var isPinned: Bool = false
     var isSelected: Bool = false
-    /// Whether an observed event for this session landed in the last ~10s.
-    var isLive: Bool = false
+    var status: DrawerSessionStatus?
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -72,7 +71,7 @@ struct DrawerSessionRow: View {
             // DC-04: animate the transition so pin/live marker changes fade in/out.
             leadingMarker
                 .frame(width: 8)
-                .animation(.easeInOut(duration: 0.25), value: isLive)
+                .animation(.easeInOut(duration: 0.25), value: status)
                 .animation(.easeInOut(duration: 0.2), value: isPinned)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -89,6 +88,11 @@ struct DrawerSessionRow: View {
                 }
 
                 HStack(spacing: 6) {
+                    if let status {
+                        Text(status.accessibilityLabel)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(status == .needsAttention ? Color.orange : theme.mutedFg)
+                    }
                     if let date = summary.displayDate {
                         // ABH-86 item 4: tick the relative-time label every 60s so
                         // "2m ago" advances to "3m ago" without a new message frame.
@@ -135,6 +139,9 @@ struct DrawerSessionRow: View {
     /// and VoiceOver omits the value announcement entirely.
     private var accessibilityRowValue: String {
         var parts: [String] = []
+        if let status {
+            parts.append(status.accessibilityLabel)
+        }
         if let date = summary.displayDate {
             // Same "now"-under-a-minute label the visible row shows (read once at
             // focus time; the TimelineView path handles the periodic refresh).
@@ -148,9 +155,9 @@ struct DrawerSessionRow: View {
 
     @ViewBuilder
     private var leadingMarker: some View {
-        if isLive {
+        if status == .working || status == .starting || status == .recentActivity {
             LivePulseDot(color: theme.midground)
-                .accessibilityLabel("Live")
+                .accessibilityLabel(status?.accessibilityLabel ?? "Working")
                 // DC-04: live-pulse dot uses an identity transition so it fades
                 // in on appear and out on removal — a .scale+.opacity combination
                 // so the dot blooms/pops into/out of existence rather than a hard
@@ -161,6 +168,18 @@ struct DrawerSessionRow: View {
                         removal:   .scale(scale: 0.4).combined(with: .opacity)
                     )
                 )
+        } else if status == .needsAttention {
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .accessibilityLabel("Needs attention")
+                .transition(.scale(scale: 0.5).combined(with: .opacity))
+        } else if status == .idle {
+            Image(systemName: "circle")
+                .font(.system(size: 7, weight: .semibold))
+                .foregroundStyle(theme.mutedFg)
+                .accessibilityLabel("Idle")
+                .transition(.opacity)
         } else if isPinned {
             Image(systemName: "pin.fill")
                 .font(.caption2)

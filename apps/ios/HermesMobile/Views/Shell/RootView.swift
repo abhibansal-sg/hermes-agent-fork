@@ -1254,7 +1254,11 @@ private struct CompactLayout: View {
                 // The drawer sits on the canvas beneath the chat card. It owns
                 // the status-bar area when the card is pushed aside (it fills the
                 // whole surface; the card simply rides above it).
-                DrawerView(onNavigate: close, onOpenSettings: onOpenSettings)
+                DrawerView(
+                    isVisible: drawer.isOpen,
+                    onNavigate: close,
+                    onOpenSettings: onOpenSettings
+                )
                     .frame(width: drawerWidth, alignment: .leading)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                     .background(themeStore.current.listBg.ignoresSafeArea())

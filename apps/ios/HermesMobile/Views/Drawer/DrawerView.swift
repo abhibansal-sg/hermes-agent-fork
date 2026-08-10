@@ -72,6 +72,10 @@ struct DrawerView: View {
     /// test body that never touched this file).
     static let archivedChatsAccessibilityIdentifier = "drawerArchivedChats"
 
+    /// Compact layouts pass the real drawer-open state; the regular sidebar is
+    /// always visible. Native live inventory is polled only while this is true.
+    var isVisible: Bool = true
+
     @Environment(ConnectionStore.self) private var connection
     @Environment(SessionStore.self) private var sessions
     @Environment(QueueStore.self) private var queueStore
@@ -348,6 +352,20 @@ struct DrawerView: View {
                 }
             }
             .hermesThemed(themeStore)
+        }
+        .task(id: isVisible) {
+            guard isVisible else {
+                sessions.clearDrawerLiveStatuses()
+                return
+            }
+            while !Task.isCancelled {
+                await sessions.refreshDrawerLiveStatuses()
+                do {
+                    try await Task.sleep(for: .seconds(2))
+                } catch {
+                    return
+                }
+            }
         }
     }
 
@@ -1110,7 +1128,12 @@ struct DrawerView: View {
             // or workspace fold), then an expand affordance. `group.sessions` is
             // already newest-first (sortedByActivity in drawerProfileGroups).
             let previewCount = SessionStore.drawerCollapsedProfilePreviewCount
-            ForEach(group.sessions.prefix(previewCount), id: \.scopedIdentity) { summary in
+            let preview = SessionStore.drawerCollapsedProfilePreview(
+                group.sessions,
+                activeScopedIdentity: sessions.activeScopedIdentity,
+                limit: previewCount
+            )
+            ForEach(preview, id: \.scopedIdentity) { summary in
                 sessionRow(summary, pinned: false)
             }
             if group.sessions.count > previewCount {
@@ -1476,7 +1499,7 @@ struct DrawerView: View {
                     summary: summary,
                     isPinned: pinned,
                     isSelected: sessions.isActive(summary),
-                    isLive: sessions.isLive(summary)
+                    status: sessions.drawerStatus(for: summary)
                 )
             }
             .buttonStyle(.plain)
@@ -2464,7 +2487,7 @@ struct ProjectDetailView: View {
             DrawerSessionRow(
                 summary: summary,
                 isSelected: sessions.isActive(summary),
-                isLive: sessions.isLive(summary)
+                status: sessions.drawerStatus(for: summary)
             )
         }
         .buttonStyle(.plain)

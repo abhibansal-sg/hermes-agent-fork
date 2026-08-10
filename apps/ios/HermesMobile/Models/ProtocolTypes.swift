@@ -271,6 +271,37 @@ struct SessionActiveItem: Decodable, Sendable, Equatable {
     }
 }
 
+/// Drawer-only presentation of Hermes' native live-session status. This value is
+/// transient and never becomes transcript, workflow, or storage authority.
+/// `recentActivity` is the compatibility fallback for gateways that do not
+/// expose `session.active_list`; every other case maps directly from stock.
+enum DrawerSessionStatus: Sendable, Equatable {
+    case idle
+    case starting
+    case working
+    case needsAttention
+    case recentActivity
+
+    init(stockStatus: SessionActiveItem.Status) {
+        switch stockStatus {
+        case .idle: self = .idle
+        case .starting: self = .starting
+        case .working: self = .working
+        case .waiting: self = .needsAttention
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .idle: return "Idle"
+        case .starting: return "Starting"
+        case .working: return "Working"
+        case .needsAttention: return "Needs attention"
+        case .recentActivity: return "Recent activity"
+        }
+    }
+}
+
 /// Bounded in-process turn snapshot returned by `session.resume`/`activate`.
 /// It restores truthful UI after navigation or reconnect; it is never written
 /// to the permanent transcript cache.
