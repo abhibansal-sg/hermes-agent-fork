@@ -251,6 +251,65 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
         XCTAssertFalse(chat.isStreaming)
     }
 
+    func testRepeatedAuthoritativeReconcileKeepsAdoptedCompletionSingle() async {
+        let firstFetch = expectation(description: "terminal authoritative transcript fetched")
+        var fetchCount = 0
+        let (chat, _) = makeStore { _ in
+            fetchCount += 1
+            if fetchCount == 1 { firstFetch.fulfill() }
+            return [
+                self.storedMessage(
+                    role: "user", text: "prompt before drop", wireId: 1
+                ),
+                self.storedMessage(
+                    role: "assistant", text: "authoritative final", wireId: 2
+                ),
+            ]
+        }
+        let live = beginLocalPartialTurn(chat)
+
+        chat.handle(event: localFrame(
+            type: "message.complete",
+            payload: ["text": "frame final", "status": "complete"]
+        ))
+        await fulfillment(of: [firstFetch], timeout: 1)
+        for _ in 0..<5 { await Task.yield() }
+
+        XCTAssertEqual(chat.messages.filter { $0.role == .assistant }.count, 1)
+        XCTAssertEqual(chat.messages.last?.id, live.id)
+
+        await chat.reconcileAuthoritativeTranscript(surfaceFailure: false)
+
+        let assistants = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(
+            assistants.count,
+            1,
+            "a later refresh must recognize the canonical row already adopted by the live bubble"
+        )
+        XCTAssertEqual(assistants.first?.id, live.id)
+        XCTAssertEqual(assistants.first?.text, "authoritative final")
+    }
+
+    func testRepeatedUnionReconcileKeepsAdoptedUserEchoSingle() {
+        let (chat, _) = makeStore()
+        let echo = ChatMessage(
+            role: .user,
+            clientMessageID: "client-prompt-1",
+            text: "prompt before drop"
+        )
+        let authoritative = [
+            storedMessage(role: "user", text: "prompt before drop", wireId: 1)
+        ]
+        chat.messages = [echo]
+
+        chat.seed(from: authoritative, policy: .union)
+        chat.seed(from: authoritative, policy: .union)
+
+        XCTAssertEqual(chat.messages.filter { $0.role == .user }.count, 1)
+        XCTAssertEqual(chat.messages.first?.id, echo.id)
+        XCTAssertEqual(chat.messages.first?.clientMessageID, echo.clientMessageID)
+    }
+
     func testColdWatchCompletionRetiresLiveTwinOfAlreadyPaintedAuthority() async {
         let authoritative = [
             storedMessage(role: "user", text: "cold-open prompt", wireId: 1),

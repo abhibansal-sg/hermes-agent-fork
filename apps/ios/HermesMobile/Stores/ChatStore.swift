@@ -2773,6 +2773,7 @@ final class ChatStore {
             guard existing.text != display else { return }
             messages[index] = ChatMessage(
                 id: existing.id,
+                canonicalID: existing.canonicalID,
                 role: .user,
                 clientMessageID: clientMessageID,
                 text: display,
@@ -3624,7 +3625,13 @@ final class ChatStore {
         }
 
         var existingByID: [UUID: ChatMessage] = [:]
-        for message in messages { existingByID[message.id] = message }
+        var existingByCanonicalID: [UUID: ChatMessage] = [:]
+        for message in messages {
+            existingByID[message.id] = message
+            if let canonicalID = message.canonicalID {
+                existingByCanonicalID[canonicalID] = message
+            }
+        }
 
         var reconnectConsumed = false
         let reconnectRow: ChatMessage? = reconnectID.flatMap { existingByID[$0] }
@@ -3641,7 +3648,8 @@ final class ChatStore {
         var retiredExistingIDs: Set<UUID> = []
 
         for newMessage in incoming {
-            if var existing = existingByID[newMessage.id] {
+            if var existing = existingByID[newMessage.id]
+                ?? existingByCanonicalID[newMessage.id] {
                 // Same identity across reseeds — keep the slot, update content in
                 // place so SwiftUI diffs the parts rather than remounting the row.
                 existing.parts = newMessage.parts
@@ -3681,6 +3689,7 @@ final class ChatStore {
                 consumedIDs.insert(reconnect.id)
                 let adopted = ChatMessage(
                     id: reconnect.id,
+                    canonicalID: newMessage.id,
                     role: newMessage.role,
                     parts: newMessage.parts,
                     isStreaming: newMessage.isStreaming,
@@ -3701,6 +3710,7 @@ final class ChatStore {
                 consumedIDs.insert(echo.id)
                 let adopted = ChatMessage(
                     id: echo.id,
+                    canonicalID: newMessage.id,
                     role: newMessage.role,
                     clientMessageID: echo.clientMessageID,
                     parts: newMessage.parts,

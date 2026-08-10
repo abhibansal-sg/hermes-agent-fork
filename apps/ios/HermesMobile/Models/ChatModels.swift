@@ -53,6 +53,14 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     }
 
     let id: UUID
+    /// Canonical seeded row identity when a live message has adopted the
+    /// authoritative transcript row without changing its SwiftUI identity.
+    ///
+    /// Live rows start with a runtime UUID. On the first terminal transcript
+    /// reconcile, ``ChatStore`` keeps that UUID so the visible bubble does not
+    /// remount, and records the canonical UUID here. Later reconciles can then
+    /// match the same authority row instead of appending a duplicate.
+    let canonicalID: UUID?
     let role: ChatRole
     /// Stable durable-outbox identity for optimistic user echoes. Nil for
     /// server-seeded/legacy rows.
@@ -91,6 +99,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     /// behavior the prior `legacyAssistantParts` projection produced.
     init(
         id: UUID = UUID(),
+        canonicalID: UUID? = nil,
         role: ChatRole,
         clientMessageID: String? = nil,
         parts: [ChatMessagePart] = [],
@@ -106,6 +115,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         presentation: Presentation = .normal
     ) {
         self.id = id
+        self.canonicalID = canonicalID
         self.role = role
         self.clientMessageID = clientMessageID
         self.isStreaming = isStreaming
