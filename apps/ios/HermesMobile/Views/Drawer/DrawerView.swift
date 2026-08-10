@@ -1748,9 +1748,7 @@ struct DrawerView: View {
     /// an asynchronous first-paint callback. Keeping that callback here made a
     /// successful row selection intermittently leave the drawer fully open.
     private func open(_ summary: SessionSummary) {
-        sessions.recordDrawerUserGesture()
-        sessions.open(summary)
-        onNavigate()
+        DrawerSessionNavigation.open(summary, in: sessions, onNavigate: onNavigate)
     }
 
     /// Start a fresh local draft chat (B3 API) and dismiss the drawer. Draft
@@ -2292,6 +2290,23 @@ enum DrawerTab: String, CaseIterable, Identifiable {
     }
 }
 
+/// One tap-edge contract for every session row, regardless of whether it came
+/// from Recents, a profile group, or Project detail. Session activation is
+/// synchronous/cache-first; transcript hydration continues independently and
+/// never owns compact drawer presentation.
+@MainActor
+enum DrawerSessionNavigation {
+    static func open(
+        _ summary: SessionSummary,
+        in sessions: SessionStore,
+        onNavigate: () -> Void
+    ) {
+        sessions.recordDrawerUserGesture()
+        sessions.open(summary)
+        onNavigate()
+    }
+}
+
 // MARK: - Project detail view (ABH-351 SLICE 2)
 
 /// ABH-351 (SLICE 2) — the project detail view pushed when the user taps a
@@ -2444,7 +2459,7 @@ struct ProjectDetailView: View {
     private func sessionRow(_ summary: SessionSummary) -> some View {
         Button {
             rowTapFeedbackTrigger = UUID()
-            sessions.open(summary) { onNavigate() }
+            DrawerSessionNavigation.open(summary, in: sessions, onNavigate: onNavigate)
         } label: {
             DrawerSessionRow(
                 summary: summary,

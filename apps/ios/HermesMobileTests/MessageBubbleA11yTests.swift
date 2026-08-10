@@ -131,6 +131,20 @@ final class MessageBubbleA11yTests: XCTestCase {
         XCTAssertEqual(table.rows, [["Apples", "12", "fresh"], ["Pears", "", "ready"]])
     }
 
+    func testMarkdownTableCellsPreserveInlineFormatting() {
+        let blocks = MessageBubble.markdownBlocks("""
+        | **Name** | Link |
+        | --- | --- |
+        | `Hermes` | [Docs](https://example.com/docs_(v2)) |
+        """)
+
+        guard case .table(let table) = blocks.first else {
+            return XCTFail("expected a standards-parsed table")
+        }
+        XCTAssertEqual(table.headers, ["**Name**", "Link"])
+        XCTAssertEqual(table.rows, [["`Hermes`", "[Docs](https://example.com/docs_(v2))"]])
+    }
+
     func testMarkdownBlocksParsesTaskListBlockquoteAndNestedList() {
         let blocks = MessageBubble.markdownBlocks("""
         - [x] Done
@@ -388,6 +402,18 @@ final class MessageBubbleA11yTests: XCTestCase {
         }
         XCTAssertEqual(alt, "a]b")
         XCTAssertEqual(source, "https://example.com/x.png")
+    }
+
+    func testSplitLineByImagesBalancesParenthesesInDestination() {
+        let pieces = MessageBubble.splitLineByImages(
+            "before ![plot](https://example.com/image_(final).png) after"
+        )
+
+        XCTAssertEqual(pieces, [
+            .prose("before "),
+            .image(alt: "plot", source: "https://example.com/image_(final).png"),
+            .prose(" after"),
+        ])
     }
 
     func testSplitLineByImagesLeavesMalformedAndEmptySourceAsProse() {

@@ -265,6 +265,13 @@ enum RenderCache {
         let tailSegments = MessageSegmenter.segments(tail)
         var result = streamSettledSegments
         result.append(contentsOf: tailSegments)
+        // Reconstruct adjacent prose slices before downstream CommonMark parsing.
+        // A loose list/table/blockquote can legally span blank lines, so parsing
+        // each O(delta) slice independently changes its AST. Concatenating the
+        // already-preserved source strings is cheap and gives the standards parser
+        // the exact monolithic prose input while code/math/embed islands remain
+        // separate. Segmentation work itself stays O(current block).
+        result = coalescingAdjacentProse(result)
 
         streamPrevText = text
         streamResult = result
@@ -272,6 +279,30 @@ enum RenderCache {
         streamingTailParseChars = tail.count
         streamingSettledCount = streamSettledSegments.count
         #endif
+        return result
+    }
+
+    private static func coalescingAdjacentProse(
+        _ segments: [MessageSegmenter.Segment]
+    ) -> [MessageSegmenter.Segment] {
+        var result: [MessageSegmenter.Segment] = []
+        var pendingProse = ""
+
+        func flushProse() {
+            guard !pendingProse.isEmpty else { return }
+            result.append(.prose(pendingProse))
+            pendingProse.removeAll(keepingCapacity: true)
+        }
+
+        for segment in segments {
+            if case .prose(let body) = segment {
+                pendingProse.append(body)
+            } else {
+                flushProse()
+                result.append(segment)
+            }
+        }
+        flushProse()
         return result
     }
 

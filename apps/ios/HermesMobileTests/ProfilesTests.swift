@@ -650,4 +650,152 @@ final class ProfilesTests: XCTestCase {
         XCTAssertFalse(store.usesAggregateRail)
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
     }
+
+    /// Regression for the production cold-connect race: hydration can start the
+    /// stock/default rail while the profiles capability is still unknown. Once
+    /// profile discovery proves an aggregate rail is available, that provisional
+    /// response must be fenced and exactly one aggregate response must become the
+    /// visible list — even when the old two-row response arrives last.
+    func testProfileResolutionRefetchesAggregateAndRejectsLateStockResponse() async {
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        sessions.attach(connection: connection, chat: chat)
+        sessions.activeProfile = DefaultsKeys.allProfilesScope
+
+        let stockRows = [
+            row("default-1", profile: nil, source: "app"),
+            row("default-2", profile: nil, source: "app"),
+        ]
+        let aggregateRows = (1...8).map { index in
+            row("work-\(index)", profile: index.isMultiple(of: 2) ? "work" : "personal", source: "app")
+        }
+        let gate = SessionRailFetchGate(stockRows: stockRows, aggregateRows: aggregateRows)
+        sessions.sessionsFetchForRail = { query in
+            await gate.fetch(query)
+        }
+        sessions.profilesFetch = {
+            [
+                ProfileSummary(name: "default", isDefault: true, description: nil),
+                ProfileSummary(name: "work", isDefault: false, description: nil),
+                ProfileSummary(name: "personal", isDefault: false, description: nil),
+            ]
+        }
+
+        let provisionalRefresh = Task { await sessions.refresh() }
+        await gate.waitUntilStockStarted()
+
+        connection.capabilities._seedProfilesCapabilityForTesting(.available)
+        await sessions.loadProfiles()
+
+        XCTAssertEqual(sessions.visibleSessions.map(\.id), aggregateRows.map(\.id),
+                       "profile resolution must replace the provisional two-row rail with the aggregate result")
+        XCTAssertEqual(sessions.lastSessionRailDiagnostics?.query.kind, .aggregate)
+        XCTAssertEqual(sessions.lastSessionRailDiagnostics?.rawCount, aggregateRows.count)
+        XCTAssertEqual(sessions.lastSessionRailDiagnostics?.displayedCount, aggregateRows.count)
+        XCTAssertEqual(sessions.lastSessionRailDiagnostics?.profileDistribution,
+                       ["work": 4, "personal": 4])
+
+        await gate.releaseStock()
+        await provisionalRefresh.value
+
+        XCTAssertEqual(sessions.visibleSessions.map(\.id), aggregateRows.map(\.id),
+                       "the late default-profile response must not overwrite the aggregate rail")
+        let requestedQueries = await gate.requestedQueries()
+        XCTAssertEqual(requestedQueries, [
+            SessionRailQuery(kind: .stock, activeProfile: DefaultsKeys.allProfilesScope),
+            SessionRailQuery(kind: .aggregate, activeProfile: DefaultsKeys.allProfilesScope),
+        ])
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+    }
+
+    /// A forced reconnect probe can discover that the same gateway URL has
+    /// downgraded from profile-capable to stock Hermes. The prior aggregate
+    /// presentation must then be replaced through the native stock rail rather
+    /// than remaining frozen behind the now-dormant profile gate.
+    func testProfileCapabilityDowngradeReconcilesBackToStockRail() async {
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        sessions.attach(connection: connection, chat: chat)
+        sessions.activeProfile = DefaultsKeys.allProfilesScope
+
+        let aggregateRows = [row("work-1", profile: "work", source: "app")]
+        let stockRows = [row("default-1", profile: nil, source: "app")]
+        var requestedQueries: [SessionRailQuery] = []
+        sessions.sessionsFetchForRail = { query in
+            requestedQueries.append(query)
+            let rows = query.kind == .aggregate ? aggregateRows : stockRows
+            return (rows, rows.count)
+        }
+        sessions.profilesFetch = {
+            [
+                ProfileSummary(name: "default", isDefault: true, description: nil),
+                ProfileSummary(name: "work", isDefault: false, description: nil),
+            ]
+        }
+
+        connection.capabilities._seedProfilesCapabilityForTesting(.available)
+        await sessions.loadProfiles()
+        XCTAssertEqual(sessions.visibleSessions.map(\.id), ["work-1"])
+
+        connection.capabilities._seedProfilesCapabilityForTesting(.unavailable)
+        await sessions.loadProfiles()
+
+        XCTAssertTrue(sessions.profiles.isEmpty)
+        XCTAssertEqual(sessions.visibleSessions.map(\.id), ["default-1"])
+        XCTAssertEqual(requestedQueries, [
+            SessionRailQuery(kind: .aggregate, activeProfile: DefaultsKeys.allProfilesScope),
+            SessionRailQuery(kind: .stock, activeProfile: DefaultsKeys.allProfilesScope),
+        ])
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+    }
+}
+
+/// Deterministic suspension point for the profile-resolution race. The actor
+/// avoids sleeps and keeps the test parallel-safe under Swift concurrency.
+private actor SessionRailFetchGate {
+    private let stockRows: [SessionSummary]
+    private let aggregateRows: [SessionSummary]
+    private var queries: [SessionRailQuery] = []
+    private var stockStarted = false
+    private var stockStartedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var stockRelease: CheckedContinuation<Void, Never>?
+
+    init(stockRows: [SessionSummary], aggregateRows: [SessionSummary]) {
+        self.stockRows = stockRows
+        self.aggregateRows = aggregateRows
+    }
+
+    func fetch(_ query: SessionRailQuery) async -> (sessions: [SessionSummary], total: Int?) {
+        queries.append(query)
+        switch query.kind {
+        case .stock:
+            stockStarted = true
+            stockStartedWaiters.forEach { $0.resume() }
+            stockStartedWaiters.removeAll()
+            await withCheckedContinuation { continuation in
+                stockRelease = continuation
+            }
+            return (stockRows, stockRows.count)
+        case .aggregate:
+            return (aggregateRows, aggregateRows.count)
+        }
+    }
+
+    func waitUntilStockStarted() async {
+        guard !stockStarted else { return }
+        await withCheckedContinuation { continuation in
+            stockStartedWaiters.append(continuation)
+        }
+    }
+
+    func releaseStock() {
+        stockRelease?.resume()
+        stockRelease = nil
+    }
+
+    func requestedQueries() -> [SessionRailQuery] { queries }
 }

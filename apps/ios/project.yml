@@ -23,6 +23,11 @@ packages:
   SwiftMath:
     url: https://github.com/mgriebling/SwiftMath
     from: "1.7.3"
+  # CommonMark + GFM syntax authority for chat and file-viewer block parsing.
+  # Hermes keeps its native SwiftUI renderers; only parsing comes from upstream.
+  SwiftMarkdown:
+    url: https://github.com/swiftlang/swift-markdown
+    from: "0.8.0"
 targets:
   HermesWorkTestHost:
     type: application
@@ -53,6 +58,8 @@ targets:
       # LaTeX math rendering (MathSegmentView / STR-445).
       - package: SwiftMath
         product: SwiftMath
+      - package: SwiftMarkdown
+        product: Markdown
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app
