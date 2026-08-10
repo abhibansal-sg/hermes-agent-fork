@@ -76,6 +76,38 @@ struct SessionBinding: Sendable, Equatable {
     var generation: UInt64?
 }
 
+/// Immutable description of the Hermes session-list projection requested by
+/// iOS. Hermes remains authoritative for the rows; this signature exists only
+/// to stop a response for one presentation scope from publishing into another.
+struct SessionRailQuery: Sendable, Equatable {
+    enum Kind: String, Sendable {
+        case stock
+        case aggregate
+    }
+
+    let kind: Kind
+    let activeProfile: String
+
+    var endpoint: String {
+        switch kind {
+        case .stock: "/api/sessions"
+        case .aggregate: "/api/profiles/sessions"
+        }
+    }
+}
+
+/// Count-only evidence for the latest authoritative rail response. No titles,
+/// paths, prompts, or other user content are logged or retained here.
+struct SessionRailDiagnostics: Sendable, Equatable {
+    let query: SessionRailQuery
+    let rawCount: Int
+    let machineryRejectedCount: Int
+    let emptyRejectedCount: Int
+    let profileRejectedCount: Int
+    let profileDistribution: [String: Int]
+    let displayedCount: Int
+}
+
 /// Observable owner of the session list and the active-session pointers.
 ///
 /// Talks to the gateway via `ConnectionStore.client` and seeds the transcript
@@ -132,6 +164,17 @@ final class SessionStore {
     /// Protected entirely on `@MainActor` — no atomics needed.
     private var refreshToken: Int = 0
 
+    /// The query signature of the most recently-started network rail. Profile
+    /// discovery compares against this after its asynchronous probe settles; a
+    /// transition from the provisional stock rail to the aggregate rail causes
+    /// one new authoritative refresh and fences the old response.
+    private var lastRequestedSessionRailQuery: SessionRailQuery?
+
+    /// DEBUG/support evidence for diagnosing list mismatches without exposing
+    /// transcript content. Kept as observable presentation state so an internal
+    /// diagnostics surface can display it without introducing another store.
+    private(set) var lastSessionRailDiagnostics: SessionRailDiagnostics?
+
     /// Connection-lifecycle ownership for async session work. ConnectionStore
     /// invalidates this whenever a gateway generation changes, so a suspended
     /// refresh or session recovery cannot publish data from the prior gateway.
@@ -142,6 +185,7 @@ final class SessionStore {
         // Existing refresh paths already guard this token at every network
         // result publication. Bumping it discards an in-flight response.
         refreshToken &+= 1
+        lastRequestedSessionRailQuery = nil
         cancelEnsureRuntime()
         cancelRuntimeBinding()
         cancelWatchPolling()
@@ -152,6 +196,7 @@ final class SessionStore {
     /// the instant that transport disappears.
     func transportDidBecomeUnavailable() {
         connectionWorkGeneration &+= 1
+        lastRequestedSessionRailQuery = nil
         activeRuntimeId = nil
         activeRuntimeEpoch = nil
         cancelEnsureRuntime()
@@ -944,9 +989,21 @@ final class SessionStore {
     /// scope (and every dormant / stock-gateway case) keeps the existing
     /// `GET /api/sessions` path byte-for-byte.
     var usesAggregateRail: Bool {
-        guard isMultiProfileAvailable else { return false }
+        currentSessionRailQuery.kind == .aggregate
+    }
+
+    /// Snapshot the complete presentation scope before a session-list request.
+    /// The active profile participates even though every non-default profile
+    /// uses the same aggregate endpoint, because the client-side projection is
+    /// different and a late response must not cross that selection boundary.
+    var currentSessionRailQuery: SessionRailQuery {
         let trimmed = activeProfile.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed != Self.defaultProfileName
+        let scope = trimmed.isEmpty ? DefaultsKeys.allProfilesScope : trimmed
+        let kind: SessionRailQuery.Kind = isMultiProfileAvailable
+            && scope != Self.defaultProfileName
+            ? .aggregate
+            : .stock
+        return SessionRailQuery(kind: kind, activeProfile: scope)
     }
 
     /// Gate for per-row profile threading on open/delete. In production this is
@@ -2383,19 +2440,47 @@ final class SessionStore {
         refreshToken &+= 1
         let myToken = refreshToken
 
-        // Use the injected seam when present (unit tests, no live gateway).
-        if let fetch = sessionsFetch {
+        // Resolve and retain the immutable query BEFORE the first network await.
+        // Capability/profile discovery may change this while the request is in
+        // flight; every publication below checks it again.
+        let railQuery = currentSessionRailQuery
+        lastRequestedSessionRailQuery = railQuery
+
+        // Use the rail-aware seam when present (race/query-shape tests).
+        if let fetch = sessionsFetchForRail {
             do {
-                let (fetched, _) = try await fetch()
+                let (fetched, _) = try await fetch(railQuery)
                 guard refreshToken == myToken,
-                      currentCacheScope == myCacheScope else { return .timeout }
-                mergeSessionSnapshot(fetched)
+                      currentCacheScope == myCacheScope,
+                      currentSessionRailQuery == railQuery else { return .timeout }
+                publishSessionRail(fetched, query: railQuery)
                 if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                 lastError = nil
                 SpotlightIndexer.index(sessions: sessions)
             } catch {
                 guard refreshToken == myToken,
-                      currentCacheScope == myCacheScope else { return .timeout }
+                      currentCacheScope == myCacheScope,
+                      currentSessionRailQuery == railQuery else { return .timeout }
+                return recordRefreshFailure(error)
+            }
+            return .success
+        }
+
+        // Use the legacy injected seam when present (unit tests, no live gateway).
+        if let fetch = sessionsFetch {
+            do {
+                let (fetched, _) = try await fetch()
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope,
+                      currentSessionRailQuery == railQuery else { return .timeout }
+                publishSessionRail(fetched, query: railQuery)
+                if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
+                lastError = nil
+                SpotlightIndexer.index(sessions: sessions)
+            } catch {
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope,
+                      currentSessionRailQuery == railQuery else { return .timeout }
                 return recordRefreshFailure(error)
             }
             return .success
@@ -2407,7 +2492,7 @@ final class SessionStore {
         if let rest = connection?.rest {
             do {
                 let fetched: [SessionSummary]
-                if usesAggregateRail {
+                if railQuery.kind == .aggregate {
                     fetched = try await rest.profileSessions(
                         profile: DefaultsKeys.allProfilesScope,
                         limit: limit,
@@ -2423,18 +2508,31 @@ final class SessionStore {
                     ).sessions
                 }
                 guard refreshToken == myToken,
-                      currentCacheScope == myCacheScope else { return .timeout }
-                mergeSessionSnapshot(fetched)
+                      currentCacheScope == myCacheScope,
+                      currentSessionRailQuery == railQuery else { return .timeout }
+                publishSessionRail(fetched, query: railQuery)
                 if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                 lastError = nil
                 SpotlightIndexer.index(sessions: sessions)
                 return .success
             } catch {
                 guard refreshToken == myToken,
-                      currentCacheScope == myCacheScope else { return .timeout }
+                      currentCacheScope == myCacheScope,
+                      currentSessionRailQuery == railQuery else { return .timeout }
+                // `session.list` is a default-profile rail. Falling back to it
+                // after an aggregate request fails would publish a plausible but
+                // incomplete list (the exact two-vs-many failure this coordinator
+                // prevents). Retain the last good presentation instead.
+                if railQuery.kind == .aggregate {
+                    return recordRefreshFailure(error)
+                }
                 let outcome = Self.backgroundRefreshOutcome(for: error)
                 if outcome == .authFailure { fallbackOutcome = outcome }
             }
+        }
+
+        guard railQuery.kind == .stock else {
+            return fallbackOutcome ?? .retryableFailure
         }
 
         // The stock WS list always performs the expensive recent-order query
@@ -2448,9 +2546,10 @@ final class SessionStore {
                 params: .object(["limit": .number(Double(limit))])
             )
             guard refreshToken == myToken,
-                  currentCacheScope == myCacheScope else { return .timeout }
+                  currentCacheScope == myCacheScope,
+                  currentSessionRailQuery == railQuery else { return .timeout }
             let fetched = Self.parseSessions(from: raw)
-            mergeSessionSnapshot(fetched)
+            publishSessionRail(fetched, query: railQuery)
             if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
             lastError = nil
             // Republish the session list into Spotlight (fire-and-forget).
@@ -2458,7 +2557,8 @@ final class SessionStore {
             return .success
         } catch {
             guard refreshToken == myToken,
-                  currentCacheScope == myCacheScope else { return .timeout }
+                  currentCacheScope == myCacheScope,
+                  currentSessionRailQuery == railQuery else { return .timeout }
             return recordRefreshFailure(error, fallback: fallbackOutcome)
         }
     }
@@ -2605,6 +2705,49 @@ final class SessionStore {
         }
     }
 
+    /// Publish one response and record count-only diagnostics at the same commit
+    /// point. Keeping diagnostics beside the merge prevents the evidence from
+    /// describing a response that a generation guard actually discarded.
+    private func publishSessionRail(_ page: [SessionSummary], query: SessionRailQuery) {
+        let emptyRejected = page.lazy.filter { $0.messageCount == 0 }.count
+        let machineryRejected = page.lazy.filter {
+            $0.messageCount != 0 && !Self.isHumanRecentsSession($0)
+        }.count
+        let humanRows = page.filter(Self.isHumanRecentsSession)
+        let projectedRows = Self.filterByProfile(
+            humanRows,
+            scope: query.activeProfile,
+            multiAvailable: query.kind == .aggregate
+        )
+        let profileRejected = humanRows.count - projectedRows.count
+        let profileDistribution = Dictionary(grouping: page) { row in
+            let profile = row.profile?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return profile.isEmpty ? Self.defaultProfileName : profile
+        }.mapValues(\.count)
+
+        mergeSessionSnapshot(page)
+        lastSessionRailDiagnostics = SessionRailDiagnostics(
+            query: query,
+            rawCount: page.count,
+            machineryRejectedCount: machineryRejected,
+            emptyRejectedCount: emptyRejected,
+            profileRejectedCount: profileRejected,
+            profileDistribution: profileDistribution,
+            displayedCount: visibleSessions.count
+        )
+        let scopeClass: String
+        if query.activeProfile == DefaultsKeys.allProfilesScope {
+            scopeClass = "all"
+        } else if query.activeProfile == Self.defaultProfileName {
+            scopeClass = "default"
+        } else {
+            scopeClass = "named"
+        }
+        sessionLog.info(
+            "Session rail endpoint=\(query.endpoint, privacy: .public) scopeClass=\(scopeClass, privacy: .public) raw=\(page.count) machineryRejected=\(machineryRejected) emptyRejected=\(emptyRejected) profileRejected=\(profileRejected) displayed=\(self.visibleSessions.count)"
+        )
+    }
+
     private func workingSetSessionIds() -> Set<String> {
         var workingIds = pinnedIds
         if let active = activeStoredId { workingIds.insert(active) }
@@ -2717,15 +2860,37 @@ final class SessionStore {
     /// stock gateway this short-circuits to clearing the cache without a network
     /// call (the probe already proved the route absent).
     func loadProfiles() async {
-        guard connection?.capabilities.profiles == .available, let rest = connection?.rest else {
+        guard connection?.capabilities.profiles == .available else {
             profiles = []
+            await reconcileSessionRailAfterProfileResolution()
             return
         }
         do {
-            profiles = try await rest.profiles()
+            let loadedProfiles: [ProfileSummary]
+            if let profilesFetch {
+                loadedProfiles = try await profilesFetch()
+            } else {
+                guard let rest = connection?.rest else { return }
+                loadedProfiles = try await rest.profiles()
+            }
+            profiles = loadedProfiles
+            await reconcileSessionRailAfterProfileResolution()
         } catch {
             // Keep the prior cache on a transient failure; don't flicker the gate.
         }
+    }
+
+    /// Capability discovery and initial hydration intentionally run concurrently.
+    /// If hydration already requested the provisional stock rail, profile
+    /// resolution expands the effective query to the aggregate rail here. Bump
+    /// the response token before awaiting so the old request cannot publish, then
+    /// perform the missing authoritative reconciliation exactly once per query
+    /// transition.
+    private func reconcileSessionRailAfterProfileResolution() async {
+        let resolvedQuery = currentSessionRailQuery
+        guard lastRequestedSessionRailQuery != resolvedQuery else { return }
+        refreshToken &+= 1
+        await refresh()
     }
 
     /// Select a profile scope from the switcher: persist ``activeProfile`` and
@@ -4809,6 +4974,15 @@ final class SessionStore {
     /// live gateway. The closure returns a tuple of `(sessions, total?)` so
     /// tests can verify snapshot reconciliation without a live gateway.
     var sessionsFetch: (() async throws -> (sessions: [SessionSummary], total: Int?))?
+
+    /// Rail-aware session fetch used by concurrency/query-shape tests. Production
+    /// resolves the native Hermes REST endpoints directly; this seam lets tests
+    /// suspend the provisional stock request and prove a later aggregate response
+    /// wins without timing sleeps.
+    var sessionsFetchForRail: ((SessionRailQuery) async throws -> (sessions: [SessionSummary], total: Int?))?
+
+    /// Profile-list fetch seam for the same deterministic capability race tests.
+    var profilesFetch: (() async throws -> [ProfileSummary])?
 
     /// REST fetch backing ``seedTranscript(storedId:profile:token:)``, injected for
     /// tests (mirrors `ChatStore.backfillFetch`). In the app it resolves the

@@ -1021,8 +1021,9 @@ struct MessageBubble: View {
     ///
     /// Malformed syntax (missing `)`, empty source, dangling `![`) is left in
     /// place as prose rather than being partially consumed, so a sentence like
-    /// "see ![note" never loses text. Source extends to the next `)`; URLs in
-    /// assistant prose do not contain raw parens.
+    /// "see ![note" never loses text. Destination parentheses are balanced per
+    /// CommonMark, including escaped parentheses, so URLs such as image_(1).png
+    /// are hoisted intact instead of being truncated at the first `)`.
     static func splitLineByImages(_ line: String) -> [ChatProseLineSplit] {
         let chars = Array(line)
         var pieces: [ChatProseLineSplit] = []
@@ -1061,8 +1062,23 @@ struct MessageBubble: View {
             }
             let sourceStart = j + 2
             var k = sourceStart
-            while k < chars.count, chars[k] != ")" { k += 1 }
-            guard k < chars.count, chars[k] == ")" else {
+            var depth = 1
+            var escapedSourceCharacter = false
+            while k < chars.count, depth > 0 {
+                let character = chars[k]
+                if escapedSourceCharacter {
+                    escapedSourceCharacter = false
+                } else if character == "\\" {
+                    escapedSourceCharacter = true
+                } else if character == "(" {
+                    depth += 1
+                } else if character == ")" {
+                    depth -= 1
+                    if depth == 0 { break }
+                }
+                k += 1
+            }
+            guard k < chars.count, depth == 0, chars[k] == ")" else {
                 i += 1
                 continue
             }
@@ -1169,11 +1185,20 @@ struct MessageBubble: View {
         case listItems([MarkdownListItem])
     }
 
-    /// Parse GFM block constructs that `AttributedString(markdown:)` cannot lay
-    /// out as native chat UI. The parser is intentionally conservative: if a run
-    /// is not a clear GFM table / task-list / blockquote / list, it falls back to
-    /// the existing inline markdown path unchanged.
+    /// Parse CommonMark/GFM block structure through swift-markdown, then project
+    /// it onto the existing native Hermes render units. A launch argument keeps
+    /// the previous parser available as a one-release rollback seam while the
+    /// renderer corpus bakes in TestFlight.
     static func markdownBlocks(_ text: String) -> [MarkdownBlock] {
+        if ProcessInfo.processInfo.arguments.contains("--legacy-markdown-parser") {
+            return legacyMarkdownBlocks(text)
+        }
+        return StandardsMarkdownBlockParser.parse(text)
+    }
+
+    /// Temporary rollback implementation. Remove after the standards parser has
+    /// completed one stable release; no production feature should call it directly.
+    static func legacyMarkdownBlocks(_ text: String) -> [MarkdownBlock] {
         let lines = text.components(separatedBy: "\n")
         guard !lines.isEmpty else { return [] }
 
@@ -1353,7 +1378,7 @@ struct MessageBubble: View {
         return (quoted.joined(separator: "\n"), cursor)
     }
 
-    private static func blockquoteText(_ line: String) -> String? {
+    static func blockquoteText(_ line: String) -> String? {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard trimmed.hasPrefix(">") else { return nil }
         var text = String(trimmed.dropFirst())
@@ -1361,7 +1386,7 @@ struct MessageBubble: View {
         return text
     }
 
-    private static func markdownAlert(fromBlockquoteText text: String) -> MarkdownAlert? {
+    static func markdownAlert(fromBlockquoteText text: String) -> MarkdownAlert? {
         var remainder = text[...]
         while let first = remainder.first, first == " " || first == "\t" {
             remainder.removeFirst()
