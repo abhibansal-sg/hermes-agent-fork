@@ -114,6 +114,20 @@ final class InboxStore {
         items.filter { $0.state.isVisible }
     }
 
+    /// The newest actionable clarification belonging to the selected session.
+    /// Runtime and stored ids are both accepted because reconnect can rotate the
+    /// runtime while the durable inbox row still carries the canonical stored id.
+    /// This is a read-only presentation projection; Hermes remains the owner of
+    /// the pending request and its response lifecycle.
+    func pendingClarification(runtimeID: String?, storedID: String?) -> Item? {
+        pendingItems.first { item in
+            guard item.kind == .clarify else { return false }
+            let runtimeMatches = runtimeID?.isEmpty == false && item.sessionId == runtimeID
+            let storedMatches = storedID?.isEmpty == false && item.storedSessionId == storedID
+            return runtimeMatches || storedMatches
+        }
+    }
+
     // MARK: - Presentation request (B5 push tap routing)
 
     /// Monotonic token bumped whenever something (a push tap whose session can't
@@ -142,6 +156,11 @@ final class InboxStore {
     private var cache: CacheStore?
     private var activeScope: CacheScope?
     private var persistenceTail: Task<Void, Never>?
+    /// Presentation tombstones for clarification ACKs received through the
+    /// active ChatStore path. Keyed by Hermes runtime + request id so a later
+    /// persistence publish cannot resurrect the same receipt, while a new
+    /// request on the same runtime remains eligible.
+    private var resolvedClarificationKeys = Set<String>()
 
     /// Called only after a database transaction commits, allowing the widget to
     /// publish the exact same pending count as the rows just exposed here.
@@ -204,7 +223,13 @@ final class InboxStore {
     }
 
     private func publish(_ snapshot: AttentionSnapshot) {
-        items = snapshot.items.map(Self.item(from:))
+        items = snapshot.items.map(Self.item(from:)).map { item in
+            guard let key = Self.clarificationKey(for: item),
+                  resolvedClarificationKeys.contains(key) else { return item }
+            var resolved = item
+            resolved.state = .resolvedElsewhere
+            return resolved
+        }
         onCommittedSnapshot?(snapshot)
     }
 
@@ -223,13 +248,10 @@ final class InboxStore {
         switch event.type {
         case .approvalRequest:
             ingestApproval(event)
-            Task { await refresh() }
         case .clarifyRequest:
             ingestClarify(event)
-            Task { await refresh() }
         case .messageComplete:
             if let sessionId = event.sessionId { expirePending(forSession: sessionId) }
-            Task { await refresh() }
         default:
             break
         }
@@ -280,6 +302,10 @@ final class InboxStore {
 
     private func insertLive(_ item: Item) {
         guard let persisted = Self.persisted(from: item) else { return }
+        if let key = Self.clarificationKey(for: item),
+           resolvedClarificationKeys.contains(key) {
+            return
+        }
         if let existing = items.first(where: { $0.id == item.id || $0.id == persisted.id }),
            existing.state == .responding || existing.state == .failedRetryable
             || existing.state == .resolvedElsewhere || existing.state == .expired {
@@ -375,6 +401,43 @@ final class InboxStore {
         }
     }
 
+    /// Consume the Inbox presentation mirror after the active ChatStore path
+    /// receives Hermes' clarification ACK. This performs no second response
+    /// RPC; it only prevents the same durable receipt from immediately
+    /// resurfacing beneath the just-resolved inline card.
+    func resolveMirroredClarification(
+        sessionID: String,
+        requestID: String?
+    ) async {
+        guard let requestID,
+              let key = Self.clarificationKey(
+                  sessionID: sessionID,
+                  requestID: requestID
+              ) else { return }
+        // Arm the tombstone before awaiting queued writes. An event arriving
+        // during that wait is then suppressed by insertLive; an event already
+        // queued is drained before the terminal cache update below.
+        resolvedClarificationKeys.insert(key)
+        await persistenceTail?.value
+
+        let persistedID = requestID.hasPrefix("clarify:")
+            ? requestID
+            : "clarify:\(requestID)"
+        if let cache, let scope = activeScope ?? currentScope,
+           let snapshot = try? await cache.markAttentionState(
+               id: persistedID,
+               state: .resolvedElsewhere,
+               scope: scope
+           ) {
+            publish(snapshot)
+            return
+        }
+        for index in items.indices {
+            guard Self.clarificationKey(for: items[index]) == key else { continue }
+            items[index].state = .resolvedElsewhere
+        }
+    }
+
     /// Drop an item without answering (user dismissed it).
     func dismiss(_ item: Item) {
         if cache != nil, activeScope ?? currentScope != nil {
@@ -400,6 +463,7 @@ final class InboxStore {
     /// Privacy reset used by Forget Gateway. Repeated calls are harmless.
     func removeAll() {
         items.removeAll()
+        resolvedClarificationKeys.removeAll()
     }
 
     // MARK: - Response bookkeeping
@@ -463,6 +527,24 @@ final class InboxStore {
             receivedAt: Date(timeIntervalSince1970: persisted.createdAt),
             state: state(from: persisted.state)
         )
+    }
+
+    private static func clarificationKey(for item: Item) -> String? {
+        guard case .clarify(let request) = item.payload else { return nil }
+        return clarificationKey(
+            sessionID: item.sessionId,
+            requestID: request.requestId
+        )
+    }
+
+    private static func clarificationKey(
+        sessionID: String,
+        requestID: String?
+    ) -> String? {
+        let session = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = requestID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !session.isEmpty, !request.isEmpty else { return nil }
+        return "\(session)\u{1F}\(request)"
     }
 
     private static func persisted(from item: Item) -> PersistedAttentionItem? {

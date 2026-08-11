@@ -201,6 +201,7 @@
 		84AF66C421A3A0CA422AFB81 /* SharedStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F68ABDFD79AE8CA0E12069F5 /* SharedStore.swift */; };
 		84F5ECFABAFB7E7E41ED417B /* Markdown in Frameworks */ = {isa = PBXBuildFile; productRef = A0C7DF194674032BFD6B0844 /* Markdown */; };
 		856C0011EAFF4E2B0CBA42C1 /* MessageRowRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85E8B32B8279AD70FB7B9791 /* MessageRowRecord.swift */; };
+		867CFDA37842AB54EF6B6DFD /* ios_fix_build149_session_reliability.json in Resources */ = {isa = PBXBuildFile; fileRef = F767AB835B01A7CB44A48E55 /* ios_fix_build149_session_reliability.json */; };
 		87898B15A49596D3EFDDE223 /* ToolRowLiveUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D97320D9266236F10B399364 /* ToolRowLiveUITests.swift */; };
 		8792F44A6964947E526C906E /* MessageBubbleAutolinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AA521BAE97F978D5A41E459 /* MessageBubbleAutolinkTests.swift */; };
 		88C0481109DF7ACFF08AF996 /* GatewayEventTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE603ED5026151CFBF2F48C3 /* GatewayEventTests.swift */; };
@@ -774,6 +775,7 @@
 		F68ABDFD79AE8CA0E12069F5 /* SharedStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedStore.swift; sourceTree = "<group>"; };
 		F6A0932D05CF706A2082F527 /* JSONRPCFramingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONRPCFramingTests.swift; sourceTree = "<group>"; };
 		F6D2E68282360ED6DA714EFB /* OutboxProcessorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutboxProcessorTests.swift; sourceTree = "<group>"; };
+		F767AB835B01A7CB44A48E55 /* ios_fix_build149_session_reliability.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = ios_fix_build149_session_reliability.json; sourceTree = "<group>"; };
 		F9653A94FDBF6636D8BA9DB9 /* VoiceConversationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceConversationController.swift; sourceTree = "<group>"; };
 		FA2C79CF12A8795F48897AD3 /* RepairSupersedesForgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RepairSupersedesForgetTests.swift; sourceTree = "<group>"; };
 		FC5F34C6CD981FBCBB8092E0 /* SubagentInterruptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentInterruptTests.swift; sourceTree = "<group>"; };
@@ -1393,6 +1395,7 @@
 		E486D38214418539A7B10D1B /* Fixtures */ = {
 			isa = PBXGroup;
 			children = (
+				F767AB835B01A7CB44A48E55 /* ios_fix_build149_session_reliability.json */,
 				BF2DED54169133EB1CBE30D2 /* ios_fix_long_prose.json */,
 				ACCF2E02057CCACF71FC3C63 /* ios_fix_mid_turn_tail.json */,
 			);
@@ -1764,6 +1767,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				867CFDA37842AB54EF6B6DFD /* ios_fix_build149_session_reliability.json in Resources */,
 				8FF2DE2A228F022AE4D1C9C0 /* ios_fix_long_prose.json in Resources */,
 				455245A6F857E57C9D20D85A /* ios_fix_mid_turn_tail.json in Resources */,
 			);

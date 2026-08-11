@@ -1231,9 +1231,14 @@ final class ChatStore {
             // error-like becomes the warning strip without clobbering an explicit
             // warning the server already sent.
             if let status = completion?.status,
-               failedStatuses.contains(status.lowercased()),
-               message.warning == nil {
-                message.setWarningPart("Turn \(status)")
+               failedStatuses.contains(status.lowercased()) {
+                let terminalError = completion?.error?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let terminalError, !terminalError.isEmpty {
+                    message.setWarningPart(terminalError)
+                } else if message.warning == nil {
+                    message.setWarningPart("Turn \(status)")
+                }
             }
             if shouldClearReconnectWarning {
                 message.clearWarningPart()
@@ -1389,6 +1394,10 @@ final class ChatStore {
         watchOnly: Bool = false
     ) async {
         guard runtimeId == activeSessionId else { return }
+        if let inflight, inflight.isTerminalFailure {
+            restoreFailedInflightTurn(inflight)
+            return
+        }
         guard snapshotRunning == true else { return }
         // `active_list` is a read-only liveness poll, not a new turn. Once the
         // selected stream already owns this runtime, restoring the snapshot
@@ -1472,10 +1481,20 @@ final class ChatStore {
         watchRuntimeId: String? = nil
     ) {
         let user = inflight?.user.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !user.isEmpty, !inflightUserPromptAlreadyRestored(user) {
-            messages.append(ChatMessage(role: .user, text: user))
+        let assistant = inflight?.assistant ?? ""
+        if !user.isEmpty,
+           !inflightUserPromptAlreadyRestored(user, turnID: inflight?.turnId) {
+            messages.append(ChatMessage(
+                authoritativeTurnID: inflight?.turnId,
+                role: .user,
+                text: user
+            ))
             rebuildUserOrdinals()
         }
+        adoptTrailingAuthoritativeAssistantIfNeeded(
+            forInflightUser: user,
+            turnID: inflight?.turnId
+        )
         if let watchRuntimeId {
             localTurnToken = nil
             watchOnlyStream = true
@@ -1484,9 +1503,118 @@ final class ChatStore {
             beginLocalTurn()
             beginStreamingMessage()
         }
-        if let assistant = inflight?.assistant, !assistant.isEmpty {
+        if !assistant.isEmpty {
             mutateStreaming { $0.applyFinalText(assistant) }
         }
+    }
+
+    /// Re-project a retained terminal failure even though Hermes correctly
+    /// reports the runtime as no longer running. This is presentation recovery,
+    /// not transcript authority: the failure remains sourced from Hermes'
+    /// bounded inflight snapshot and is never written back as canonical history.
+    private func restoreFailedInflightTurn(_ inflight: SessionInflightTurn) {
+        let hadVisibleTurn = isStreaming || localTurnInFlight
+        let user = inflight.user.trimmingCharacters(in: .whitespacesAndNewlines)
+        let failure = inflight.error?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = failure.flatMap { $0.isEmpty ? nil : $0 }
+            ?? "The turn failed before Hermes produced a reply."
+        let partial = inflight.assistant.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !user.isEmpty,
+           trailingInflightPromptIndex(
+               user: user,
+               turnID: inflight.turnId,
+               terminalError: message
+           ) == nil {
+            messages.append(ChatMessage(
+                authoritativeTurnID: inflight.turnId,
+                role: .user,
+                text: user
+            ))
+            rebuildUserOrdinals()
+        }
+        let promptIndex = messages.lastIndex(where: {
+            $0.role == .user && $0.text == user
+        })
+        let existingAssistantIndex = promptIndex.flatMap { promptIndex in
+            messages.indices.reversed().first(where: {
+                $0 > promptIndex && messages[$0].role == .assistant
+            })
+        }
+        if let existingAssistantIndex,
+           messages[existingAssistantIndex].isStreaming
+            || partial.isEmpty
+            || messages[existingAssistantIndex].text == partial {
+            if !partial.isEmpty {
+                messages[existingAssistantIndex].applyFinalText(partial)
+            }
+            messages[existingAssistantIndex].setWarningPart(message)
+            messages[existingAssistantIndex].isStreaming = false
+        } else {
+            messages.append(ChatMessage(
+                role: .assistant,
+                text: partial,
+                warning: message
+            ))
+        }
+        flushBuffersImmediately()
+        streamingMessageID = nil
+        pendingReconnectReconcileID = nil
+        activeToolName = nil
+        activeToolCallId = nil
+        onToolChange?(nil)
+        endLocalTurn()
+        setStreaming(false, reason: "restoreFailedInflightTurn")
+        watchOnlyStream = false
+        streamOwner = nil
+        turnStartedAt = nil
+        expireTurnScopedPrompts(includeSecure: true)
+        if hadVisibleTurn { onTurnDiscarded?() }
+        lastError = message
+    }
+
+    /// A cold watch may seed the current tool-only assistant row from Hermes'
+    /// transcript before the live snapshot arrives. Adopt that row as the live
+    /// projection instead of appending a second empty assistant placeholder.
+    private func adoptTrailingAuthoritativeAssistantIfNeeded(
+        forInflightUser user: String,
+        turnID: String?
+    ) {
+        guard streamingMessageID == nil,
+              !user.isEmpty,
+              let promptIndex = trailingInflightPromptIndex(
+                  user: user,
+                  turnID: turnID
+              ),
+              let candidateIndex = messages.indices.last,
+              candidateIndex > promptIndex else { return }
+        let candidate = messages[candidateIndex]
+        guard candidate.role == .assistant,
+              !candidate.isStreaming else { return }
+        streamingMessageID = candidate.id
+    }
+
+    /// Return the latest user row only when the transcript tail can still be
+    /// the same in-flight turn. Prompt text alone is not identity: a user may
+    /// repeat an earlier prompt verbatim. A settled assistant after that row
+    /// therefore closes it unless Hermes stamped the canonical user row with
+    /// this exact turn id, or the row already carries this retained failure.
+    private func trailingInflightPromptIndex(
+        user: String,
+        turnID: String?,
+        terminalError: String? = nil
+    ) -> Int? {
+        guard let promptIndex = messages.lastIndex(where: { $0.role == .user }),
+              messages[promptIndex].text == user else { return nil }
+        let suffix = messages[messages.index(after: promptIndex)...]
+        guard let candidate = suffix.last(where: { $0.role == .assistant }) else {
+            return promptIndex
+        }
+        if candidate.isStreaming { return promptIndex }
+        if let terminalError, candidate.warning == terminalError { return promptIndex }
+        guard let turnID, !turnID.isEmpty,
+              messages[promptIndex].authoritativeTurnID == turnID else { return nil }
+        return promptIndex
     }
 
     /// True when `user` is already the prompt row that opened the in-flight
@@ -1496,10 +1624,20 @@ final class ChatStore {
     /// prior guard (`lastUser?.text != user || messages.last?.role != .user`) was
     /// always satisfied once the streaming assistant row trailed the prompt, so
     /// each repeat call appended another copy of the same inflight prompt.
-    private func inflightUserPromptAlreadyRestored(_ user: String) -> Bool {
+    private func inflightUserPromptAlreadyRestored(
+        _ user: String,
+        turnID: String?
+    ) -> Bool {
         guard let streamingMessageID,
               let streamIndex = messages.firstIndex(where: { $0.id == streamingMessageID })
-        else { return false }
+        else {
+            // Cold watch ordering: canonical transcript can paint the prompt and
+            // its tool-only assistant row before the first live snapshot has a
+            // streaming id to point at. Treat the latest matching user with no
+            // newer user as the same current turn; the assistant adoption below
+            // will bind its trailing authority row.
+            return trailingInflightPromptIndex(user: user, turnID: turnID) != nil
+        }
         // Walk back from the streaming assistant row to the prompt that started
         // it; equality there means this exact inflight turn is already restored.
         var index = streamIndex - 1
@@ -2776,6 +2914,7 @@ final class ChatStore {
                 canonicalID: existing.canonicalID,
                 usesPositionalSeedIdentity: existing.usesPositionalSeedIdentity,
                 authoritativeSeedTimestamp: existing.authoritativeSeedTimestamp,
+                authoritativeTurnID: existing.authoritativeTurnID,
                 role: .user,
                 clientMessageID: clientMessageID,
                 text: display,
@@ -3219,11 +3358,12 @@ final class ChatStore {
     /// answer by `_pending[request_id]` (the generic `_respond`,
     /// `tui_gateway/server.py:5059`) — a reply without it 4009s ("no pending
     /// clarify request") and the agent stays blocked on the prompt forever.
-    func respondClarification(_ answer: String) async {
-        guard let pending = pendingClarification else { return }
+    @discardableResult
+    func respondClarification(_ answer: String) async -> Bool {
+        guard let pending = pendingClarification else { return false }
         let owner = pendingGateOwnerSessionID
         let sessionId = pending.sessionId.isEmpty ? activeSessionId : pending.sessionId
-        guard let sessionId, let requestId = pending.request.requestId else { return }
+        guard let sessionId, let requestId = pending.request.requestId else { return false }
         var params: [String: JSONValue] = [
             "session_id": .string(sessionId),
             "answer": .string(answer),
@@ -3247,8 +3387,10 @@ final class ChatStore {
             if let requestId = pending.request.requestId {
                 markGateResolved(requestId)
             }
+            return true
         } catch {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return false
         }
     }
 
@@ -3673,6 +3815,7 @@ final class ChatStore {
                 existing.parts = newMessage.parts
                 existing.isStreaming = newMessage.isStreaming
                 existing.authoritativeSeedTimestamp = newMessage.authoritativeSeedTimestamp
+                existing.authoritativeTurnID = newMessage.authoritativeTurnID
                 existing.timestamp = newMessage.timestamp
                 existing.presentation = newMessage.presentation
                 updatedByID[existing.id] = existing
@@ -3711,6 +3854,7 @@ final class ChatStore {
                     canonicalID: newMessage.id,
                     usesPositionalSeedIdentity: newMessage.usesPositionalSeedIdentity,
                     authoritativeSeedTimestamp: newMessage.authoritativeSeedTimestamp,
+                    authoritativeTurnID: newMessage.authoritativeTurnID,
                     role: newMessage.role,
                     parts: newMessage.parts,
                     isStreaming: newMessage.isStreaming,
@@ -3734,6 +3878,7 @@ final class ChatStore {
                     canonicalID: newMessage.id,
                     usesPositionalSeedIdentity: newMessage.usesPositionalSeedIdentity,
                     authoritativeSeedTimestamp: newMessage.authoritativeSeedTimestamp,
+                    authoritativeTurnID: newMessage.authoritativeTurnID,
                     role: newMessage.role,
                     clientMessageID: echo.clientMessageID,
                     parts: newMessage.parts,
@@ -4305,6 +4450,7 @@ final class ChatStore {
                 id: ChatMessage.deterministicID(seedKey: baseID),
                 usesPositionalSeedIdentity: row.wireId == nil,
                 authoritativeSeedTimestamp: row.timestamp,
+                authoritativeTurnID: row.turnID,
                 role: role,
                 // R4b (I5 write-local-first / I8): a write-local-first cache row
                 // carries the send's cmid — thread it onto the painted row so the

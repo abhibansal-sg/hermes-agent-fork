@@ -1746,7 +1746,19 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
 
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
-    is_error = frame.get("type") == "turn.error"
+    frame_inflight = frame.get("inflight")
+    is_error = (
+        frame.get("type") == "turn.error"
+        or frame.get("status") == "error"
+        or bool(frame.get("error"))
+        or (isinstance(frame_inflight, dict) and bool(frame_inflight.get("error")))
+    )
+    error_message = str(
+        frame.get("error")
+        or frame.get("message")
+        or (frame_inflight.get("error") if isinstance(frame_inflight, dict) else "")
+        or "compute host turn failed"
+    )
     with session["history_lock"]:
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
@@ -1760,10 +1772,41 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
                 pass
         session["running"] = False
         session["last_active"] = time.time()
-        _clear_inflight_turn(session)
-    if is_error:
-        message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        if is_error:
+            # The serving process owns the reconnect snapshot. Preserve the
+            # same retained-failure contract as the inline turn path so a
+            # client that missed this terminal frame can recover the provider
+            # error through session.watch/session.resume.
+            #
+            # The child is the only process that saw streamed assistant text
+            # and accepted corrections. Merge those presentation fields into
+            # the parent's snapshot before making it terminal, but keep the
+            # parent's Hermes turn identity: that is the ID stamped onto the
+            # canonical user row and handed to the remote client.
+            if isinstance(frame_inflight, dict):
+                parent_inflight = session.get("inflight_turn")
+                if not isinstance(parent_inflight, dict):
+                    parent_inflight = {}
+                else:
+                    parent_inflight = dict(parent_inflight)
+                for field in ("user", "assistant", "corrections"):
+                    if field in frame_inflight:
+                        parent_inflight[field] = frame_inflight[field]
+                session["inflight_turn"] = parent_inflight
+            _fail_inflight_turn(session, error_message)
+        else:
+            _clear_inflight_turn(session)
+    if is_error and not frame.get("terminal_event_emitted"):
+        _emit(
+            "message.complete",
+            sid,
+            {
+                "text": f"Error: {error_message}",
+                "status": "error",
+                "error": error_message,
+                "recoverable": True,
+            },
+        )
     _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
@@ -1784,6 +1827,11 @@ def _submit_prompt_to_compute_host(
     queued_prompt_generation: int | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
+    with session["history_lock"]:
+        inflight = session.get("inflight_turn")
+        if not isinstance(inflight, dict) or inflight.get("status") == "error":
+            _start_inflight_turn(session, text)
+        display_metadata = _inflight_display_metadata(session, display_metadata)
     frame = _compute_host_turn_frame(
         rid,
         sid,
@@ -7663,6 +7711,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 client_message_id = m["display_metadata"].get("client_message_id")
                 if isinstance(client_message_id, str) and client_message_id:
                     msg["client_message_id"] = client_message_id
+                turn_id = m["display_metadata"].get("hermes_turn_id")
+                if isinstance(turn_id, str) and turn_id:
+                    msg["turn_id"] = turn_id
         messages.append(msg)
 
     return messages
@@ -7732,9 +7783,21 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
         "assistant": "",
         "started_at": now,
         "streaming": True,
+        "turn_id": uuid.uuid4().hex,
         "updated_at": now,
         "user": _inflight_text(text),
     }
+
+
+def _inflight_display_metadata(session: dict, metadata: dict | None) -> dict | None:
+    """Stamp Hermes' opaque turn identity onto the canonical user row."""
+    turn = session.get("inflight_turn")
+    turn_id = turn.get("turn_id") if isinstance(turn, dict) else None
+    if not isinstance(turn_id, str) or not turn_id:
+        return dict(metadata) if isinstance(metadata, dict) else None
+    stamped = dict(metadata or {})
+    stamped.setdefault("hermes_turn_id", turn_id)
+    return stamped
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:
@@ -8245,6 +8308,14 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+    turn_id = turn.get("turn_id")
+    if isinstance(turn_id, str) and turn_id:
+        snapshot["turn_id"] = turn_id
+    if turn.get("started_at") is not None:
+        try:
+            snapshot["started_at"] = float(turn["started_at"])
+        except (TypeError, ValueError):
+            pass
     corrections = [c for c in (turn.get("corrections") or []) if str(c).strip()]
     if corrections:
         # Mid-turn redirects. Carried alongside the original prompt (not over
@@ -10102,6 +10173,7 @@ def _run_prompt_submit(
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
+        display_metadata = _inflight_display_metadata(session, display_metadata)
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:

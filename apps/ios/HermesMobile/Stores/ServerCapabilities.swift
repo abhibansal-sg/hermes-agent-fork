@@ -94,14 +94,19 @@ final class ServerCapabilities {
         if !force {
             if probedServerURL == serverURL,
                probedAppVersion == version,
-               fs != .unknown {
+               fs != .unknown,
+               profiles != .unknown {
                 return
             }
             if let cached = Self.loadCache(),
                cached.serverURL == serverURL,
                cached.appVersion == version {
                 applyCache(cached)
-                return
+                // A cache is reusable only when every eager capability is
+                // conclusive. Build 149 persisted `profiles: unknown` beside a
+                // known filesystem result, then treated that partial snapshot as
+                // complete forever, hiding the profile picker across launches.
+                if fs != .unknown, profiles != .unknown { return }
             }
         }
 

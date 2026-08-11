@@ -714,7 +714,8 @@ struct ChatView: View {
     private var dockContent: TurnDockContent {
         TurnDockContent.resolve(
             hasApproval: chatStore.pendingApproval != nil,
-            hasClarification: chatStore.pendingClarification != nil,
+            hasClarification: chatStore.pendingClarification != nil
+                || activeInboxClarification != nil,
             // QA-2 R12/R13: mirror the TurnDock's own resolver exactly — the
             // inline-todo suppression below must agree with the dock about who
             // owns the checklist. Reading `dockShowsTaskBox` (turn-lifecycle +
@@ -736,6 +737,13 @@ struct ChatView: View {
         dockContent == .tasks
     }
 
+    private var activeInboxClarification: InboxStore.Item? {
+        inboxStore.pendingClarification(
+            runtimeID: sessionStore.activeRuntimeId,
+            storedID: sessionStore.activeStoredId
+        )
+    }
+
     @ViewBuilder
     private func bottomStack(proxy: ScrollViewProxy) -> some View {
         VStack(spacing: Self.bottomStackSpacing) {
@@ -753,7 +761,13 @@ struct ChatView: View {
             // so without this the taller surfaces cover the last message. Collapses
             // to 0 when the dock shows nothing (EmptyView), restoring the exact
             // composer-only clearance.
-            TurnDock(chatStore: chatStore, queueStore: queueStore, themeStore: themeStore)
+            TurnDock(
+                chatStore: chatStore,
+                queueStore: queueStore,
+                inboxStore: inboxStore,
+                inboxClarification: activeInboxClarification,
+                themeStore: themeStore
+            )
                 .onGeometryChange(for: CGFloat.self) { proxy in
                     proxy.size.height
                 } action: { height in
@@ -973,7 +987,8 @@ struct ChatView: View {
                         onRestoreCheckpoint: restoreCheckpointHandler,
                         onBranch: branchHandler,
                         menuActionsEnabled: menuActionsEnabled,
-                        assistantTurnActionsEnabled: !chatStore.isStreaming,
+                        assistantTurnActionsEnabled: !chatStore.isStreaming
+                            && !dockContent.blocksAssistantActions,
                         liveTurnStartedAt: chatStore.turnStartedAt,
                         // QA-2 R5/A3: the LAST assistant row tracks the store's
                         // turn-scoped streaming (relay `relayTurnLive`) so the
@@ -1647,6 +1662,7 @@ struct ChatView: View {
     /// `SessionStore.activeRuntimeId` carry.
     private var crossSessionItems: [InboxStore.Item] {
         let activeRuntime = sessionStore.activeRuntimeId ?? ""
+        let activeStored = sessionStore.activeStoredId ?? ""
         // Also exclude — by id — whatever approval is showing inline RIGHT NOW
         // (ApprovalCard). This is belt-and-suspenders over the runtime filter: it
         // closes the draft / session-switch transition window where
@@ -1654,7 +1670,9 @@ struct ChatView: View {
         // still set, which could otherwise let the same approval show twice.
         let inlineApprovalId = chatStore.pendingApproval?.id
         return inboxStore.pendingItems.filter {
-            $0.sessionId != activeRuntime && $0.id != inlineApprovalId
+            let belongsToActiveSession = $0.sessionId == activeRuntime
+                || ($0.storedSessionId?.isEmpty == false && $0.storedSessionId == activeStored)
+            return !belongsToActiveSession && $0.id != inlineApprovalId
         }
     }
 

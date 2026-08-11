@@ -25,4 +25,29 @@ final class InboxStoreTests: XCTestCase {
         inbox.dismiss(inbox.items[0])
         XCTAssertTrue(inbox.items.isEmpty)
     }
+
+    func testActiveClarificationMatchesRuntimeOrStoredIdentity() throws {
+        let inbox = InboxStore()
+        let event = try XCTUnwrap(GatewayEvent(params: .object([
+            "type": .string("clarify.request"),
+            "session_id": .string("runtime-clarify"),
+            "stored_session_id": .string("stored-clarify"),
+            "payload": .object([
+                "question": .string("Which path should I use?"),
+                "choices": .array([.string("A"), .string("B")]),
+                "request_id": .string("request-clarify"),
+            ]),
+        ])))
+        inbox.handle(event: event)
+
+        XCTAssertEqual(
+            inbox.pendingClarification(runtimeID: "runtime-clarify", storedID: nil)?.id,
+            "clarify:runtime-clarify"
+        )
+        XCTAssertEqual(
+            inbox.pendingClarification(runtimeID: nil, storedID: "stored-clarify")?.id,
+            "clarify:runtime-clarify"
+        )
+        XCTAssertNil(inbox.pendingClarification(runtimeID: "other", storedID: "other"))
+    }
 }

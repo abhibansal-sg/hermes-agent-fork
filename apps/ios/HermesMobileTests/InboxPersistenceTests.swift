@@ -52,4 +52,58 @@ final class InboxPersistenceTests: XCTestCase {
         let persisted = try await cache.loadAttentionSnapshot(scope: scope)
         XCTAssertEqual(persisted.items.first?.state, .resolvedElsewhere)
     }
+
+    func testActiveChatAckDrainsQueuedInsertBeforeResolvingMirror() async throws {
+        let cache = try CacheStore(testDB: DatabaseQueue())
+        let inbox = InboxStore()
+        inbox.attachCache(cache)
+        await inbox.hydrate(scope: scope)
+        let event = try XCTUnwrap(GatewayEvent(params: .object([
+            "type": .string("clarify.request"),
+            "session_id": .string("runtime-1"),
+            "stored_session_id": .string("stored-1"),
+            "payload": .object([
+                "question": .string("Which option?"),
+                "choices": .array([.string("A"), .string("B")]),
+                "request_id": .string("request-1"),
+            ]),
+        ])))
+
+        inbox.handle(event: event)
+        await inbox.resolveMirroredClarification(
+            sessionID: "runtime-1",
+            requestID: "request-1"
+        )
+        await inbox.flushPersistence()
+
+        XCTAssertEqual(inbox.pendingCount, 0)
+        let persisted = try await cache.loadAttentionSnapshot(scope: scope)
+        XCTAssertEqual(persisted.items.first?.state, .resolvedElsewhere)
+    }
+
+    func testActiveChatAckTombstoneSuppressesLaterLiveReceipt() async throws {
+        let cache = try CacheStore(testDB: DatabaseQueue())
+        let inbox = InboxStore()
+        inbox.attachCache(cache)
+        await inbox.hydrate(scope: scope)
+
+        await inbox.resolveMirroredClarification(
+            sessionID: "runtime-1",
+            requestID: "request-1"
+        )
+        inbox.handle(event: try XCTUnwrap(GatewayEvent(params: .object([
+            "type": .string("clarify.request"),
+            "session_id": .string("runtime-1"),
+            "stored_session_id": .string("stored-1"),
+            "payload": .object([
+                "question": .string("Which option?"),
+                "request_id": .string("request-1"),
+            ]),
+        ]))))
+        await inbox.flushPersistence()
+
+        XCTAssertEqual(inbox.pendingCount, 0)
+        let persisted = try await cache.loadAttentionSnapshot(scope: scope)
+        XCTAssertTrue(persisted.items.isEmpty)
+    }
 }

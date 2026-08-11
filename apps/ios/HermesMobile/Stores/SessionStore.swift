@@ -1544,10 +1544,11 @@ final class SessionStore {
                 connection?.applySessionModel(live.model)
                 guard let snapshot = live.snapshot else { return false }
                 if let info = snapshot.info { connection?.applyRuntimeInfo(info) }
-                if snapshot.snapshotRunning == true {
+                if snapshot.snapshotRunning == true
+                    || snapshot.inflight?.isTerminalFailure == true {
                     await chat?.reconcileLiveTurnStatus(
                         runtimeId: live.id,
-                        snapshotRunning: true,
+                        snapshotRunning: snapshot.snapshotRunning,
                         inflight: snapshot.inflight,
                         watchOnly: true
                     )
@@ -2611,7 +2612,11 @@ final class SessionStore {
                     ).sessions
                 } else {
                     fetched = try await rest.sessionsWithTotal(
-                        limit: limit,
+                        // Stock `/api/sessions` validates `limit <= 100`; the
+                        // profile-aware aggregate endpoint accepts our 200-row
+                        // presentation window. Keep the larger native window on
+                        // that route, but never turn a stock refresh into 422.
+                        limit: min(limit, 100),
                         order: order,
                         minMessages: 1,
                         excludeSource: Self.recentsExcludeSources

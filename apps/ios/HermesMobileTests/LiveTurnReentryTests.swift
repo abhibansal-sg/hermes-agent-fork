@@ -24,10 +24,26 @@ final class LiveTurnReentryTests: XCTestCase {
         return (chat, sessions)
     }
 
-    private func storedMessage(role: String, text: String) -> StoredMessage {
+    private func storedMessage(
+        role: String,
+        text: String,
+        turnID: String? = nil
+    ) -> StoredMessage {
+        StoredMessage(role: role, content: .string(text), turnID: turnID)
+    }
+
+    private func storedToolCall(name: String, id: String) -> StoredMessage {
         StoredMessage(json: .object([
-            "role": .string(role),
-            "content": .string(text),
+            "role": .string("assistant"),
+            "content": .string(""),
+            "tool_calls": .array([.object([
+                "id": .string(id),
+                "type": .string("function"),
+                "function": .object([
+                    "name": .string(name),
+                    "arguments": .string("{}"),
+                ]),
+            ])]),
         ]))!
     }
 
@@ -128,6 +144,184 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertTrue(chat.messages.last?.isStreaming == true)
         XCTAssertTrue(chat.localTurnInFlight)
         XCTAssertEqual(chat.interruptTarget, runtimeId)
+    }
+
+    func testFailedInflightSnapshotRestoresPersistentProviderFailure() async {
+        let (chat, _) = makeStore()
+        let inflight = SessionInflightTurn(
+            user: "draft the follow-up",
+            assistant: "",
+            streaming: false,
+            status: "failed",
+            error: "HTTP 503: all accounts at capacity",
+            recoverable: true
+        )
+
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: runtimeId,
+            snapshotRunning: false,
+            inflight: inflight
+        )
+
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant])
+        XCTAssertEqual(chat.messages.last?.warning, "HTTP 503: all accounts at capacity")
+        XCTAssertEqual(chat.lastError, "HTTP 503: all accounts at capacity")
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertFalse(chat.messages.last?.isStreaming == true)
+    }
+
+    func testRepeatedPromptFailureCreatesANewTurnAndStaysDeduplicated() async {
+        let (chat, _) = makeStore()
+        chat.seed(from: [
+            storedMessage(role: "user", text: "retry this"),
+            storedMessage(role: "assistant", text: "previous answer"),
+        ])
+        let previousAssistantID = chat.messages.last?.id
+        let inflight = SessionInflightTurn(
+            user: "retry this",
+            assistant: "",
+            streaming: false,
+            status: "failed",
+            error: "HTTP 503: all accounts at capacity",
+            recoverable: true
+        )
+
+        for _ in 0..<3 {
+            await chat.reconcileLiveTurnStatus(
+                runtimeId: runtimeId,
+                snapshotRunning: false,
+                inflight: inflight
+            )
+        }
+
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant, .user, .assistant])
+        XCTAssertEqual(chat.messages[1].id, previousAssistantID)
+        XCTAssertNil(chat.messages[1].warning)
+        XCTAssertEqual(chat.messages[1].text, "previous answer")
+        XCTAssertEqual(chat.messages[2].text, "retry this")
+        XCTAssertEqual(chat.messages[3].warning, "HTTP 503: all accounts at capacity")
+    }
+
+    func testRepeatedPromptColdWatchDoesNotAdoptPriorSettledAssistant() async {
+        let (chat, _) = makeStore()
+        chat.seed(from: [
+            storedMessage(role: "user", text: "retry this"),
+            storedMessage(role: "assistant", text: "previous answer"),
+        ])
+        let previousAssistantID = chat.messages.last?.id
+        let inflight = SessionInflightTurn(
+            user: "retry this",
+            assistant: "",
+            streaming: true
+        )
+
+        for _ in 0..<3 {
+            await chat.reconcileLiveTurnStatus(
+                runtimeId: runtimeId,
+                snapshotRunning: true,
+                inflight: inflight,
+                watchOnly: true
+            )
+        }
+
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant, .user, .assistant])
+        XCTAssertEqual(chat.messages[1].id, previousAssistantID)
+        XCTAssertFalse(chat.messages[1].isStreaming)
+        XCTAssertTrue(chat.messages[3].isStreaming)
+        XCTAssertEqual(chat.messages.filter { $0.role == .user }.count, 2)
+    }
+
+    func testRepeatedPromptColdWatchDoesNotAdoptEqualPriorPartialWithoutTurnIdentity() async {
+        let (chat, _) = makeStore()
+        chat.seed(from: [
+            storedMessage(role: "user", text: "retry this", turnID: "prior-turn"),
+            storedMessage(role: "assistant", text: "same partial"),
+        ])
+        let previousAssistantID = chat.messages.last?.id
+        let inflight = SessionInflightTurn(
+            user: "retry this",
+            assistant: "same partial",
+            streaming: true,
+            turnId: "new-turn"
+        )
+
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: runtimeId,
+            snapshotRunning: true,
+            inflight: inflight,
+            watchOnly: true
+        )
+
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant, .user, .assistant])
+        XCTAssertEqual(chat.messages[1].id, previousAssistantID)
+        XCTAssertEqual(chat.messages[1].text, "same partial")
+        XCTAssertTrue(chat.messages[3].isStreaming)
+    }
+
+    func testRepeatedPromptColdWatchDoesNotAdoptPriorCompletedToolOnlyAssistant() async {
+        let (chat, _) = makeStore()
+        chat.seed(from: [
+            storedMessage(role: "user", text: "retry this"),
+            storedToolCall(name: "clarify", id: "prior-tool"),
+            StoredMessage(
+                role: "tool",
+                content: .string("done"),
+                toolCallId: "prior-tool",
+                toolName: "clarify"
+            ),
+        ])
+        let previousAssistantID = chat.messages.last?.id
+        let inflight = SessionInflightTurn(
+            user: "retry this",
+            assistant: "",
+            streaming: true
+        )
+
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: runtimeId,
+            snapshotRunning: true,
+            inflight: inflight,
+            watchOnly: true
+        )
+
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant, .user, .assistant])
+        XCTAssertEqual(chat.messages[1].id, previousAssistantID)
+        XCTAssertFalse(chat.messages[1].isStreaming)
+        XCTAssertTrue(chat.messages[3].isStreaming)
+    }
+
+    func testColdWatchAdoptsAuthoritativeToolOnlyTurnWithoutSecondWorkingRow() async {
+        let (chat, _) = makeStore()
+        chat.seed(from: [
+            storedMessage(
+                role: "user",
+                text: "trying to send messages",
+                turnID: "current-turn"
+            ),
+            storedToolCall(name: "clarify", id: "clarify-call"),
+        ])
+        let authoritativeAssistantID = chat.messages.last?.id
+        let inflight = SessionInflightTurn(
+            user: "trying to send messages",
+            assistant: "",
+            streaming: true,
+            turnId: "current-turn"
+        )
+
+        for _ in 0..<3 {
+            await chat.reconcileLiveTurnStatus(
+                runtimeId: runtimeId,
+                snapshotRunning: true,
+                inflight: inflight,
+                watchOnly: true
+            )
+        }
+
+        let assistants = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(assistants.count, 1)
+        XCTAssertEqual(assistants.first?.id, authoritativeAssistantID)
+        XCTAssertTrue(assistants.first?.isStreaming == true)
+        XCTAssertEqual(chat.messages.filter { $0.role == .user }.count, 1)
     }
 
     func testRepeatResumeSnapshotDoesNotDuplicateInflightPrompt() async {

@@ -183,7 +183,13 @@ final class NativeChromeSnapshotEvidenceTests: XCTestCase {
         let (queue, directory) = try await makeQueue(pendingTexts: ["Also ping the on-call channel"])
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let dock = TurnDock(chatStore: chat, queueStore: queue, themeStore: ThemeStore())
+        let dock = TurnDock(
+            chatStore: chat,
+            queueStore: queue,
+            inboxStore: InboxStore(),
+            inboxClarification: nil,
+            themeStore: ThemeStore()
+        )
         try snapshot(
             chatBackdrop(HermesThemePresets.nousDark) { dock },
             name: "qa2-dock-task-plus-pending"
@@ -199,7 +205,13 @@ final class NativeChromeSnapshotEvidenceTests: XCTestCase {
         let (queue, directory) = try await makeQueue(pendingTexts: [])
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let dock = TurnDock(chatStore: chat, queueStore: queue, themeStore: ThemeStore())
+        let dock = TurnDock(
+            chatStore: chat,
+            queueStore: queue,
+            inboxStore: InboxStore(),
+            inboxClarification: nil,
+            themeStore: ThemeStore()
+        )
         try snapshot(
             chatBackdrop(HermesThemePresets.nousDark) { dock },
             name: "qa2-dock-task-pill-only"

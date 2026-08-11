@@ -499,22 +499,34 @@ class ComputeHost:
                 message_count = len(session.get("history") or [])
                 interrupted = bool(session.get("_turn_cancel_requested"))
                 session_key = str(session.get("session_key") or "")
+                inflight = server._inflight_snapshot(session)
             session_info = server._session_info(session.get("agent"), session)
             self._bump_progress()
-            self.emit(
-                {
-                    "type": "turn.end",
-                    "sid": sid,
-                    "request_id": request_id,
-                    "history_version": history_version,
-                    "session_key": session_key,
-                    "message_count": message_count,
-                    "interrupted": interrupted,
-                    "ended_ns": now_ns(),
-                    "session_info": session_info,
-                    "session_info_emitted": True,
-                }
-            )
+            completed = {
+                "type": "turn.end",
+                "sid": sid,
+                "request_id": request_id,
+                "history_version": history_version,
+                "session_key": session_key,
+                "message_count": message_count,
+                "interrupted": interrupted,
+                "ended_ns": now_ns(),
+                "session_info": session_info,
+                "session_info_emitted": True,
+            }
+            if isinstance(inflight, dict) and inflight.get("error"):
+                completed.update(
+                    status="error",
+                    error=str(inflight["error"]),
+                    recoverable=bool(inflight.get("recoverable", True)),
+                    inflight=inflight,
+                    # _run_prompt_submit already emitted the structured
+                    # message.complete through the host RPC transport. The
+                    # serving parent must retain this snapshot, not emit a
+                    # second terminal message.
+                    terminal_event_emitted=True,
+                )
+            self.emit(completed)
         except Exception as exc:
             try:
                 from tui_gateway import server

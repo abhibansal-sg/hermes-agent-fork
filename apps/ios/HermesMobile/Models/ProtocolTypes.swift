@@ -310,6 +310,42 @@ struct SessionInflightTurn: Decodable, Sendable, Equatable {
     let user: String
     let assistant: String
     let streaming: Bool
+    /// Opaque Hermes-owned turn identity. New gateways stamp the same value on
+    /// the canonical user row; older gateways omit it and take the conservative
+    /// non-adopting reconciliation path.
+    let turnId: String?
+    let startedAt: Double?
+    /// Terminal state retained by Hermes after a failed turn. Older gateways
+    /// omit these fields, so all three remain optional for wire compatibility.
+    let status: String?
+    let error: String?
+    let recoverable: Bool?
+
+    init(
+        user: String,
+        assistant: String,
+        streaming: Bool,
+        turnId: String? = nil,
+        startedAt: Double? = nil,
+        status: String? = nil,
+        error: String? = nil,
+        recoverable: Bool? = nil
+    ) {
+        self.user = user
+        self.assistant = assistant
+        self.streaming = streaming
+        self.turnId = turnId
+        self.startedAt = startedAt
+        self.status = status
+        self.error = error
+        self.recoverable = recoverable
+    }
+
+    var isTerminalFailure: Bool {
+        let normalized = status?.lowercased() ?? ""
+        return ["error", "failed", "interrupted", "cancelled", "canceled"].contains(normalized)
+            || error?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
 }
 
 /// `info` block returned by session.create/resume.
@@ -358,6 +394,9 @@ struct StoredMessage: Sendable {
     /// emits it there) and on pre-R4b cached rows — adoption then falls back
     /// to the cmid-less same-text branch (unchanged behavior).
     let clientMessageID: String?
+    /// Hermes' opaque live-turn identity, stamped on canonical user rows.
+    /// This is distinct from the client outbox id and remains nil on older rows.
+    let turnID: String?
 
     // MARK: - ABH-87 Batch B (§2.3) — fields the seed producer reconstructs from
     //
@@ -396,6 +435,8 @@ struct StoredMessage: Sendable {
         self.wireId = json["id"]?.intValue
         // R4b — the write-local-first echo identity (additive; nil on REST rows).
         self.clientMessageID = Self.nonEmpty(json["client_message_id"]?.stringValue)
+        self.turnID = Self.nonEmpty(json["turn_id"]?.stringValue)
+            ?? Self.nonEmpty(json["display_metadata"]?["hermes_turn_id"]?.stringValue)
 
         // tool_calls[]: keep only well-formed calls; an empty/absent array → nil.
         let calls = (json["tool_calls"]?.arrayValue ?? []).compactMap(WireToolCall.init(json:))
@@ -418,6 +459,7 @@ struct StoredMessage: Sendable {
         timestamp: Double? = nil,
         wireId: Int? = nil,
         clientMessageID: String? = nil,
+        turnID: String? = nil,
         toolCalls: [WireToolCall]? = nil,
         toolCallId: String? = nil,
         toolName: String? = nil,
@@ -429,6 +471,7 @@ struct StoredMessage: Sendable {
         self.timestamp = timestamp
         self.wireId = wireId
         self.clientMessageID = clientMessageID
+        self.turnID = turnID
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
         self.toolName = toolName
@@ -544,6 +587,10 @@ struct MessageCompletePayload: Decodable, Sendable {
     let usage: UsageStats?
     let reasoning: String?
     let warning: String?
+    /// Structured terminal failure retained by the gateway. Prefer this over a
+    /// generic status-derived label so provider failures remain actionable.
+    let error: String?
+    let recoverable: Bool?
 }
 
 /// Payload of `tool.start`.

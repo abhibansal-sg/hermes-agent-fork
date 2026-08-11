@@ -70,6 +70,9 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     /// positional alias recovery to reject equal-content turns whose authority
     /// timestamps prove they are distinct.
     var authoritativeSeedTimestamp: Double?
+    /// Hermes-owned live-turn identity from the canonical user row. Nil for
+    /// older transcripts; never synthesized from prompt or assistant content.
+    var authoritativeTurnID: String?
     let role: ChatRole
     /// Stable durable-outbox identity for optimistic user echoes. Nil for
     /// server-seeded/legacy rows.
@@ -111,6 +114,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         canonicalID: UUID? = nil,
         usesPositionalSeedIdentity: Bool = false,
         authoritativeSeedTimestamp: Double? = nil,
+        authoritativeTurnID: String? = nil,
         role: ChatRole,
         clientMessageID: String? = nil,
         parts: [ChatMessagePart] = [],
@@ -129,6 +133,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         self.canonicalID = canonicalID
         self.usesPositionalSeedIdentity = usesPositionalSeedIdentity
         self.authoritativeSeedTimestamp = authoritativeSeedTimestamp
+        self.authoritativeTurnID = authoritativeTurnID
         self.role = role
         self.clientMessageID = clientMessageID
         self.isStreaming = isStreaming
