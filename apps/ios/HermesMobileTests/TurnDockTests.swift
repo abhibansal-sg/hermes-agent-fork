@@ -142,4 +142,89 @@ final class TurnDockTests: XCTestCase {
             TurnDockContent.resolve(hasApproval: false, hasClarification: false, hasTasks: false, hasQueued: false),
             .none)
     }
+
+    func testPendingHumanGateSuppressesSettledAssistantActions() {
+        XCTAssertTrue(TurnDockContent.approval.blocksAssistantActions)
+        XCTAssertTrue(TurnDockContent.clarify.blocksAssistantActions)
+        XCTAssertFalse(TurnDockContent.tasks.blocksAssistantActions)
+        XCTAssertFalse(TurnDockContent.queued.blocksAssistantActions)
+        XCTAssertFalse(TurnDockContent.none.blocksAssistantActions)
+    }
+
+    func testChatClarificationAckConsumesInboxMirrorWithoutSecondRPC() async throws {
+        let chat = ChatStore()
+        let inbox = InboxStore()
+        var responseCalls = 0
+        chat.gateResponseRPC = { method, _ in
+            XCTAssertEqual(method, "clarify.respond")
+            responseCalls += 1
+        }
+        let requestPayload: JSONValue = .object([
+            "question": .string("Which path?"),
+            "choices": .array([.string("A"), .string("B")]),
+            "request_id": .string("request-dual-store"),
+        ])
+        chat.pendingClarification = PendingClarification(
+            sessionId: "runtime-dual-store",
+            request: ClarifyRequestPayload(payload: requestPayload)
+        )
+        inbox.handle(event: try XCTUnwrap(GatewayEvent(params: .object([
+            "type": .string("clarify.request"),
+            "session_id": .string("runtime-dual-store"),
+            "stored_session_id": .string("stored-dual-store"),
+            "payload": requestPayload,
+        ]))))
+        _ = try XCTUnwrap(inbox.pendingClarification(
+            runtimeID: "runtime-dual-store",
+            storedID: "stored-dual-store"
+        ))
+
+        await TurnDock.respondActiveClarification(
+            "A",
+            chatStore: chat,
+            inboxStore: inbox
+        )
+
+        XCTAssertEqual(responseCalls, 1)
+        XCTAssertNil(chat.pendingClarification)
+        XCTAssertNil(inbox.pendingClarification(
+            runtimeID: "runtime-dual-store",
+            storedID: "stored-dual-store"
+        ))
+    }
+
+    func testFailedChatClarificationAckKeepsInboxMirrorActionable() async throws {
+        let chat = ChatStore()
+        let inbox = InboxStore()
+        chat.gateResponseRPC = { _, _ in throw GatewayError.notConnected }
+        let requestPayload: JSONValue = .object([
+            "question": .string("Which path?"),
+            "request_id": .string("request-dual-store-failure"),
+        ])
+        chat.pendingClarification = PendingClarification(
+            sessionId: "runtime-dual-store",
+            request: ClarifyRequestPayload(payload: requestPayload)
+        )
+        inbox.handle(event: try XCTUnwrap(GatewayEvent(params: .object([
+            "type": .string("clarify.request"),
+            "session_id": .string("runtime-dual-store"),
+            "payload": requestPayload,
+        ]))))
+        _ = try XCTUnwrap(inbox.pendingClarification(
+            runtimeID: "runtime-dual-store",
+            storedID: nil
+        ))
+
+        await TurnDock.respondActiveClarification(
+            "A",
+            chatStore: chat,
+            inboxStore: inbox
+        )
+
+        XCTAssertNotNil(chat.pendingClarification)
+        XCTAssertNotNil(inbox.pendingClarification(
+            runtimeID: "runtime-dual-store",
+            storedID: nil
+        ))
+    }
 }

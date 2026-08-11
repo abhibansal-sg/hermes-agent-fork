@@ -80,6 +80,7 @@ final class ServerCapabilities {
     /// preserved across a cache restore so a known value survives reconnect.
     func probe(serverURL: String, rest: RestClient, force: Bool = false) async {
         let version = Self.currentAppVersion
+        var reusedPartialCache = false
 
         // Reuse a cached snapshot for the same server + app version: a reconnect
         // to a server we already probed must not re-probe (contract E1).
@@ -94,30 +95,45 @@ final class ServerCapabilities {
         if !force {
             if probedServerURL == serverURL,
                probedAppVersion == version,
-               fs != .unknown {
+               fs != .unknown,
+               profiles != .unknown {
                 return
             }
             if let cached = Self.loadCache(),
                cached.serverURL == serverURL,
                cached.appVersion == version {
                 applyCache(cached)
-                return
+                // A cache is reusable only when every eager capability is
+                // conclusive. Build 149 persisted `profiles: unknown` beside a
+                // known filesystem result, then treated that partial snapshot as
+                // complete forever, hiding the profile picker across launches.
+                if fs != .unknown, profiles != .unknown { return }
+                reusedPartialCache = true
             }
         }
 
-        // Fresh server (or new app version): reset passive/derived state so a
-        // stale prior-server value can't leak through, then probe.
-        broadcast = .unknown
-        fs = .unknown
-        subagentEvents = .unknown
-        profiles = .unknown
-        probedServerURL = serverURL
-        probedAppVersion = version
+        if !reusedPartialCache {
+            // Fresh server (or new app version): reset passive/derived state so
+            // a stale prior-server value can't leak through, then probe.
+            broadcast = .unknown
+            fs = .unknown
+            subagentEvents = .unknown
+            profiles = .unknown
+            probedServerURL = serverURL
+            probedAppVersion = version
+        }
 
-        // Files and profiles are independent stock capabilities. Probe them
-        // concurrently after path-style resolution.
-        async let fsProbe = Self.probeStockFS(rest: rest)
-        async let profilesProbe = Self.probeProfiles(rest: rest)
+        // Files and profiles are independent stock capabilities. A partial
+        // cache re-probes only its unknown fields so a transient outage cannot
+        // erase a conclusive capability while repairing a different one.
+        let cachedFS = fs
+        let cachedProfiles = profiles
+        async let fsProbe = cachedFS == .unknown
+            ? Self.probeStockFS(rest: rest)
+            : cachedFS
+        async let profilesProbe = cachedProfiles == .unknown
+            ? Self.probeProfiles(rest: rest)
+            : cachedProfiles
         let (fsState, profilesState) = await (fsProbe, profilesProbe)
         // The connection (and thus serverURL) may have changed while we awaited;
         // only apply if we're still probing the same server.

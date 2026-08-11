@@ -785,6 +785,49 @@ final class ProfilesTests: XCTestCase {
         XCTAssertEqual(query["limit"], "200")
     }
 
+    func testLegacySessionRailClampsSnapshotToServerMaximum() async throws {
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+        defer {
+            UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+            ProfileRailRequestStubProtocol.requestedURL = nil
+        }
+
+        ProfileRailRequestStubProtocol.requestedURL = nil
+        ProfileRailRequestStubProtocol.responseData = Data(
+            #"{"sessions":[],"total":0,"limit":100,"offset":0}"#.utf8
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ProfileRailRequestStubProtocol.self]
+        let rest = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: configuration)
+        )
+
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        sessions.attach(connection: connection, chat: chat)
+        connection._restOverrideForTesting = rest
+        connection.capabilities._seedProfilesCapabilityForTesting(.unavailable)
+
+        await sessions.refresh()
+
+        let requestedURL = try XCTUnwrap(ProfileRailRequestStubProtocol.requestedURL)
+        let components = try XCTUnwrap(
+            URLComponents(url: requestedURL, resolvingAgainstBaseURL: false)
+        )
+        let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap {
+            item in item.value.map { (item.name, $0) }
+        })
+        XCTAssertEqual(components.path, "/api/sessions")
+        XCTAssertEqual(
+            query["limit"],
+            "100",
+            "the stock endpoint rejects limits above 100 with HTTP 422"
+        )
+    }
+
     /// Regression for the production cold-connect race: hydration can start the
     /// stock/default rail while the profiles capability is still unknown. Once
     /// profile discovery proves an aggregate rail is available, that provisional

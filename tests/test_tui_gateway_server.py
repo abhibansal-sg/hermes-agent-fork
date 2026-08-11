@@ -396,6 +396,109 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         server._sessions.pop("iso-sid", None)
 
 
+def test_compute_host_turn_error_retains_recoverable_inflight_failure(monkeypatch):
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        _compute_host_active=True,
+        running=True,
+    )
+    server._start_inflight_turn(session, "draft the follow-up")
+    parent_turn_id = session["inflight_turn"]["turn_id"]
+    parent_started_at = session["inflight_turn"]["started_at"]
+    server._sessions["iso-error"] = session
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+    )
+
+    try:
+        server._on_compute_host_turn_done(
+            "turn-error",
+            "iso-error",
+            session,
+            {
+                "type": "turn.end",
+                "sid": "iso-error",
+                "request_id": "turn-error",
+                "status": "error",
+                "error": "HTTP 503: all accounts at capacity",
+                "recoverable": True,
+                "terminal_event_emitted": True,
+                "inflight": {
+                    "user": "draft the follow-up",
+                    "assistant": "partial reply from child",
+                    "corrections": ["use the shorter version"],
+                    "streaming": False,
+                    "turn_id": "child-turn-id-must-not-win",
+                    "started_at": 1.0,
+                    "status": "error",
+                    "error": "HTTP 503: all accounts at capacity",
+                    "recoverable": True,
+                },
+            },
+        )
+
+        assert session["running"] is False
+        inflight = server._inflight_snapshot(session)
+        assert inflight is not None
+        assert inflight["assistant"] == "partial reply from child"
+        assert inflight["corrections"] == ["use the shorter version"]
+        assert inflight["streaming"] is False
+        assert inflight["user"] == "draft the follow-up"
+        assert inflight["status"] == "error"
+        assert inflight["error"] == "HTTP 503: all accounts at capacity"
+        assert inflight["recoverable"] is True
+        assert inflight["turn_id"] == parent_turn_id
+        assert inflight["started_at"] == parent_started_at
+        assert not any(event == "message.complete" for event, _sid, _payload in emitted)
+    finally:
+        server._sessions.pop("iso-error", None)
+
+
+def test_compute_host_normal_turn_end_carries_returned_provider_failure(monkeypatch):
+    from tui_gateway.compute_host import ComputeHost
+
+    sid = "iso-returned-error"
+    session = _session(agent=None, agent_ready=threading.Event(), _compute_host_active=True)
+    server._sessions[sid] = session
+    emitted = []
+    host = ComputeHost(heartbeat_secs=0)
+    host.emit = emitted.append
+
+    def _returned_error(_rid, _sid, child_session, _text, **_kwargs):
+        with child_session["history_lock"]:
+            server._fail_inflight_turn(child_session, "HTTP 503: all accounts at capacity")
+            child_session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _returned_error)
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    try:
+        host._run_real_turn(
+            {
+                "type": "turn.start",
+                "sid": sid,
+                "request_id": "turn-returned-error",
+                "session_key": "stored-returned-error",
+                "text": "draft the follow-up",
+                "history": [],
+            }
+        )
+    finally:
+        host.close()
+        server._sessions.pop(sid, None)
+
+    completed = next(frame for frame in emitted if frame.get("type") == "turn.end")
+    assert completed["status"] == "error"
+    assert completed["error"] == "HTTP 503: all accounts at capacity"
+    assert completed["recoverable"] is True
+    assert completed["terminal_event_emitted"] is True
+    assert completed["inflight"]["status"] == "error"
+    assert completed["inflight"]["turn_id"]
+
+
 def test_slash_exec_compress_flag_on_applies_host_control_mirror(monkeypatch):
     class _ExplodingWorker:
         def __init__(self, *args, **kwargs):
@@ -8905,6 +9008,21 @@ def test_inflight_snapshot_omits_corrections_when_none_recorded():
     assert "corrections" not in snapshot
 
 
+def test_inflight_turn_identity_matches_canonical_user_metadata():
+    session = {}
+    server._start_inflight_turn(session, "just the prompt")
+    metadata = server._inflight_display_metadata(session, None)
+    messages = server._history_to_messages(
+        [{"role": "user", "content": "just the prompt", "display_metadata": metadata}]
+    )
+    snapshot = server._inflight_snapshot(session)
+
+    assert snapshot is not None
+    assert snapshot["turn_id"]
+    assert messages[0]["turn_id"] == snapshot["turn_id"]
+    assert messages[0]["display_metadata"]["hermes_turn_id"] == snapshot["turn_id"]
+
+
 def test_new_turn_does_not_inherit_prior_turn_corrections():
     session = {}
     server._start_inflight_turn(session, "first prompt")
@@ -12535,6 +12653,46 @@ def test_session_watch_by_runtime_id_can_omit_messages(monkeypatch):
     assert "info" not in resp["result"]
 
 
+def test_session_watch_returns_retained_terminal_failure(monkeypatch):
+    """A reconnecting native client must recover the provider failure itself."""
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live"),
+        history=[{"role": "user", "content": "draft the follow-up"}],
+        inflight_turn={
+            "assistant": "",
+            "streaming": False,
+            "user": "draft the follow-up",
+            "status": "error",
+            "error": "HTTP 503: all accounts at capacity",
+            "recoverable": True,
+        },
+        running=False,
+        session_key="key-failed",
+    )
+    server._sessions["sid-failed"] = session
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    try:
+        resp = server.handle_request(
+            {
+                "id": "watch-failed",
+                "method": "session.watch",
+                "params": {"session_id": "sid-failed", "omit_messages": True},
+            }
+        )
+    finally:
+        server._sessions.pop("sid-failed", None)
+
+    assert resp["result"]["running"] is False
+    assert resp["result"]["inflight"] == {
+        "assistant": "",
+        "streaming": False,
+        "user": "draft the follow-up",
+        "status": "error",
+        "error": "HTTP 503: all accounts at capacity",
+        "recoverable": True,
+    }
+
+
 def test_session_watch_rejects_missing_or_finalized_session():
     missing = server.handle_request(
         {
@@ -12631,11 +12789,11 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         )
 
         inflight = resp["result"].get("inflight")
-        assert inflight == {
-            "assistant": "partial answer",
-            "streaming": True,
-            "user": "write a long answer",
-        }
+        assert inflight["assistant"] == "partial answer"
+        assert inflight["streaming"] is True
+        assert inflight["user"] == "write a long answer"
+        assert inflight["turn_id"]
+        assert isinstance(inflight["started_at"], float)
         assert resp["result"]["messages"] == []
 
         release.set()

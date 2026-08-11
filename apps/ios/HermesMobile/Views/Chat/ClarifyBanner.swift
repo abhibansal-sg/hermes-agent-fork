@@ -23,8 +23,10 @@ import SwiftUI
 struct ClarifyBanner: View {
     /// The pending clarification to present.
     let clarification: PendingClarification
-    /// The chat store that owns the clarification response RPC.
-    let chatStore: ChatStore
+    /// Response path for the source that supplied the presentation. Live
+    /// ChatStore cards use the selected runtime; a reconnect-restored Inbox row
+    /// answers its own Hermes runtime directly.
+    private let respondAction: @MainActor (String) async -> Void
 
     @Environment(\.hermesTheme) private var theme
 
@@ -43,6 +45,21 @@ struct ClarifyBanner: View {
     /// of growing the card past the nav bar (R10, IMG_2537). ~5 lines at
     /// subheadline is enough to read the question in context; the rest scrolls.
     private let questionHeaderMaxHeight: CGFloat = 132
+
+    init(clarification: PendingClarification, chatStore: ChatStore) {
+        self.clarification = clarification
+        self.respondAction = { answer in
+            _ = await chatStore.respondClarification(answer)
+        }
+    }
+
+    init(
+        clarification: PendingClarification,
+        respond: @escaping @MainActor (String) async -> Void
+    ) {
+        self.clarification = clarification
+        self.respondAction = respond
+    }
 
     var body: some View {
         let request = clarification.request
@@ -191,7 +208,7 @@ struct ClarifyBanner: View {
         isResponding = true
         freeText = ""
         Task {
-            await chatStore.respondClarification(answer)
+            await respondAction(answer)
             isResponding = false
         }
     }

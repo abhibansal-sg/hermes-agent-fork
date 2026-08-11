@@ -459,9 +459,9 @@ def test_inline_turn_persists_client_id_as_user_display_metadata(
         display_metadata={"client_message_id": message_id},
     )
 
-    assert captured["persist_user_display_metadata"] == {
-        "client_message_id": message_id
-    }
+    metadata = captured["persist_user_display_metadata"]
+    assert metadata["client_message_id"] == message_id
+    assert metadata["hermes_turn_id"]
 
 
 def test_fingerprint_uses_stable_compression_lineage_root(isolated, monkeypatch):

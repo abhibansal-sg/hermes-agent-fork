@@ -30,6 +30,12 @@ enum TurnDockContent: Equatable {
         if hasQueued { return .queued }
         return .none
     }
+
+    /// Approval/clarification rows are intermediate human gates, not completed
+    /// assistant turns. Keep Retry/Branch/Copy chrome off until Hermes advances.
+    var blocksAssistantActions: Bool {
+        self == .approval || self == .clarify
+    }
 }
 
 // MARK: - Turn dock container
@@ -42,6 +48,8 @@ enum TurnDockContent: Equatable {
 struct TurnDock: View {
     let chatStore: ChatStore
     let queueStore: QueueStore
+    let inboxStore: InboxStore
+    let inboxClarification: InboxStore.Item?
     /// Applied at the queued-messages sheet root so the sheet inherits the theme
     /// (SwiftUI sheets do not inherit `\.hermesTheme` from the presenter).
     let themeStore: ThemeStore
@@ -62,7 +70,7 @@ struct TurnDock: View {
     private var content: TurnDockContent {
         TurnDockContent.resolve(
             hasApproval: chatStore.pendingApproval != nil,
-            hasClarification: chatStore.pendingClarification != nil,
+            hasClarification: chatStore.pendingClarification != nil || inboxClarification != nil,
             hasTasks: chatStore.dockShowsTaskBox,
             hasQueued: TurnDock.hasQueued(queueStore)
         )
@@ -77,6 +85,23 @@ struct TurnDock: View {
         !queueStore.activeItems.isEmpty && !queueStore.hasBacklog
     }
 
+    /// Send through the active ChatStore owner exactly once, then retire the
+    /// Inbox presentation mirror only after Hermes acknowledges that response.
+    /// Keeping this coordinator testable prevents the two caches from showing
+    /// the same already-answered clarification back-to-back.
+    static func respondActiveClarification(
+        _ answer: String,
+        chatStore: ChatStore,
+        inboxStore: InboxStore
+    ) async {
+        guard let pending = chatStore.pendingClarification else { return }
+        guard await chatStore.respondClarification(answer) else { return }
+        await inboxStore.resolveMirroredClarification(
+            sessionID: pending.sessionId,
+            requestID: pending.request.requestId
+        )
+    }
+
     var body: some View {
         Group {
             switch content {
@@ -87,8 +112,29 @@ struct TurnDock: View {
                 }
             case .clarify:
                 if let clarification = chatStore.pendingClarification {
-                    ClarifyBanner(clarification: clarification, chatStore: chatStore)
+                    ClarifyBanner(
+                        clarification: clarification,
+                        respond: { answer in
+                            await Self.respondActiveClarification(
+                                answer,
+                                chatStore: chatStore,
+                                inboxStore: inboxStore
+                            )
+                        }
+                    )
                         .transition(dockTransition)
+                } else if let item = inboxClarification,
+                          case .clarify(let request) = item.payload {
+                    ClarifyBanner(
+                        clarification: PendingClarification(
+                            sessionId: item.sessionId,
+                            request: request
+                        ),
+                        respond: { answer in
+                            await inboxStore.respondClarification(item, answer: answer)
+                        }
+                    )
+                    .transition(dockTransition)
                 }
             case .tasks:
                 // QA-2 R12 redesign: a NATIVE CAPSULE pill, width-to-fit and

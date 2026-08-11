@@ -85,6 +85,53 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertNil(chat.turnStartedAt, "completion clears the active turn source after stamping the message")
     }
 
+    func testMessageCompleteUsesStructuredProviderError() async throws {
+        let (chat, _) = makeStore()
+        chat.handle(event: localFrame(type: "message.start"))
+        chat.handle(event: localFrame(type: "message.complete", payload: .object([
+            "status": .string("error"),
+            "error": .string("HTTP 503: all accounts at capacity"),
+            "recoverable": .bool(true),
+        ])))
+
+        await waitUntil { chat.isStreaming == false }
+        let last = try XCTUnwrap(chat.messages.last)
+        XCTAssertEqual(last.warning, "HTTP 503: all accounts at capacity")
+        XCTAssertNotEqual(last.warning, "Turn error")
+    }
+
+    func testInflightTurnDecodesTerminalFailureFields() throws {
+        let payload: JSONValue = .object([
+            "user": .string("draft the follow-up"),
+            "assistant": .string(""),
+            "streaming": .bool(false),
+            "turn_id": .string("turn-provider-failure"),
+            "started_at": .number(123.5),
+            "status": .string("failed"),
+            "error": .string("HTTP 503: all accounts at capacity"),
+            "recoverable": .bool(true),
+        ])
+
+        let inflight = try XCTUnwrap(payload.decoded(as: SessionInflightTurn.self))
+        XCTAssertEqual(inflight.status, "failed")
+        XCTAssertEqual(inflight.turnId, "turn-provider-failure")
+        XCTAssertEqual(inflight.startedAt, 123.5)
+        XCTAssertEqual(inflight.error, "HTTP 503: all accounts at capacity")
+        XCTAssertEqual(inflight.recoverable, true)
+    }
+
+    func testCanonicalUserRowDecodesHermesTurnIdentity() throws {
+        let message = try XCTUnwrap(StoredMessage(json: .object([
+            "role": .string("user"),
+            "content": .string("draft the follow-up"),
+            "display_metadata": .object([
+                "hermes_turn_id": .string("turn-provider-failure"),
+            ]),
+        ])))
+
+        XCTAssertEqual(message.turnID, "turn-provider-failure")
+    }
+
     // MARK: - Item 6: approval payload surfaces the real command
 
     func testApprovalPayloadSurfacesCommandAndDerivesTitle() {
@@ -533,6 +580,60 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertFalse(chat.localTurnInFlight)
         XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
         XCTAssertEqual(chat.messages.last?.text, "finished")
+        await sessions.closeActive()
+    }
+
+    func testStockWatchRefreshRestoresRetainedTerminalFailureWhenIdle() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        var watchCalls = 0
+        sessions.watchRPC = { _ in
+            watchCalls += 1
+            let running = watchCalls == 1
+            return JSONValue.object([
+                "session_id": .string("runtime-desktop"),
+                "session_key": .string("stored-desktop"),
+                "running": .bool(running),
+                "status": .string(running ? "working" : "error"),
+                "inflight": .object([
+                    "user": .string("build the feature"),
+                    "assistant": .string(""),
+                    "streaming": .bool(running),
+                    "status": .string(running ? "working" : "failed"),
+                    "error": running
+                        ? .null
+                        : .string("HTTP 503: all accounts at capacity"),
+                    "recoverable": .bool(!running),
+                ]),
+                "messages": .array([]),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+        sessions.resumeRPC = { _, _ in
+            XCTFail("watch refresh must not resume or rebind the session")
+            throw GatewayError.notConnected
+        }
+
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertTrue(chat.isStreaming)
+
+        let continued = await sessions.refreshWatchedSessionOnce(
+            storedID: "stored-desktop", runtimeID: "runtime-desktop"
+        )
+
+        XCTAssertTrue(continued)
+        XCTAssertFalse(chat.isStreaming)
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant])
+        XCTAssertEqual(chat.messages.last?.warning, "HTTP 503: all accounts at capacity")
+        XCTAssertEqual(chat.lastError, "HTTP 503: all accounts at capacity")
         await sessions.closeActive()
     }
 
