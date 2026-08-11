@@ -83,11 +83,12 @@ final class ServerCapabilitiesFSTests: XCTestCase {
         let caps = ServerCapabilities()
         await caps.probe(serverURL: url, rest: rest)
 
+        XCTAssertEqual(caps.fs, .available)
         XCTAssertEqual(caps.profiles, .available)
         XCTAssertEqual(
             Set(CachedUnknownProfilesProtocol.paths),
-            ["/api/fs/default-cwd", "/api/profiles/sessions"],
-            "a partially-known cache must not suppress the missing profile probe"
+            ["/api/profiles/sessions"],
+            "a partial cache must probe only its missing capability"
         )
     }
 }
