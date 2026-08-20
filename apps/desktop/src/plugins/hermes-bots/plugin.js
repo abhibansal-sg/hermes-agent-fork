@@ -10181,7 +10181,7 @@ function BotsPane() {
 // These narrow behavior seams keep the standalone ESM plugin testable through
 // its real module boundary. The runtime loader consumes only the default
 // export, so they do not add plugin capabilities or alter production loading.
-export const __test = {
+const __test = {
   createCanonicalChat,
   ensureGroupChatSession,
   hideOwnedBotSessions,
@@ -10194,6 +10194,7 @@ export const __test = {
 }
 
 export default {
+  __test,
   id: ID,
   name: 'Bots',
   description: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',

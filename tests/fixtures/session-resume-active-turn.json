@@ -1,4 +1,5 @@
 {
+  "action_revision": 1,
   "info": {
     "cwd": "/workspace",
     "lazy": false,
@@ -8,6 +9,7 @@
   },
   "inflight": {
     "assistant": "partial answer",
+    "started_at": 1700000123.5,
     "streaming": true,
     "user": "current prompt"
   },

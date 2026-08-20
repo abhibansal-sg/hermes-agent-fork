@@ -5,7 +5,7 @@ register(new URL('./plugin-test-loader.mjs', import.meta.url), import.meta.url)
 export const sdk = await import('@hermes/plugin-sdk')
 const plugin = await import(new URL('../plugin.js', import.meta.url))
 
-export const botMode = plugin.__test
+export const botMode = plugin.default.__test
 
 export function resetBotModeTestState({ openSession, request, requestProfile } = {}) {
   botMode.state.$botMeta.set({})

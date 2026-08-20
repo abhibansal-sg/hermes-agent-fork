@@ -15,6 +15,8 @@ function loadCanonicalRecovery({ openSession, request }) {
       openSession,
       request: async (method, params) => {
         requests.push(method)
+        // This legacy harness exercises the explicit old-gateway fallback.
+        if (method === 'profiles.ensure_bot_chat') throw new Error('method not found')
         return request(method, params)
       }
     },
