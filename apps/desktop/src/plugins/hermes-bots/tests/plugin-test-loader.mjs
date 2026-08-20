@@ -54,7 +54,16 @@ export function atom(initial) {
     }
   }
 }
-export const host = { state: { profile: atom('default') } }
+export const host = {
+  state: {
+    profile: atom('default'),
+    connectionId: atom('local'),
+    activeSessionId: atom(null),
+    focusedSessionId: atom(null),
+    focusedStoredSessionId: atom(null),
+    focusedSessionProfile: atom('default')
+  }
+}
 export const cn = (...values) => values.filter(Boolean).join(' ')
 export const COMPOSER_AREAS = { atCompletions: 'atCompletions', middleware: 'middleware' }
 export const PALETTE_AREA = 'palette'

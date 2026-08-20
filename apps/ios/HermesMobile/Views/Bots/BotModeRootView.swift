@@ -29,7 +29,8 @@ struct BotModeRootView: View {
         .hermesThemed(themeStore)
         // A newly accepted transport gets a fresh profile read. This is a
         // presentation refresh only; the server remains profile authority.
-        .task(id: connection.transportEpoch) {
+        .task(id: "\(connection.transportEpoch):\(connection.botModeCapability.rawValue)") {
+            guard connection.botModeCapability == .available else { return }
             await botMode.refresh(using: connection)
         }
         .alert(
@@ -92,6 +93,24 @@ private struct BotRosterView: View {
 
     @ViewBuilder
     private var rosterContent: some View {
+        switch connection.botModeCapability {
+        case .unknown:
+            capabilityState(
+                title: "Waiting for Hermes",
+                message: "Bot Mode will appear after this gateway advertises support."
+            )
+        case .unavailable:
+            capabilityState(
+                title: "Bot Mode unavailable",
+                message: "This gateway does not advertise Bot Mode support. Choose Session Mode in Settings."
+            )
+        case .available:
+            availableRosterContent
+        }
+    }
+
+    @ViewBuilder
+    private var availableRosterContent: some View {
         switch botMode.rosterPhase {
         case .idle where botMode.profiles.isEmpty,
              .loading where botMode.profiles.isEmpty:
@@ -118,6 +137,20 @@ private struct BotRosterView: View {
                 errorState(message)
             }
         }
+    }
+
+    private func capabilityState(title: String, message: String) -> some View {
+        Section {
+            ContentUnavailableView {
+                Label(title, systemImage: "externaldrive.badge.xmark")
+            } description: {
+                Text(message)
+            } actions: {
+                Button("Open Settings") { onOpenSettings() }
+            }
+            .accessibilityIdentifier("botModeCapabilityState")
+        }
+        .listRowBackground(Color.clear)
     }
 
     private var botsSection: some View {

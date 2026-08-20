@@ -231,6 +231,8 @@ final class ProtocolParityTests: XCTestCase {
         let sessions = SessionStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
 
+        XCTAssertEqual(connection.botModeCapability, .unknown)
+
         connection.applyGatewayReadyCapabilities(.object([
             "capabilities": .array([
                 .string("session_watch_v1"),
@@ -242,9 +244,16 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertTrue(connection.supportsGatewayCapability("session_watch_v1"))
         XCTAssertTrue(connection.supportsGatewayCapability("session_action_authority_v1"))
         XCTAssertFalse(connection.supportsGatewayCapability("missing_contract_v1"))
+        XCTAssertEqual(connection.botModeCapability, .unavailable)
 
         connection.applyGatewayReadyCapabilities(.object([:]))
         XCTAssertFalse(connection.supportsGatewayCapability("session_watch_v1"))
+        XCTAssertEqual(connection.gatewayCapabilityState("session_watch_v1"), .unavailable)
+
+        connection.applyGatewayReadyCapabilities(.object([
+            "capabilities": .array([.string("profiles_bot_chat_v1")]),
+        ]))
+        XCTAssertEqual(connection.botModeCapability, .available)
     }
 
     func testWatchedPromptExplicitlyTakesOverBeforeDriving() async throws {

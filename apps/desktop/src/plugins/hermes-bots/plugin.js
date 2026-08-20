@@ -3327,6 +3327,72 @@ async function openStoredBotChat(name, storedId, summary) {
   return storedId
 }
 
+const CANONICAL_CHAT_INTRO = 'Hey, tell me about yourself!'
+
+/** Build the explicit route for the profile that owns a newly-opened Bot Chat.
+ *  The descriptor keeps the greeting on the same gateway/profile even when
+ *  the window's ambient socket is still homed elsewhere. */
+function canonicalBotProfileRoute(name) {
+  const connectionId = String(
+    host.state?.connectionId?.get?.() || host.activeConnectionId?.() || 'local'
+  ).trim() || 'local'
+  return {
+    connectionId,
+    mode: connectionId === 'local' ? 'local' : 'remote',
+    profile: name,
+    targetProfile: name
+  }
+}
+
+/** Send the one-time canonical greeting only after the SDK confirms that the
+ *  opened durable id is the focused chat on the requested profile. This is a
+ *  best-effort presentation flourish: a missing SDK route, focus race, or
+ *  rejected prompt must never invalidate the canonical chat itself. */
+async function sendCanonicalChatIntro(name, storedId) {
+  if (!storedId || typeof host.requestProfile !== 'function') return false
+
+  const runtimeId = String(
+    host.state?.focusedSessionId?.get?.() || host.state?.activeSessionId?.get?.() || ''
+  ).trim()
+  const focusedStoredId = String(host.state?.focusedStoredSessionId?.get?.() || '').trim()
+  const focusedProfile = String(host.state?.focusedSessionProfile?.get?.() || '').trim()
+
+  if (
+    !runtimeId ||
+    focusedStoredId !== String(storedId).trim() ||
+    focusedProfile !== String(name).trim()
+  ) {
+    return false
+  }
+
+  try {
+    await host.requestProfile(canonicalBotProfileRoute(name), 'prompt.submit', {
+      session_id: runtimeId,
+      text: CANONICAL_CHAT_INTRO
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Legacy gateways return an ephemeral runtime before their durable row is
+ *  visible. Keep that compatibility kickoff on the owning route too; the
+ *  canonical RPC path above has the stricter focused-session verification. */
+async function sendLegacyCanonicalChatIntro(name, runtimeId) {
+  if (!runtimeId || typeof host.requestProfile !== 'function') return false
+
+  try {
+    await host.requestProfile(canonicalBotProfileRoute(name), 'prompt.submit', {
+      session_id: runtimeId,
+      text: CANONICAL_CHAT_INTRO
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Older gateways without Hermes' canonical Bot Chat RPC still need the
  *  original create/open/kickoff flow. This is intentionally kept separate so
  *  only an identified missing-method response can reach it. */
@@ -3362,17 +3428,16 @@ async function createLegacyCanonicalChat(name) {
   }
 
   if (runtime) {
-    await new Promise(resolve => window.setTimeout(resolve, 400))
+    await sendLegacyCanonicalChatIntro(name, runtime)
+  }
 
+  if (!opened && sid && typeof host.openSession === 'function') {
     try {
-      await host.request('prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
-
-      if (!opened && sid && typeof host.openSession === 'function') {
-        await host.openSession(sid, { profile: name, intent: 'main', keepAllProfilesScope: true })
-      }
+      await host.openSession(sid, { profile: name, intent: 'main', keepAllProfilesScope: true })
+      opened = true
     } catch {
-      // The chat already exists. Keep the pin so the next click
-      // opens it instead of making a second Bot Chat.
+      // Keep the pin so the next click opens it instead of making a second
+      // Bot Chat. The compatibility greeting above remains best effort.
     }
   }
 
@@ -3425,6 +3490,9 @@ function createCanonicalChat(name) {
 
     saveBotMeta(name, { chat: sid })
     await openStoredBotChat(name, sid, res.created ? { message_count: 0 } : undefined)
+    if (res.created === true) {
+      await sendCanonicalChatIntro(name, sid)
+    }
     return sid
   })().finally(() => canonicalCreations.delete(name))
 

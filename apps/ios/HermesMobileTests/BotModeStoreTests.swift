@@ -78,4 +78,66 @@ final class BotModeStoreTests: XCTestCase {
         XCTAssertNil(sessions.activeStoredId)
         XCTAssertEqual(store.openError, "Hermes is unavailable.")
     }
+
+    func testOpenRejectsAnEnsureResultForADifferentProfile() async {
+        let store = BotModeStore(botChatEnsurer: { _ in
+            BotChatEnsureResult(
+                sessionId: "durable-bot-chat",
+                profile: "other",
+                created: false,
+                runtimeSessionId: nil
+            )
+        })
+        let sessions = SessionStore()
+        let profile = ProfileSummary(name: "research", isDefault: false, description: nil)
+
+        let destination = await store.open(profile, in: sessions)
+
+        XCTAssertNil(destination)
+        XCTAssertEqual(store.openError, "Hermes returned a bot chat for a different profile.")
+        XCTAssertNil(sessions.activeStoredId)
+    }
+
+    func testAuthoritativeProfileIsBoundBeforeCapabilityProbeSettles() async {
+        let sessions = SessionStore()
+        let summary = SessionSummary(
+            id: "durable-bot-chat",
+            title: "Bot Chat",
+            preview: nil,
+            startedAt: nil,
+            messageCount: 0,
+            source: nil,
+            lastActive: nil,
+            cwd: nil,
+            profile: nil
+        )
+
+        sessions.open(summary, authoritativeProfile: "research", bindRuntime: false)
+
+        XCTAssertEqual(sessions.activeStoredId, "durable-bot-chat")
+        XCTAssertEqual(sessions.activeStoredProfile, "research")
+        XCTAssertEqual(sessions.activeSummary?.profile, "research")
+    }
+
+    func testUnsupportedGatewayDoesNotLoadOrOpenBotMode() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        connection.applyGatewayReadyCapabilities(.object([:]))
+        let store = BotModeStore(profileLoader: {
+            XCTFail("unsupported gateways must not load the Bot roster")
+            return []
+        }, botChatEnsurer: { _ in
+            XCTFail("unsupported gateways must not ensure a Bot Chat")
+            throw GatewayError.notConnected
+        })
+        let profile = ProfileSummary(name: "research", isDefault: false, description: nil)
+
+        await store.refresh(using: connection)
+        let destination = await store.open(profile, in: sessions, using: connection)
+
+        XCTAssertNil(destination)
+        XCTAssertEqual(store.rosterPhase, .idle)
+        XCTAssertEqual(store.openError, "Bot Mode is unavailable on this Hermes gateway. Choose Session Mode in Settings.")
+    }
 }

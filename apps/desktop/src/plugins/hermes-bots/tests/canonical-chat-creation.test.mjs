@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { botMode, resetBotModeTestState } from './plugin-test-runtime.mjs'
+import { botMode, resetBotModeTestState, sdk } from './plugin-test-runtime.mjs'
 
 test('regression: navigation retries after the kickoff persists a new canonical chat', async () => {
   const events = []
@@ -43,11 +43,22 @@ test('regression: a failed intro keeps the pin', async () => {
   })
 })
 
-test('canonical authority creates and opens without legacy create or kickoff', async () => {
+test('canonical authority creates, opens, and greets without legacy create', async () => {
   const calls = []
   const opens = []
+  const routed = []
   resetBotModeTestState({
-    openSession: async (id, params) => opens.push({ id, params }),
+    openSession: async (id, params) => {
+      opens.push({ id, params })
+      sdk.host.state.activeSessionId.set('runtime-1')
+      sdk.host.state.focusedSessionId.set('runtime-1')
+      sdk.host.state.focusedStoredSessionId.set('durable-1')
+      sdk.host.state.focusedSessionProfile.set('ops')
+    },
+    requestProfile: async (route, method, params) => {
+      routed.push({ route, method, params })
+      return {}
+    },
     request: async (method, params) => {
       calls.push({ method, params })
       if (method === 'profiles.ensure_bot_chat') {
@@ -67,7 +78,21 @@ test('canonical authority creates and opens without legacy create or kickoff', a
     'profiles.configure'
   ])
   assert.equal(calls.some(call => call.method === 'session.create'), false)
-  assert.equal(calls.some(call => call.method === 'prompt.submit'), false)
+  assert.deepEqual(routed, [
+    {
+      route: {
+        connectionId: 'local',
+        mode: 'local',
+        profile: 'ops',
+        targetProfile: 'ops'
+      },
+      method: 'prompt.submit',
+      params: {
+        session_id: 'runtime-1',
+        text: 'Hey, tell me about yourself!'
+      }
+    }
+  ])
   assert.deepEqual(opens, [
     {
       id: 'durable-1',
@@ -81,6 +106,52 @@ test('canonical authority creates and opens without legacy create or kickoff', a
       }
     }
   ])
+})
+
+test('existing canonical chat does not receive a duplicate greeting', async () => {
+  const routed = []
+  resetBotModeTestState({
+    openSession: async () => {
+      sdk.host.state.activeSessionId.set('runtime-existing')
+      sdk.host.state.focusedSessionId.set('runtime-existing')
+      sdk.host.state.focusedStoredSessionId.set('durable-existing')
+      sdk.host.state.focusedSessionProfile.set('ops')
+    },
+    requestProfile: async (...args) => routed.push(args),
+    request: async method => {
+      if (method === 'profiles.ensure_bot_chat') {
+        return { session_id: 'durable-existing', profile: 'ops', created: false }
+      }
+      if (method === 'profiles.configure') return { applied: { ui_meta: true } }
+      throw new Error(`unexpected ${method}`)
+    }
+  })
+
+  assert.equal(await botMode.createCanonicalChat('ops'), 'durable-existing')
+  assert.equal(routed.length, 0)
+})
+
+test('created canonical chat skips greeting when focus is not the bound owner', async () => {
+  const routed = []
+  resetBotModeTestState({
+    openSession: async () => {
+      sdk.host.state.activeSessionId.set('runtime-other')
+      sdk.host.state.focusedSessionId.set('runtime-other')
+      sdk.host.state.focusedStoredSessionId.set('different-chat')
+      sdk.host.state.focusedSessionProfile.set('ops')
+    },
+    requestProfile: async (...args) => routed.push(args),
+    request: async method => {
+      if (method === 'profiles.ensure_bot_chat') {
+        return { session_id: 'durable-new', profile: 'ops', created: true }
+      }
+      if (method === 'profiles.configure') return { applied: { ui_meta: true } }
+      throw new Error(`unexpected ${method}`)
+    }
+  })
+
+  assert.equal(await botMode.createCanonicalChat('ops'), 'durable-new')
+  assert.equal(routed.length, 0)
 })
 
 test('an explicit missing-method envelope is the only compatibility fallback', async () => {

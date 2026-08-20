@@ -40,6 +40,11 @@ final class BotModeStore {
     /// Refresh from the existing native `GET /api/profiles` surface. The roster
     /// is intentionally not persisted or transformed into a separate model.
     func refresh(using connection: ConnectionStore? = nil) async {
+        if let connection, connection.botModeCapability != .available {
+            profiles = []
+            rosterPhase = .idle
+            return
+        }
         refreshGeneration &+= 1
         let generation = refreshGeneration
         rosterPhase = .loading
@@ -73,6 +78,11 @@ final class BotModeStore {
     ) async -> BotChatDestination? {
         guard openingProfileID == nil else { return nil }
 
+        if let connection, connection.botModeCapability != .available {
+            openError = "Bot Mode is unavailable on this Hermes gateway. Choose Session Mode in Settings."
+            return nil
+        }
+
         let requestedProfile = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !requestedProfile.isEmpty else {
             openError = "Hermes returned a profile without a stable identity."
@@ -95,7 +105,14 @@ final class BotModeStore {
 
             let sessionID = result.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
             let resolvedProfile = result.profile.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !sessionID.isEmpty, !resolvedProfile.isEmpty else {
+            guard !sessionID.isEmpty,
+                  !resolvedProfile.isEmpty,
+                  Self.normalizedProfile(resolvedProfile) == Self.normalizedProfile(requestedProfile)
+            else {
+                if !resolvedProfile.isEmpty,
+                   Self.normalizedProfile(resolvedProfile) != Self.normalizedProfile(requestedProfile) {
+                    throw BotModeError.profileMismatch
+                }
                 throw BotModeError.invalidResponse
             }
 
@@ -117,7 +134,7 @@ final class BotModeStore {
                 cwd: nil,
                 profile: resolvedProfile
             )
-            sessions.open(summary)
+            sessions.open(summary, authoritativeProfile: resolvedProfile)
             return BotChatDestination(sessionID: sessionID, profile: resolvedProfile)
         } catch {
             openError = Self.message(for: error)
@@ -146,6 +163,7 @@ final class BotModeStore {
     private enum BotModeError: LocalizedError {
         case notConnected
         case invalidResponse
+        case profileMismatch
 
         var errorDescription: String? {
             switch self {
@@ -153,6 +171,8 @@ final class BotModeStore {
                 "Connect to Hermes before loading or opening bots."
             case .invalidResponse:
                 "Hermes returned an invalid bot chat response."
+            case .profileMismatch:
+                "Hermes returned a bot chat for a different profile."
             }
         }
     }
