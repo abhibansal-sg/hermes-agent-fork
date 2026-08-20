@@ -1216,7 +1216,8 @@ final class SessionStore {
 
     func inspectLiveSession(
         storedID: String,
-        compactSnapshot: Bool = false
+        compactSnapshot: Bool = false,
+        profile: String? = nil
     ) async throws -> LiveSessionInspection {
         // Prefer the versioned stock snapshot. Test graphs that install only the
         // legacy active-list seam deliberately exercise the compatibility path.
@@ -1230,13 +1231,25 @@ final class SessionStore {
                     snapshot = try await watchRPC(storedID)
                 } else {
                     guard let client else { throw GatewayError.notConnected }
+                    var params: [String: JSONValue] = [
+                        "session_key": .string(storedID),
+                        "omit_messages": .bool(true),
+                        "omit_info": .bool(compactSnapshot),
+                    ]
+                    // Bot Mode has an authoritative profile echo from
+                    // `profiles.ensure_bot_chat`. Thread that identity even
+                    // while the REST profile probe is still unsettled; the
+                    // gateway's stock watch route must not fall back to the
+                    // launch profile for a named bot.
+                    if let profile = Self.profileParam(
+                        scope: profile ?? "",
+                        multiAvailable: true
+                    ) {
+                        params["profile"] = .string(profile)
+                    }
                     snapshot = try await client.request(
                         "session.watch",
-                        params: .object([
-                            "session_key": .string(storedID),
-                            "omit_messages": .bool(true),
-                            "omit_info": .bool(compactSnapshot),
-                        ])
+                        params: .object(params)
                     )
                 }
                 return .found(WatchedLiveSession(
@@ -1320,7 +1333,10 @@ final class SessionStore {
         let token = openToken
         let workGeneration = connectionWorkGeneration
         do {
-            let inspection = try await inspectLiveSession(storedID: storedID)
+            let inspection = try await inspectLiveSession(
+                storedID: storedID,
+                profile: activeStoredProfile
+            )
             guard activeStoredId == storedID,
                   openToken == token,
                   connectionWorkGeneration == workGeneration else { return }
@@ -1528,7 +1544,9 @@ final class SessionStore {
               activeRuntimeId == runtimeID else { return false }
         do {
             let inspection = try await inspectLiveSession(
-                storedID: storedID, compactSnapshot: true
+                storedID: storedID,
+                compactSnapshot: true,
+                profile: activeStoredProfile
             )
             guard sessionBinding?.mode == .watch,
                   activeStoredId == storedID,
@@ -3364,9 +3382,32 @@ final class SessionStore {
     ///   prior behavior.
     func open(
         _ summary: SessionSummary,
+        authoritativeProfile: String? = nil,
         revealOnFirstPaint: (@MainActor () -> Void)? = nil,
         bindRuntime: Bool = true
     ) {
+        // Bot Mode receives the owning profile directly from Hermes' canonical
+        // ensure response. Preserve it in the same presentation row used by
+        // the normal drawer path so active identity, watch, resume, and cache
+        // scope all agree before any capability probe settles.
+        var summary = summary
+        if let authoritativeProfile = authoritativeProfile?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ), !authoritativeProfile.isEmpty {
+            summary = SessionSummary(
+                id: summary.id,
+                title: summary.title,
+                preview: summary.preview,
+                startedAt: summary.startedAt,
+                messageCount: summary.messageCount,
+                source: summary.source,
+                lastActive: summary.lastActive,
+                cwd: summary.cwd,
+                profile: authoritativeProfile,
+                model: summary.model,
+                billingProvider: summary.billingProvider
+            )
+        }
         let wasAlreadyActive = isActive(summary)
         let reusableDrive = sessionBinding?.storedID == summary.id
             && sessionBinding?.mode == .drive
@@ -3576,7 +3617,10 @@ final class SessionStore {
                 usingResumeTestSeam: usingResumeTestSeam
             ) else { return }
             do {
-                switch try await self.inspectLiveSession(storedID: summary.id) {
+                switch try await self.inspectLiveSession(
+                    storedID: summary.id,
+                    profile: summary.profile
+                ) {
                 case .found(let live):
                     guard self.isCurrentRuntimeBinding(
                         token: token,
@@ -4234,7 +4278,10 @@ final class SessionStore {
             usingResumeTestSeam: usingResumeTestSeam
         ) else { return nil }
         do {
-            switch try await inspectLiveSession(storedID: storedId) {
+            switch try await inspectLiveSession(
+                storedID: storedId,
+                profile: bindingProfile
+            ) {
             case .found(let live):
                 guard isCurrentRuntimeBinding(
                     token: token,
@@ -4280,7 +4327,11 @@ final class SessionStore {
             // Re-resume into the same profile scope so a reconnect keeps the
             // session in its per-profile home. Omitted for the default/all scope.
             var resumeParams: [String: JSONValue] = ["session_id": .string(storedId)]
-            applyProfileScope(to: &resumeParams, selectedProfile: activeStoredProfile)
+            applyProfileScope(
+                to: &resumeParams,
+                selectedProfile: activeStoredProfile,
+                forceProfile: activeProfileHasAuthoritativeRow
+            )
             let result = try await coalescedSessionResume(
                 storedId: storedId,
                 profileId: bindingProfile,
@@ -4998,14 +5049,25 @@ final class SessionStore {
     /// shipped single-profile shape. The single gate for create/resume threading.
     private func applyProfileScope(
         to params: inout [String: JSONValue],
-        selectedProfile: String? = nil
+        selectedProfile: String? = nil,
+        forceProfile: Bool = false
     ) {
         if let name = Self.profileParam(
             scope: selectedProfile ?? activeProfile,
-            multiAvailable: isMultiProfileAvailable
+            multiAvailable: forceProfile || isMultiProfileAvailable
         ) {
             params["profile"] = .string(name)
         }
+    }
+
+    /// A tagged presentation row is the authoritative owner for an opened Bot
+    /// Chat. Keep that explicit identity available to reconnect/resume paths,
+    /// even when the REST capability probe has not settled yet.
+    private var activeProfileHasAuthoritativeRow: Bool {
+        guard let profile = activePresentationSummary?.profile?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ), !profile.isEmpty else { return false }
+        return profile != Self.defaultProfileName
     }
 
     /// Pure decision for create/resume profile threading: the `profile` value to
@@ -5042,7 +5104,18 @@ final class SessionStore {
     }
 
     private func profileParam(for summary: SessionSummary) -> String? {
-        Self.profileParam(
+        if let rowProfile = summary.profile?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ), !rowProfile.isEmpty {
+            // A profile-tagged row is already authoritative, so it is safe to
+            // thread its owner before the optional REST capability probe settles.
+            return Self.profileParam(
+                for: summary,
+                activeScope: activeProfile,
+                multiAvailable: true
+            )
+        }
+        return Self.profileParam(
             for: summary,
             activeScope: activeProfile,
             multiAvailable: profileThreadingAvailable

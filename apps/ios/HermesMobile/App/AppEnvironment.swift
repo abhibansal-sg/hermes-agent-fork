@@ -34,6 +34,7 @@ final class AppEnvironment {
     let appLock: AppLock
     let themeStore: ThemeStore
     let projectsStore: ProjectsStore
+    let botModeStore: BotModeStore
     let stateFlushCoordinator: StateFlushCoordinator
     private let syncCoordinator: ManifestInvalidationCoordinator
 
@@ -57,6 +58,7 @@ final class AppEnvironment {
         let appLock = AppLock()
         let themeStore = ThemeStore()
         let projectsStore = ProjectsStore()
+        let botModeStore = BotModeStore()
         let connectionStore = ConnectionStore(
             sessionStore: sessionStore,
             chatStore: chatStore
@@ -433,6 +435,7 @@ final class AppEnvironment {
         self.themeStore = themeStore
         self.connectionStore = connectionStore
         self.projectsStore = projectsStore
+        self.botModeStore = botModeStore
         self.stateFlushCoordinator = stateFlushCoordinator
 
         // Do not publish process-local defaults before bootstrap. The shared

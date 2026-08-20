@@ -149,6 +149,17 @@ struct ProfileSummary: Decodable, Identifiable, Sendable, Equatable {
     var id: String { name }
 }
 
+/// `profiles.ensure_bot_chat` result. `sessionId` is always the durable Hermes
+/// session identity and must enter the normal ``SessionStore`` opening path.
+/// A newly-created chat can additionally expose its live runtime identity, but
+/// iOS deliberately does not use that ephemeral id as its selected session.
+struct BotChatEnsureResult: Decodable, Sendable, Equatable {
+    let sessionId: String
+    let profile: String
+    let created: Bool
+    let runtimeSessionId: String?
+}
+
 /// Wrapper for `GET /api/profiles/sessions` (`web_server.py:1734-1741`) — the
 /// profile-aware rail used when multi-profile is available. "All profiles"
 /// requests the cross-profile aggregate; Default and named selectors request an

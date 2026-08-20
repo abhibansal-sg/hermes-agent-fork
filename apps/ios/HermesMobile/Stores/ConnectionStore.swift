@@ -538,15 +538,35 @@ final class ConnectionStore {
     /// Unlike the legacy REST endpoint probes above, these identify native
     /// transport contracts and are reset for every connection generation.
     private(set) var gatewayProtocolCapabilities: Set<String> = []
+    /// Whether the current transport generation has delivered its
+    /// `gateway.ready` capability snapshot. An empty capability set is a
+    /// conclusive "unsupported" result only after this becomes `true`.
+    private(set) var gatewayProtocolCapabilitiesSettled = false
 
     func supportsGatewayCapability(_ capability: String) -> Bool {
         gatewayProtocolCapabilities.contains(capability)
+    }
+
+    /// Tri-state view over the single `gateway.ready` capability authority.
+    /// Callers must distinguish an unsettled handshake from a gateway that
+    /// explicitly advertised no such contract.
+    func gatewayCapabilityState(_ capability: String) -> ServerCapabilities.State {
+        guard gatewayProtocolCapabilitiesSettled else { return .unknown }
+        return supportsGatewayCapability(capability) ? .available : .unavailable
+    }
+
+    /// Bot Mode is a gateway protocol feature, not a client-only presentation
+    /// preference. Keep this read beside the other gateway capability accessors
+    /// so the UI never grows a second capability cache.
+    var botModeCapability: ServerCapabilities.State {
+        gatewayCapabilityState("profiles_bot_chat_v1")
     }
 
     func applyGatewayReadyCapabilities(_ payload: JSONValue) {
         gatewayProtocolCapabilities = Set(
             payload["capabilities"]?.arrayValue?.compactMap(\.stringValue) ?? []
         )
+        gatewayProtocolCapabilitiesSettled = true
     }
 
     /// A stock Hermes REST client built from the active cookie or token session,
@@ -798,6 +818,8 @@ final class ConnectionStore {
         // Reserve the next epoch for this handshake, but do not publish it as
         // accepted until `gateway.ready` has completed. Failed retries therefore
         // never create a runtime epoch that callers could bind to.
+        gatewayProtocolCapabilities.removeAll()
+        gatewayProtocolCapabilitiesSettled = false
         let candidateEpoch = transportEpoch &+ 1
         ReliabilityDiagnostics.shared.websocketConnect(epoch: candidateEpoch)
         setTransportReadiness(.connecting(epoch: candidateEpoch))
@@ -812,6 +834,11 @@ final class ConnectionStore {
     }
 
     private func markTransportUnavailable() {
+        // A capability snapshot belongs to the accepted transport generation;
+        // never let a dropped socket leave Bot Mode looking supported while a
+        // reconnect handshake is still unsettled.
+        gatewayProtocolCapabilities.removeAll()
+        gatewayProtocolCapabilitiesSettled = false
         switch transportReadiness {
         case .ready(let epoch), .connecting(let epoch), .unavailable(let epoch):
             ReliabilityDiagnostics.shared.websocketClose(epoch: epoch)
@@ -1803,6 +1830,8 @@ final class ConnectionStore {
         // Drop live capability state (the cached snapshot is retained so a
         // reconnect to the same server reuses it — see ServerCapabilities).
         capabilities.reset()
+        gatewayProtocolCapabilities.removeAll()
+        gatewayProtocolCapabilitiesSettled = false
         // Forget the resolved model so a fresh connection re-probes it (F0).
         activeModelName = nil
         // Clear the per-session hot-swap state so the next session starts clean.
@@ -2074,6 +2103,11 @@ final class ConnectionStore {
         guard isActiveGeneration(generation) else { return }
         switch event.type {
         case .gatewayReady:
+            // The gateway.ready payload is the transport capability authority.
+            // Apply it before any dependent refresh can render Bot Mode so an
+            // empty advertised list is treated as a settled unsupported state,
+            // not as a transient handshake.
+            applyGatewayReadyCapabilities(event.payload)
             Task {
                 guard self.isActiveGeneration(generation) else { return }
                 await self.sessionStore.refresh()
