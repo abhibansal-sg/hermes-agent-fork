@@ -34,7 +34,6 @@ def _(rid, params: dict) -> dict:
     clients feature-detect the complete contract through ``gateway.ready``.
     """
 
-    import contextlib
     from pathlib import Path
 
     profile = params.get("profile") if isinstance(params, dict) else None
@@ -44,6 +43,7 @@ def _(rid, params: dict) -> dict:
 
     try:
         from hermes_cli import profiles as profiles_mod
+        from hermes_cli.profiles import profile_metadata_lock
 
         # Validate against the canonical profile registry, not just a path
         # concatenation.  This rejects traversal/case aliases and ensures the
@@ -60,37 +60,6 @@ def _(rid, params: dict) -> dict:
 
     if not profile_dir.is_dir():
         return _err(rid, 4073, f"profile '{profile}' not found")
-
-    # A flock handles separate Hermes gateway processes.  The existing gateway
-    # session lock handles same-process threads (and also keeps metadata and DB
-    # updates ordered with other local gateway session operations).
-    lock_path = profile_dir / ".bot-chat.lock"
-    try:
-        lock_path.touch(exist_ok=True)
-    except OSError as exc:
-        return _err(rid, 5072, f"could not lock profile '{profile}': {exc}")
-
-    @contextlib.contextmanager
-    def _locked_profile():
-        with open(lock_path, "a+", encoding="utf-8") as lock_file:
-            flocked = False
-            try:
-                try:
-                    import fcntl
-
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                    flocked = True
-                except (ImportError, OSError):
-                    # Windows has no fcntl; the gateway's process-local lock
-                    # still protects repeated calls in one process there.
-                    pass
-                yield
-            finally:
-                if flocked:
-                    try:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                    except OSError:
-                        pass
 
     def _read_profile_yaml() -> dict:
         path = profile_dir / "profile.yaml"
@@ -158,7 +127,7 @@ def _(rid, params: dict) -> dict:
         # profile file lock.  This mirrors gateway action/session paths and
         # prevents a future handler from introducing a lock inversion.
         with _sessions_lock:
-            with _locked_profile():
+            with profile_metadata_lock(profile_dir):
                 meta = _read_profile_yaml()
                 pinned = _canonical_pin(meta)
                 with _profile_db({"profile": profile}) as db:
@@ -186,46 +155,59 @@ def _(rid, params: dict) -> dict:
                             row = None
 
                     created = False
+                    created_id = None
                     if row is None:
                         stored_id = _new_session_key()
+                        created_id = stored_id
                         db.create_session(
                             stored_id,
                             source="desktop",
                             profile_name=None if profile == "default" else profile,
+                            title="Bot Chat",
+                            hidden=True,
                         )
-                        try:
-                            db.set_session_title(stored_id, "Bot Chat")
-                        except Exception:
-                            # A concurrent non-RPC writer may have claimed the
-                            # title. Re-read the canonical title and adopt it;
-                            # do not expose a second chat to the client.
-                            adopted = db.get_session_by_title("Bot Chat")
-                            if adopted is None:
-                                raise
-                            stored_id = str(adopted["id"])
-                        else:
-                            created = True
-                        row = db.get_session(stored_id) or {"id": stored_id}
+                        row = db.get_session(stored_id)
+                        if row is None:
+                            raise RuntimeError("Bot Chat row disappeared after creation")
+                        created = True
                     stored_id = str(row.get("id") or "").strip()
                     if not stored_id:
                         raise RuntimeError("Bot Chat row has no session id")
 
-                    # ``False`` means either an already-hidden row or no
-                    # changed column; both are idempotent success once the row
-                    # exists.  Exceptions remain real failures.
-                    set_hidden(stored_id, True)
+                    try:
+                        # ``False`` means unchanged, not missing. Verify the
+                        # row after the hide write so a delete/race cannot
+                        # result in a pinned id that no longer names a hidden
+                        # session.
+                        set_hidden(stored_id, True)
+                        hidden_row = db.get_session(stored_id)
+                        if hidden_row is None:
+                            raise RuntimeError("Bot Chat row disappeared after hide")
+                        if not bool(hidden_row.get("hidden")):
+                            raise RuntimeError("Bot Chat row was not hidden")
 
-                    ui_meta = meta.get("ui_meta")
-                    if not isinstance(ui_meta, dict):
-                        ui_meta = {}
-                    bot_meta = ui_meta.get("hermes-bots")
-                    if not isinstance(bot_meta, dict):
-                        bot_meta = {}
-                    if bot_meta.get("chat") != stored_id:
-                        bot_meta["chat"] = stored_id
-                        ui_meta["hermes-bots"] = bot_meta
-                        meta["ui_meta"] = ui_meta
-                        _write_profile_yaml(meta)
+                        ui_meta = meta.get("ui_meta")
+                        if not isinstance(ui_meta, dict):
+                            ui_meta = {}
+                        bot_meta = ui_meta.get("hermes-bots")
+                        if not isinstance(bot_meta, dict):
+                            bot_meta = {}
+                        if bot_meta.get("chat") != stored_id:
+                            bot_meta["chat"] = stored_id
+                            ui_meta["hermes-bots"] = bot_meta
+                            meta["ui_meta"] = ui_meta
+                            _write_profile_yaml(meta)
+                    except Exception:
+                        # A just-created row is safe to remove before any
+                        # transcript exists. If cleanup itself fails, leave a
+                        # hidden exact-title row: the next locked call adopts
+                        # it deterministically instead of minting a duplicate.
+                        if created_id:
+                            try:
+                                db.delete_session(created_id)
+                            except Exception:
+                                pass
+                        raise
 
                     return _ok(
                         rid,
@@ -941,6 +923,7 @@ def _(rid, params: dict) -> dict:
             # assets elsewhere and store a reference.
             try:
                 import json as _json
+                from hermes_cli.profiles import profile_metadata_lock
 
                 incoming = params["ui_meta"]
                 if len(_json.dumps(incoming)) > 65536:
@@ -948,32 +931,33 @@ def _(rid, params: dict) -> dict:
                 else:
                     import yaml as _yaml
 
-                    meta_path = profile_dir / "profile.yaml"
-                    existing = {}
-                    if meta_path.is_file():
-                        try:
-                            with open(meta_path, "r", encoding="utf-8") as f:
-                                loaded = _yaml.safe_load(f) or {}
-                            if isinstance(loaded, dict):
-                                existing = loaded
-                        except Exception:
-                            existing = {}
-                    current = existing.get("ui_meta")
-                    if not isinstance(current, dict):
-                        current = {}
-                    for key, value in incoming.items():
-                        if value is None:
-                            current.pop(key, None)
+                    with profile_metadata_lock(profile_dir):
+                        meta_path = profile_dir / "profile.yaml"
+                        existing = {}
+                        if meta_path.is_file():
+                            try:
+                                with open(meta_path, "r", encoding="utf-8") as f:
+                                    loaded = _yaml.safe_load(f) or {}
+                                if isinstance(loaded, dict):
+                                    existing = loaded
+                            except Exception:
+                                existing = {}
+                        current = existing.get("ui_meta")
+                        if not isinstance(current, dict):
+                            current = {}
+                        for key, value in incoming.items():
+                            if value is None:
+                                current.pop(key, None)
+                            else:
+                                current[key] = value
+                        if current:
+                            existing["ui_meta"] = current
                         else:
-                            current[key] = value
-                    if current:
-                        existing["ui_meta"] = current
-                    else:
-                        existing.pop("ui_meta", None)
-                    from utils import atomic_yaml_write
+                            existing.pop("ui_meta", None)
+                        from utils import atomic_yaml_write
 
-                    atomic_yaml_write(meta_path, existing, sort_keys=False)
-                    applied["ui_meta"] = True
+                        atomic_yaml_write(meta_path, existing, sort_keys=False)
+                        applied["ui_meta"] = True
             except Exception:
                 applied["ui_meta"] = False
 

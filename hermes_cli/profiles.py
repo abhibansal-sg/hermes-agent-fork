@@ -19,6 +19,8 @@ Usage::
     hermes profile delete coder          # remove profile + alias + service
 """
 
+import contextlib
+import errno
 import json
 import logging
 import os
@@ -28,6 +30,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -136,6 +139,111 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 # `hermes skills install` or drop SKILL.md files into the profile's skills/.
 # Delete the marker file to opt back in.
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+
+
+class ProfileMetadataLockUnavailable(RuntimeError):
+    """Raised when profile.yaml cannot be locked safely."""
+
+
+_PROFILE_METADATA_LOCKS: dict[str, threading.RLock] = {}
+_PROFILE_METADATA_LOCKS_GUARD = threading.Lock()
+
+
+@contextlib.contextmanager
+def profile_metadata_lock(profile_dir: Path):
+    """Serialize profile.yaml read/merge/write operations across processes.
+
+    POSIX uses ``fcntl.flock``; Windows uses a one-byte ``msvcrt`` range lock.
+    A process-local RLock closes the same-process/thread gap. Locking failures
+    are fail-closed: callers must not proceed with an unlocked metadata write.
+    """
+    profile_dir = Path(profile_dir)
+    lock_path = profile_dir / ".profile-metadata.lock"
+    key = str(lock_path.resolve())
+    with _PROFILE_METADATA_LOCKS_GUARD:
+        local_lock = _PROFILE_METADATA_LOCKS.setdefault(key, threading.RLock())
+    if not profile_dir.is_dir():
+        raise ProfileMetadataLockUnavailable(f"profile directory does not exist: {profile_dir}")
+
+    acquired = False
+    lock_file = None
+    native_lock = False
+    try:
+        if not local_lock.acquire(timeout=30.0):
+            raise ProfileMetadataLockUnavailable(f"timed out locking profile metadata: {profile_dir}")
+        acquired = True
+        lock_file = open(lock_path, "a+b")
+        lock_file.seek(0, 2)
+        if lock_file.tell() == 0:
+            lock_file.write(b"0")
+            lock_file.flush()
+        lock_file.seek(0)
+        deadline = time.monotonic() + 30.0
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    native_lock = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise ProfileMetadataLockUnavailable(
+                            f"timed out locking profile metadata: {profile_dir}"
+                        ) from exc
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    native_lock = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise ProfileMetadataLockUnavailable(
+                            f"timed out locking profile metadata: {profile_dir}"
+                        ) from exc
+                    time.sleep(0.05)
+        yield
+    except ProfileMetadataLockUnavailable:
+        raise
+    except (ImportError, OSError) as exc:
+        raise ProfileMetadataLockUnavailable(
+            f"could not lock profile metadata: {profile_dir}"
+        ) from exc
+    finally:
+        try:
+            if lock_file is not None and native_lock:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except (ImportError, OSError):
+                    pass
+        finally:
+            try:
+                if lock_file is not None:
+                    try:
+                        lock_file.close()
+                    except OSError:
+                        pass
+            finally:
+                if acquired:
+                    local_lock.release()
 
 
 def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
@@ -866,32 +974,34 @@ def write_profile_meta(
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
     import yaml
-    path = _profile_yaml_path(profile_dir)
-    existing: dict = {}
-    if path.is_file():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                loaded = yaml.safe_load(f) or {}
-            if isinstance(loaded, dict):
-                existing = loaded
-        except Exception:
-            existing = {}
-    if description is not None:
-        existing["description"] = description.strip()
-    if description_auto is not None:
-        existing["description_auto"] = bool(description_auto)
-    if display_name is not None:
-        # Empty string clears the key (falls back to the canonical id).
-        if display_name.strip():
-            existing["display_name"] = display_name.strip()
-        else:
-            existing.pop("display_name", None)
-    # Atomic write: bare open("w") truncates before the dump, and the read
-    # path above swallows parse errors as {}, so a crashed write would
-    # silently drop unspecified fields on the next call (#51356, #16743).
-    from utils import atomic_yaml_write
 
-    atomic_yaml_write(path, existing, sort_keys=False)
+    with profile_metadata_lock(profile_dir):
+        path = _profile_yaml_path(profile_dir)
+        existing: dict = {}
+        if path.is_file():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    loaded = yaml.safe_load(f) or {}
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except Exception:
+                existing = {}
+        if description is not None:
+            existing["description"] = description.strip()
+        if description_auto is not None:
+            existing["description_auto"] = bool(description_auto)
+        if display_name is not None:
+            # Empty string clears the key (falls back to the canonical id).
+            if display_name.strip():
+                existing["display_name"] = display_name.strip()
+            else:
+                existing.pop("display_name", None)
+        # Atomic write: bare open("w") truncates before the dump, and the read
+        # path above swallows parse errors as {}, so a crashed write would
+        # silently drop unspecified fields on the next call (#51356, #16743).
+        from utils import atomic_yaml_write
+
+        atomic_yaml_write(path, existing, sort_keys=False)
 
 
 def format_profile_label(name: str, display_name: Optional[str]) -> str:

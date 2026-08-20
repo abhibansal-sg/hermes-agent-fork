@@ -1,128 +1,110 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import vm from 'node:vm'
 
-// Bot Mode sessions are ALWAYS hidden from the global Sessions sidebar
-// (canonical Bot Chats and group-chat member sessions alike) via the core
-// generic `hidden` session flag. There is no user pref: session.create
-// passes hidden:true unconditionally, and hideOwnedBotSessions() sweeps
-// every known plugin-owned session id through session.set_hidden so rows
-// born visible under the old pref get reconciled.
+import { botMode, resetBotModeTestState } from './plugin-test-runtime.mjs'
 
-const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
-
-function loadCreate() {
-  const start = source.indexOf('const canonicalCreations = new Map()')
-  const end = source.indexOf('function displayName(', start)
+test('legacy canonical creation is born hidden with no preference gate', async () => {
   const created = []
-  const context = {
-    host: {
-      openSession: async () => {},
-      request: async (method, params) => {
-        if (method === 'session.create') {
-          created.push(params)
-          return { stored_session_id: 'sid-1', session_id: 'rt-1' }
-        }
-        return {}
+  resetBotModeTestState({
+    openSession: async () => undefined,
+    request: async (method, params) => {
+      if (method === 'profiles.ensure_bot_chat') throw new Error('method not found')
+      if (method === 'session.create') {
+        created.push(params)
+        return { stored_session_id: 'sid-1', session_id: null }
       }
-    },
-    saveBotMeta: () => {},
-    window: { setTimeout: cb => cb() }
-  }
-  const section = source.slice(start, end).concat('\nglobalThis.__c = { createCanonicalChat };\n')
-  vm.runInNewContext(section, context, { filename: 'c.js' })
-  return { create: context.__c.createCanonicalChat, created }
-}
-
-test('createCanonicalChat always passes hidden:true — no pref gate', async () => {
-  const { create, created } = loadCreate()
-  await create('alpha')
-  assert.equal(created.length, 1)
-  assert.equal(created[0].hidden, true)
-  assert.equal(created[0].title, 'Bot Chat')
-})
-
-test('group member session.create is unconditionally hidden too', () => {
-  // Source contract on ensureGroupChatSession: the create carries a literal
-  // hidden:true, with no $hideBotChats conditional anywhere in the plugin.
-  const fn = source.slice(source.indexOf('async function ensureGroupChatSession('), source.indexOf('const GROUP_TURN_TIMEOUT_MS'))
-  assert.match(fn, /hidden: true/)
-  assert.equal(source.includes('$hideBotChats'), false, 'the old pref atom must be gone')
-})
-
-test('hideOwnedBotSessions sweeps canonical chats AND room member sessions', async () => {
-  const start = source.indexOf('function hideOwnedBotSessions()')
-  const end = source.indexOf('/** Fetch server-side avatars', start)
-  const calls = []
-  const context = {
-    host: {
-      request: async (method, params) => {
-        calls.push({ method, params })
-        if (method === 'profiles.list') {
-          return {
-            profiles: [
-              { name: 'alpha', preferred_session: { id: 'chat-a', title: 'Bot Chat' } },
-              { name: 'beta', preferred_session: { id: 'chat-b', title: 'Bot Chat' } }
-            ]
-          }
-        }
-        return {}
-      }
-    },
-    $botMeta: { get: () => ({ alpha: { chat: 'chat-a' }, beta: { chat: 'chat-b' }, gamma: {} }) },
-    $groupChats: {
-      get: () => ({
-        Core: { sessions: { alpha: 'room-core-a', beta: 'room-core-b' } },
-        Quiet: { sessions: { alpha: 'chat-a' } }, // duplicate id — must dedupe
-        Legacy: {} // pre-sessions room shape
-      })
+      if (method === 'profiles.configure') return { applied: { ui_meta: true } }
+      return {}
     }
-  }
-  const section = source.slice(start, end).concat('\nglobalThis.__h = { hideOwnedBotSessions };\n')
-  vm.runInNewContext(section, context, { filename: 'h.js' })
-  await context.__h.hideOwnedBotSessions()
+  })
 
-  const ids = calls.filter(c => c.method === 'session.set_hidden').map(c => c.params.session_id).sort()
-  assert.deepEqual(ids, ['chat-a', 'chat-b', 'room-core-a', 'room-core-b'])
-  const hiddenCalls = calls.filter(c => c.method === 'session.set_hidden')
-  assert.ok(hiddenCalls.every(c => c.params.hidden === true))
+  await botMode.createCanonicalChat('alpha')
+  assert.deepEqual(created, [{ profile: 'alpha', title: 'Bot Chat', hidden: true }])
 })
 
-test('safety: a stale canonical pointer to an ordinary session is not hidden', async () => {
-  const start = source.indexOf('function hideOwnedBotSessions()')
-  const end = source.indexOf('/** Fetch server-side avatars', start)
+test('group member session creation is also born hidden', async () => {
+  const requests = []
+  resetBotModeTestState({
+    request: async (method, params) => {
+      requests.push({ method, params })
+      if (method === 'session.resume') throw new Error('not found')
+      if (method === 'session.create') return { stored_session_id: 'group-1', session_id: 'runtime-1' }
+      throw new Error(`unexpected ${method}`)
+    }
+  })
+
+  assert.deepEqual(
+    await botMode.ensureGroupChatSession('Core', { name: 'alpha' }),
+    { runtime: 'runtime-1', stored: 'group-1' }
+  )
+  assert.deepEqual(requests.at(-1), {
+    method: 'session.create',
+    params: { profile: 'alpha', title: 'Group: Core', hidden: true }
+  })
+  assert.equal(botMode.state.$groupChats.get().Core.sessions.alpha, 'group-1')
+})
+
+test('known canonical and room sessions are hidden only after canonical verification', async () => {
   const calls = []
-  const context = {
-    host: {
-      request: async (method, params) => {
-        calls.push({ method, params })
-        if (method === 'profiles.list') {
-          return {
-            profiles: [{ name: 'default', preferred_session: { id: 'ordinary-1', title: '生产调度会优化' } }]
-          }
+  resetBotModeTestState({
+    request: async (method, params) => {
+      calls.push({ method, params })
+      if (method === 'profiles.list') {
+        return {
+          profiles: [
+            { name: 'alpha', preferred_session: { id: 'chat-a', title: 'Bot Chat' } },
+            { name: 'beta', preferred_session: { id: 'chat-b', title: 'Bot Chat' } }
+          ]
         }
-        return {}
       }
-    },
-    $botMeta: { get: () => ({ default: { chat: 'ordinary-1' } }) },
-    $groupChats: { get: () => ({}) }
-  }
-  const section = source.slice(start, end).concat('\nglobalThis.__h = { hideOwnedBotSessions };\n')
-  vm.runInNewContext(section, context, { filename: 'h-stale.js' })
-  await context.__h.hideOwnedBotSessions()
+      if (method === 'session.list') return { sessions: [] }
+      return {}
+    }
+  })
+  botMode.state.$botMeta.set({ alpha: { chat: 'chat-a' }, beta: { chat: 'chat-b' }, gamma: {} })
+  botMode.state.$groupChats.set({
+    Core: { sessions: { alpha: 'room-core-a', beta: 'room-core-b' } },
+    Quiet: { sessions: { alpha: 'chat-a' } }
+  })
 
-  assert.equal(calls.some(c => c.method === 'session.set_hidden'), false)
+  await botMode.hideOwnedBotSessions()
+
+  const hidden = calls
+    .filter(call => call.method === 'session.set_hidden')
+    .map(call => call.params.session_id)
+    .sort()
+  assert.deepEqual(hidden, ['chat-a', 'chat-b', 'room-core-a', 'room-core-b'])
+  assert.ok(
+    calls
+      .filter(call => call.method === 'session.set_hidden')
+      .every(call => call.params.hidden === true)
+  )
 })
 
-test('sweepBotProfileSessions hides Bot-Mode-titled rows per roster bot, and only those', async () => {
-  // Ownership-based half of the sweep: CLI-born "Agent Inbox" / extra
-  // "Bot Chat" rows live in bot profiles but are unknown to $botMeta /
-  // $groupChats, so the id-based sweep never reaches them. This sweep lists
-  // each roster bot's own sessions and hides rows by exact plumbing title
-  // ('Bot Chat', 'Agent Inbox', 'Group: …' prefix) — never a user-titled row.
-  const start = source.indexOf('function hideOwnedBotSessions()')
-  const end = source.indexOf('/** Fetch server-side avatars', start)
+test('a stale canonical pointer to an ordinary session is never hidden', async () => {
+  const calls = []
+  resetBotModeTestState({
+    request: async (method, params) => {
+      calls.push({ method, params })
+      if (method === 'profiles.list') {
+        return {
+          profiles: [
+            { name: 'default', preferred_session: { id: 'ordinary-1', title: 'production planning' } }
+          ]
+        }
+      }
+      if (method === 'session.list') return { sessions: [] }
+      return {}
+    }
+  })
+  botMode.state.$botMeta.set({ default: { chat: 'ordinary-1' } })
+
+  await botMode.hideOwnedBotSessions()
+
+  assert.equal(calls.some(call => call.method === 'session.set_hidden'), false)
+})
+
+test('profile sweep hides Bot Mode plumbing and preserves user-titled rows on each source', async () => {
   const calls = []
   const rowsByProfile = {
     alpha: [
@@ -130,54 +112,67 @@ test('sweepBotProfileSessions hides Bot-Mode-titled rows per roster bot, and onl
       { id: 'a-2', title: 'Agent Inbox' },
       { id: 'a-3', title: 'Group: Core' },
       { id: 'a-4', title: 'My real conversation' },
-      { id: 'a-5', title: 'Bot Chat notes' } // not an exact title — kept
+      { id: 'a-5', title: 'Bot Chat notes' }
     ],
     remy: [{ id: 'r-1', title: 'Agent Inbox' }]
   }
-  const context = {
-    host: { request: async () => ({}) },
-    $botMeta: { get: () => ({}) },
-    $groupChats: { get: () => ({}) },
-    $lastRoster: { get: () => [{ name: 'alpha' }, { name: 'remy', remoteSource: true, connectionId: 'mini' }] },
-    PROFILE_SESSION_LIST_LIMIT: 200,
-    requestForBot: async (bot, method, params) => {
-      calls.push({ bot: bot.name, method, params })
-      if (method === 'session.list') {
-        return { sessions: rowsByProfile[params.profile] || [] }
-      }
+  resetBotModeTestState({
+    request: async (method, params) => {
+      calls.push({ source: 'local', method, params })
+      if (method === 'session.list') return { sessions: rowsByProfile[params.profile] || [] }
+      return {}
+    },
+    requestProfile: async (route, method, params) => {
+      calls.push({ source: route.connectionId, method, params })
+      if (method === 'session.list') return { sessions: rowsByProfile[params.profile] || [] }
       return {}
     }
-  }
-  const section = source.slice(start, end).concat('\nglobalThis.__h = { hideOwnedBotSessions, sweepBotProfileSessions };\n')
-  vm.runInNewContext(section, context, { filename: 's.js' })
-  await context.__h.sweepBotProfileSessions()
+  })
+  botMode.state.$lastRoster.set([
+    { name: 'alpha' },
+    { name: 'remy', remoteSource: true, connectionId: 'mini' }
+  ])
 
-  const lists = calls.filter(c => c.method === 'session.list')
-  assert.deepEqual(lists.map(c => c.params.profile).sort(), ['alpha', 'remy'])
-  // Visible-rows-only listing keeps the sweep idempotent.
-  assert.ok(lists.every(c => !c.params.include_hidden))
+  await botMode.sweepBotProfileSessions()
 
-  const hidden = calls.filter(c => c.method === 'session.set_hidden')
+  const lists = calls.filter(call => call.method === 'session.list')
+  assert.deepEqual(lists.map(call => call.params.profile).sort(), ['alpha', 'remy'])
+  assert.ok(lists.every(call => !('include_hidden' in call.params)))
+
+  const hidden = calls.filter(call => call.method === 'session.set_hidden')
   assert.deepEqual(
-    hidden.map(c => c.params.session_id).sort(),
-    ['a-1', 'a-2', 'a-3', 'r-1'],
-    'exact plumbing titles only — user-titled rows in bot profiles stay visible'
+    hidden.map(call => call.params.session_id).sort(),
+    ['a-1', 'a-2', 'a-3', 'r-1']
   )
-  assert.ok(hidden.every(c => c.params.hidden === true))
-  // Remote-source bots route through requestForBot with their own bot row.
-  assert.equal(hidden.find(c => c.params.session_id === 'r-1').bot, 'remy')
+  assert.ok(hidden.every(call => call.params.hidden === true))
+  assert.equal(hidden.find(call => call.params.session_id === 'r-1').source, 'mini')
 })
 
-test('hideOwnedBotSessions chains the ownership sweep and survives its absence of context', async () => {
-  // The load/reconnect entrypoint runs BOTH halves: known ids first, then
-  // the roster-wide title sweep (best-effort — a throwing sweep never
-  // breaks the id half).
-  assert.match(source, /return Promise\.all\(\[known, sweepBotProfileSessions\(\)\.catch\(\(\) => undefined\)\]\)/)
-})
+test('the load sweep runs both known-id and profile-ownership recovery paths', async () => {
+  const calls = []
+  resetBotModeTestState({
+    request: async (method, params) => {
+      calls.push({ method, params })
+      if (method === 'profiles.list') {
+        return {
+          profiles: [
+            { name: 'alpha', preferred_session: { id: 'chat-a', title: 'Bot Chat' } }
+          ]
+        }
+      }
+      if (method === 'session.list') return { sessions: [{ id: 'inbox-a', title: 'Agent Inbox' }] }
+      return {}
+    }
+  })
+  botMode.state.$botMeta.set({ alpha: { chat: 'chat-a' } })
 
-test('the Bots session browser lists with include_hidden', () => {
-  // The one session.list consumer that must see the always-hidden rows.
-  // (Canonical-chat recovery now goes through profiles.list
-  // preferred_session_ids, whose resolver already sees hidden rows.)
-  assert.match(source, /session\.list', \{ profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true \}/)
+  await botMode.hideOwnedBotSessions()
+
+  assert.deepEqual(
+    calls
+      .filter(call => call.method === 'session.set_hidden')
+      .map(call => call.params.session_id)
+      .sort(),
+    ['chat-a', 'inbox-a']
+  )
 })

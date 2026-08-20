@@ -265,6 +265,7 @@ _LONG_HANDLERS = frozenset(
         # profile) and opens each profile's state.db for the last-session
         # preview; profiles.create copies skill bundles. Both are seconds-
         # scale on cold disks — keep them off the WS reader thread.
+        "profiles.ensure_bot_chat",
         "profiles.configure",
         "profiles.create",
         "profiles.describe",
@@ -6148,22 +6149,48 @@ DESKTOP_BACKEND_CONTRACT = 6
 # lets remote clients select stock behavior without probing plugin routes.
 GATEWAY_CAPABILITIES = ("session_action_authority_v1", "session_watch_v1")
 BOT_CHAT_CAPABILITY = "profiles_bot_chat_v1"
+_BOT_CHAT_REQUIRED_METHODS = frozenset(
+    {
+        # The ensure RPC mints the durable hidden row; these stock session
+        # routes are the profile-scoped open/list/watch path clients use to
+        # resume and stream that row from the owning profile.
+        "profiles.ensure_bot_chat",
+        "session.create",
+        "session.list",
+        "session.resume",
+        "session.set_hidden",
+        "session.watch",
+    }
+)
+
+
+def _bot_chat_capability_available() -> bool:
+    """Return true only when the complete profile-scoped Bot Chat contract exists."""
+    if not _BOT_CHAT_REQUIRED_METHODS.issubset(_methods):
+        return False
+    # These are the stock profile authorities used by session.* handlers.  A
+    # partial/legacy gateway that happens to register the method names but
+    # cannot bind a requested profile must not advertise the mobile contract.
+    if not callable(globals().get("_profile_home")):
+        return False
+    if not callable(globals().get("_profile_db")):
+        return False
+    try:
+        from hermes_state import SessionDB
+    except Exception:
+        return False
+    return callable(getattr(SessionDB, "set_session_hidden", None))
 
 
 def gateway_ready_payload(skin: dict) -> dict:
     """Build the transport-neutral gateway.ready capability envelope."""
     capabilities = list(GATEWAY_CAPABILITIES)
-    # Bot Chat creation relies on the generic hidden-session authority.  Older
-    # mobile-compatible gateways may have the RPC module but predate that
-    # SessionDB method, so advertise only when the complete stock contract is
-    # available rather than making clients probe into a visible fallback.
+    # Bot Chat creation relies on the generic hidden-session authority and
+    # profile-scoped session threading. Older gateways may expose only part of
+    # that surface; do not make mobile clients probe into a different open
+    # path or a visible fallback.
     try:
-        from hermes_state import SessionDB
-
-        if (
-            "profiles.ensure_bot_chat" in _methods
-            and callable(getattr(SessionDB, "set_session_hidden", None))
-        ):
+        if _bot_chat_capability_available():
             capabilities.append(BOT_CHAT_CAPABILITY)
     except Exception:
         logger.debug("Bot Chat capability discovery failed", exc_info=True)

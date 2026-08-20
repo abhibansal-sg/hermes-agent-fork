@@ -3327,10 +3327,67 @@ async function openStoredBotChat(name, storedId, summary) {
   return storedId
 }
 
-/** Create the bot's ONE forever chat: a real session opened with a kickoff
- *  message (the gateway prunes zero-message sessions, so the chat is born
- *  with the bot introducing itself). Pins the stored id in bot meta and
- *  returns it. */
+/** Older gateways without Hermes' canonical Bot Chat RPC still need the
+ *  original create/open/kickoff flow. This is intentionally kept separate so
+ *  only an identified missing-method response can reach it. */
+async function createLegacyCanonicalChat(name) {
+  const res = await host.request('session.create', {
+    profile: name,
+    title: 'Bot Chat',
+    // Always born hidden from the global sidebar — Bot Mode sessions are
+    // plugin-owned. Core applies this via the generic `hidden` flag
+    // (deferred as pending_hidden until the row exists); older gateways
+    // ignore the unknown param and it stays visible.
+    hidden: true
+  })
+  const sid = res?.stored_session_id
+  const runtime = res?.session_id
+
+  if (sid) {
+    saveBotMeta(name, { chat: sid })
+  }
+
+  // Mount the session view FIRST, then send the kickoff — submitting into
+  // an unmounted session left the intro reply invisible until reopen.
+  let opened = false
+
+  if (sid && typeof host.openSession === 'function') {
+    try {
+      await host.openSession(sid, { profile: name, intent: 'main', keepAllProfilesScope: true })
+      opened = true
+    } catch {
+      // The stored row may not exist until the kickoff persists it. Retry
+      // after prompt.submit below instead of leaving the chat off-screen.
+    }
+  }
+
+  if (runtime) {
+    await new Promise(resolve => window.setTimeout(resolve, 400))
+
+    try {
+      await host.request('prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
+
+      if (!opened && sid && typeof host.openSession === 'function') {
+        await host.openSession(sid, { profile: name, intent: 'main', keepAllProfilesScope: true })
+      }
+    } catch {
+      // The chat already exists. Keep the pin so the next click
+      // opens it instead of making a second Bot Chat.
+    }
+  }
+
+  return sid || null
+}
+
+function isMissingBotChatRpc(error) {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /method not found|-32601|unknown method|no such method/i.test(message)
+}
+
+/** Create the bot's ONE forever chat through Hermes' canonical authority.
+ *  The legacy flow is reachable only when the backend explicitly reports
+ *  that this RPC does not exist; authoritative or transient failures surface
+ *  to the caller and cannot mint a second/visible chat. */
 function createCanonicalChat(name) {
   const inflight = canonicalCreations.get(name)
 
@@ -3339,52 +3396,36 @@ function createCanonicalChat(name) {
   }
 
   const run = (async () => {
-    const res = await host.request('session.create', {
-      profile: name,
-      title: 'Bot Chat',
-      // Always born hidden from the global sidebar — Bot Mode sessions are
-      // plugin-owned. Core applies this via the generic `hidden` flag
-      // (deferred as pending_hidden until the row exists); older gateways
-      // ignore the unknown param and it stays visible.
-      hidden: true
-    })
-    const sid = res?.stored_session_id
-    const runtime = res?.session_id
-
-    if (sid) {
-      saveBotMeta(name, { chat: sid })
-    }
-
-    // Mount the session view FIRST, then send the kickoff — submitting into
-    // an unmounted session left the intro reply invisible until reopen.
-    let opened = false
-
-    if (sid && typeof host.openSession === 'function') {
-      try {
-        await host.openSession(sid, { profile: name, intent: 'main', keepAllProfilesScope: true })
-        opened = true
-      } catch {
-        // The stored row may not exist until the kickoff persists it. Retry
-        // after prompt.submit below instead of leaving the chat off-screen.
+    let res
+    try {
+      res = await host.request('profiles.ensure_bot_chat', { profile: name })
+    } catch (error) {
+      if (isMissingBotChatRpc(error)) {
+        return createLegacyCanonicalChat(name)
       }
+      throw error
     }
 
-    if (runtime) {
-      await new Promise(resolve => window.setTimeout(resolve, 400))
-
-      try {
-        await host.request('prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
-
-        if (!opened && sid && typeof host.openSession === 'function') {
-          await host.openSession(sid, { profile: name, intent: 'main', keepAllProfilesScope: true })
-        }
-      } catch {
-        // The chat already exists. Keep the pin so the next click
-        // opens it instead of making a second Bot Chat.
+    // host.request normally rejects JSON-RPC errors, but keep this guard for
+    // older SDK adapters that return the envelope directly. Only a genuine
+    // missing-method error is eligible for the legacy path.
+    if (res?.error) {
+      const error = new Error(res.error.message || String(res.error.code || 'Bot Chat RPC failed'))
+      if (isMissingBotChatRpc(error)) {
+        return createLegacyCanonicalChat(name)
       }
+      throw error
     }
 
-    return sid || null
+    const sid = typeof res?.session_id === 'string' ? res.session_id.trim() : ''
+    const returnedProfile = typeof res?.profile === 'string' ? res.profile.trim() : ''
+    if (!sid || returnedProfile !== name) {
+      throw new Error('Hermes returned an invalid canonical Bot Chat result')
+    }
+
+    saveBotMeta(name, { chat: sid })
+    await openStoredBotChat(name, sid, res.created ? { message_count: 0 } : undefined)
+    return sid
   })().finally(() => canonicalCreations.delete(name))
 
   canonicalCreations.set(name, run)
@@ -6557,18 +6598,23 @@ function CreateAgentDialog({ open, onClose, roster }) {
 
       $selectedBot.set(slug)
 
-      // Birth the bot's forever chat right away: it introduces itself as
-      // the first thing the user sees, and the pin exists from minute one.
+      // Birth the bot's forever chat through Hermes' canonical authority.
       try {
-        // Creates, pins, opens, and kicks off the intro in one flow.
+        // Creates, pins, and opens the canonical row. Older gateways are
+        // handled inside createCanonicalChat only when the RPC is explicitly
+        // unavailable; transient/authoritative failures must remain visible.
         const sid = await createCanonicalChat(slug)
 
         if (!sid && typeof host.newChat === 'function') {
           host.newChat(slug)
         }
-      } catch {
-        if (typeof host.newChat === 'function') {
-          host.newChat(slug)
+      } catch (error) {
+        host.notifyError?.(error, `Could not create ${slug}'s canonical Bot Chat`)
+        if (typeof host.notifyError !== 'function') {
+          host.notify({
+            kind: 'error',
+            message: error instanceof Error ? error.message : String(error)
+          })
         }
       }
     } catch (err) {
@@ -10063,6 +10109,21 @@ function BotsPane() {
 }
 
 // ── plugin ───────────────────────────────────────────────────────────────────
+
+// These narrow behavior seams keep the standalone ESM plugin testable through
+// its real module boundary. The runtime loader consumes only the default
+// export, so they do not add plugin capabilities or alter production loading.
+export const __test = {
+  createCanonicalChat,
+  ensureGroupChatSession,
+  hideOwnedBotSessions,
+  sweepBotProfileSessions,
+  state: {
+    $botMeta,
+    $groupChats,
+    $lastRoster
+  }
+}
 
 export default {
   id: ID,

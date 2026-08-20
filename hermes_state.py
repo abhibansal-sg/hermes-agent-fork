@@ -4537,6 +4537,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
+        title: str = None,
+        hidden: bool = False,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -4580,9 +4582,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, system_prompt_hash,
                    parent_session_id, cwd, profile_name, git_repo_root,
-                   origin_json, display_name, started_at
+                   origin_json, display_name, title, hidden, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = CASE
@@ -4623,7 +4625,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
                        git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root),
                        origin_json = COALESCE(sessions.origin_json, excluded.origin_json),
-                       display_name = COALESCE(sessions.display_name, excluded.display_name)""",
+                       display_name = COALESCE(sessions.display_name, excluded.display_name),
+                       title = COALESCE(sessions.title, excluded.title),
+                       hidden = CASE
+                           WHEN excluded.hidden = 1 THEN 1
+                           ELSE sessions.hidden
+                       END""",
                 (
                     session_id,
                     source,
@@ -4641,6 +4648,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     git_repo_root,
                     origin_json,
                     display_name,
+                    title,
+                    1 if hidden else 0,
                     time.time(),
                 ),
             )
@@ -8277,60 +8286,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 WHERE id IN (SELECT id FROM lineage)
                 """,
                 (session_id, session_id, 1 if archived else 0),
-            )
-            rowcount = cursor.rowcount
-            if rowcount is None or rowcount < 0:
-                rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            return rowcount
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
-
-    def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
-        """Hide or unhide a session (and its whole compression lineage).
-
-        ``hidden`` is a generic "don't show in the global Sessions sidebar"
-        flag: a hidden session is dropped from the default
-        :meth:`list_sessions_rich` listing (which omits ``include_hidden``) but
-        stays fully resumable by the surface that owns it — useful for plugins
-        that manage their own sessions (e.g. kanban) and don't want them
-        cluttering the shared recents list. Like :meth:`set_session_archived`
-        / :meth:`set_session_pinned` the whole compression chain is flipped as
-        a unit, so hiding the surfaced tip hides the root (and vice-versa) no
-        matter which id the caller holds. Returns True if at least one row
-        changed.
-        """
-        def _do(conn):
-            cursor = conn.execute(
-                """
-                WITH RECURSIVE
-                  ancestors(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT parent.id
-                    FROM ancestors a
-                    JOIN sessions child ON child.id = a.id
-                    JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  descendants(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT child.id
-                    FROM descendants d
-                    JOIN sessions parent ON parent.id = d.id
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  lineage(id) AS (
-                    SELECT id FROM ancestors
-                    UNION
-                    SELECT id FROM descendants
-                  )
-                UPDATE sessions
-                SET hidden = ?
-                WHERE id IN (SELECT id FROM lineage)
-                """,
-                (session_id, session_id, 1 if hidden else 0),
             )
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
