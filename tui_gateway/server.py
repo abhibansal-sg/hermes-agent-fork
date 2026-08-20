@@ -2012,6 +2012,7 @@ _SESSION_MUTATING_METHODS = frozenset(
         "session.redirect",
         "session.resume",
         "session.save",
+        "session.set_hidden",
         "session.steer",
         "session.title",
         "session.undo",
@@ -3330,6 +3331,14 @@ def _ensure_session_db_row(session: dict) -> None:
             # means the launch/default profile (matches run_agent's convention).
             profile_name=Path(profile_home).name if profile_home else None,
         )
+        # A session can be born hidden (session.create hidden=true, or a
+        # session.set_hidden that arrived before the row existed): apply the
+        # deferred intent now that the row exists, mirroring pending_title.
+        if session.get("pending_hidden"):
+            try:
+                db.set_session_hidden(key, True)
+            except Exception:
+                logger.debug("failed to apply pending hidden flag", exc_info=True)
     except Exception as exc:
         # Disk-full is not a soft failure: if we swallow it here, prompt.submit
         # returns {"status":"streaming"} and the user's message vanishes with
@@ -5613,11 +5622,26 @@ DESKTOP_BACKEND_CONTRACT = 5
 # client protocol features, not model tools; advertising them in gateway.ready
 # lets remote clients select stock behavior without probing plugin routes.
 GATEWAY_CAPABILITIES = ("session_action_authority_v1", "session_watch_v1")
+BOT_CHAT_CAPABILITY = "profiles_bot_chat_v1"
 
 
 def gateway_ready_payload(skin: dict) -> dict:
     """Build the transport-neutral gateway.ready capability envelope."""
     capabilities = list(GATEWAY_CAPABILITIES)
+    # Bot Chat creation relies on the generic hidden-session authority.  Older
+    # mobile-compatible gateways may have the RPC module but predate that
+    # SessionDB method, so advertise only when the complete stock contract is
+    # available rather than making clients probe into a visible fallback.
+    try:
+        from hermes_state import SessionDB
+
+        if (
+            "profiles.ensure_bot_chat" in _methods
+            and callable(getattr(SessionDB, "set_session_hidden", None))
+        ):
+            capabilities.append(BOT_CHAT_CAPABILITY)
+    except Exception:
+        logger.debug("Bot Chat capability discovery failed", exc_info=True)
     try:
         from tui_gateway.prompt_admission import ensure_prompt_receipt_provider
 
@@ -14816,6 +14840,7 @@ from . import (  # noqa: E402
     methods_complete as _methods_complete,
     methods_config as _methods_config,
     methods_prompt as _methods_prompt,
+    methods_profiles as _methods_profiles,
     methods_session as _methods_session,
     methods_tools as _methods_tools,
 )
@@ -14823,6 +14848,7 @@ from . import (  # noqa: E402
 for _m in (
     _methods_session,
     _methods_prompt,
+    _methods_profiles,
     _methods_config,
     _methods_complete,
     _methods_tools,

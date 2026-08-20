@@ -99,6 +99,7 @@ def _(rid, params: dict) -> dict:
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
+            "pending_hidden": is_truthy_value(params.get("hidden", False)),
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
             "session_key": key,
@@ -1145,6 +1146,33 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"pending": True, "title": title})
         except ValueError as e:
             return _err(rid, 4022, str(e))
+        except Exception as e:
+            return _err(rid, 5007, str(e))
+
+
+@method("session.set_hidden")
+def _(rid, params: dict) -> dict:
+    """Set/clear the generic ``hidden`` flag on a session (and its lineage).
+
+    A hidden session is excluded from the default global Sessions list but
+    remains fully resumable by the surface that owns it. The DB layer flips
+    the whole compression chain as one unit.
+    """
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    hidden = is_truthy_value(params.get("hidden", True))
+    with _session_db(session) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5007)
+        key = session["session_key"]
+        try:
+            changed = db.set_session_hidden(key, hidden)
+            if not changed:
+                # A draft has no row until its first prompt. Preserve the
+                # intent so that row is born hidden, mirroring pending_title.
+                session["pending_hidden"] = hidden
+            return _ok(rid, {"hidden": hidden, "session_key": key})
         except Exception as e:
             return _err(rid, 5007, str(e))
 
