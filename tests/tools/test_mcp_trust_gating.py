@@ -247,3 +247,28 @@ class TestAnnotationCaptureAtDiscovery:
         assert _mcp_registration._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+    def test_sdk_tool_annotations_supported(self):
+        """A live-discovered ``mcp.types.Tool`` carries ``ToolAnnotations``; on MCP SDK >= 2.0
+        the model stores the field as ``read_only_hint`` (``readOnlyHint`` is only the wire
+        alias), so reading the camelCase attribute would classify every real tool as
+        write-capable and gate reads on untrusted servers too."""
+        from mcp import types as mcp_types
+
+        def sdk_tool(name, annotations):
+            return mcp_types.Tool.model_validate(
+                {"name": name, "inputSchema": {"type": "object"}, "annotations": annotations}
+            )
+
+        assert _mcp_registration._annotation_read_only_hint(
+            sdk_tool("list_repos", {"readOnlyHint": True})
+        ) is True
+        assert _mcp_registration._annotation_read_only_hint(
+            sdk_tool("delete_repo", {"readOnlyHint": False})
+        ) is False
+        assert _mcp_registration._annotation_read_only_hint(
+            sdk_tool("unhinted", {"title": "Unhinted"})
+        ) is False
+        assert _mcp_registration._annotation_read_only_hint(
+            sdk_tool("no_annotations", None)
+        ) is False
