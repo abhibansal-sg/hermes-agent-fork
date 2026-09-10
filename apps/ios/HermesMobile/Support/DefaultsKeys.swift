@@ -34,6 +34,14 @@ enum DefaultsKeys {
     /// `String` (raw value) — the selected theme preset. Owned by ``ThemeStore``.
     static let theme = "hermes.theme"
 
+    // MARK: Root presentation
+
+    /// `String` (`AppPresentationMode.rawValue`) — the user's chosen root
+    /// presentation. This is intentionally the only Bot Mode persistence: bot
+    /// roster and opening state remain ephemeral, while Hermes retains all
+    /// profile, session, transcript, and execution authority.
+    static let appPresentationMode = "hermes.appPresentationMode"
+
     // MARK: Session list (persisted UI state)
 
     /// `[String]` — pinned `stored_session_id`s. Owned by ``SessionStore``.
@@ -371,4 +379,28 @@ enum DefaultsKeys {
         ConnectionMode.saved(rawValue: defaults.string(forKey: connectionMode))
     }
 
+}
+
+/// The app-root presentation selected in Settings. Session Mode preserves the
+/// established session drawer/chat shell; Bot Mode presents Hermes profiles as a
+/// roster and opens their canonical chats through ``SessionStore``.
+enum AppPresentationMode: String, CaseIterable, Hashable, Sendable {
+    case sessions
+    case bots
+
+    var title: String {
+        switch self {
+        case .sessions: "Session Mode"
+        case .bots: "Bot Mode"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .sessions:
+            "Show your existing session list and chat home."
+        case .bots:
+            "Show Hermes profiles as bots and open each bot’s canonical chat."
+        }
+    }
 }

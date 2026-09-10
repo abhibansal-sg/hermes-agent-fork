@@ -1,0 +1,2 @@
+skip-agent
+# PR #279 upstream convergence; restores upstream's prior exact-case mapping
