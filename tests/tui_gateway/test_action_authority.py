@@ -8,7 +8,8 @@ import threading
 import pytest
 
 from tui_gateway import server
-from tui_gateway.transport import AuthenticatedPrincipal, bind_transport, reset_transport
+from tui_gateway.server import AuthenticatedPrincipal
+from tui_gateway.transport import bind_transport, reset_transport
 from tui_gateway.ws import WSTransport
 
 
@@ -236,15 +237,10 @@ def test_remote_subagent_action_requires_owning_session_selector():
     assert response["error"]["code"] == 4006
 
 
-def test_ws_transport_carries_authenticated_principal():
-    class _WS:
-        async def send_text(self, _text: str) -> None:
-            pass
-
+def test_ws_transport_uses_stock_verified_identity():
     loop = asyncio.new_event_loop()
     try:
-        principal = AuthenticatedPrincipal("device-a", "test", "ticket")
-        transport = WSTransport(_WS(), loop, principal=principal)
-        assert transport.authenticated_principal == principal
+        transport = WSTransport(object(), loop, auth_identity={"user_id": "device-a", "provider": "test"})
+        assert server._request_principal(transport).key == "test:device-a"
     finally:
         loop.close()

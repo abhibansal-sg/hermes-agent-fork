@@ -379,10 +379,18 @@ final class FileSystemModelTests: XCTestCase {
         XCTAssertEqual(mapped.errorDescription, "Too large to preview")
     }
 
-    func testMapFSErrorEscape403() {
-        let mapped = RestClient.mapFSError(.badStatus(403, body: #"{"error":"path escapes session root"}"#))
-        guard case .pathEscapesRoot = mapped else {
-            return XCTFail("expected .pathEscapesRoot, got \(mapped)")
+    func testMapFSErrorStock403IsUnreadable() {
+        // Stock file routes are path-based, not session-sandbox endpoints.
+        // Traversal is rejected locally by resolveFSPath; an HTTP 403 is a
+        // read denial, even if an older server supplies the legacy body.
+        for body in [#"{"detail":"File is not readable"}"#,
+                     #"{"error":"path escapes session root"}"#] {
+            let mapped = RestClient.mapFSError(.badStatus(403, body: body))
+            guard case .other(let message) = mapped else {
+                return XCTFail("expected unreadable error, got \(mapped)")
+            }
+            XCTAssertEqual(message, "That file isn't readable.")
+            XCTAssertEqual(mapped.errorDescription, message)
         }
     }
 
@@ -401,15 +409,19 @@ final class FileSystemModelTests: XCTestCase {
         }
     }
 
-    func testMapFSErrorUnknownSession404IsNoActiveSession() {
-        // R1-fix finding 2: the server's unknown/stale-sid 404 carries
-        // `{"error":"unknown session"}` and must surface as "No Active Session"
-        // (the browser handles it gracefully instead of "file not found").
-        let mapped = RestClient.mapFSError(.badStatus(404, body: #"{"error":"unknown session"}"#))
-        guard case .noActiveSession = mapped else {
-            return XCTFail("expected .noActiveSession, got \(mapped)")
+    func testMapFSErrorStock404DoesNotInferSessionStateFromBody() {
+        // Stock requests carry a path, not a session ID. A missing canonical
+        // cwd produces noActiveSession before any network request (covered by
+        // testMissingCanonicalCwdMapsToNoActiveSessionWithoutNetwork); an HTTP
+        // 404 is a path miss, including the retired plugin's session marker.
+        for body in [#"{"detail":"File not found"}"#,
+                     #"{"error":"unknown session"}"#] {
+            let mapped = RestClient.mapFSError(.badStatus(404, body: body))
+            guard case .notAFile = mapped else {
+                return XCTFail("expected .notAFile, got \(mapped)")
+            }
+            XCTAssertEqual(mapped.errorDescription, FSReadError.notAFile.errorDescription)
         }
-        XCTAssertEqual(mapped.errorDescription, "No Active Session")
     }
 
     func testMapFSErrorOtherPassesThrough() {

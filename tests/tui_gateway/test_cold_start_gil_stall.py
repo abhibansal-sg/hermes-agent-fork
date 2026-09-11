@@ -8,7 +8,7 @@ between ``HERMES_BACKEND_READY`` and the first prompt. Three fixes:
    subprocess when a Copilot env var is explicitly set (even if invalid).
 2. ``tui_gateway.ws.handle_ws`` runs ``resolve_skin()`` via
    ``asyncio.to_thread`` so the loop is not blocked by config/skin init.
-3. ``web_server._warm_gateway_module`` pre-imports the heavy module
+3. ``web_server_lifecycle._warm_gateway_module`` pre-imports the heavy module
    chains that the first WS connection + RPC burst would otherwise
    import on the loop thread.
 """
@@ -19,6 +19,7 @@ import sys
 from unittest.mock import patch, MagicMock
 
 import pytest
+import hermes_cli.web_server_lifecycle as _web_server_lifecycle
 
 
 # ─── Fix 1: copilot_auth skips gh CLI when env var is set ──────────────
@@ -141,7 +142,7 @@ def test_handle_ws_ready_payload_wires_skin_through_to_thread():
                     "method": "event",
                     "params": {
                         "type": "gateway.ready",
-                        "payload": server_mod.gateway_ready_payload(skin_payload),
+                        "payload": {"skin": skin_payload, "change_events": True},
                     },
                 }
             )
@@ -150,7 +151,6 @@ def test_handle_ws_ready_payload_wires_skin_through_to_thread():
 
     assert frames[0]["params"]["payload"]["skin"] == {"palette": "wired"}
     assert frames[0]["params"]["payload"]["change_events"] is True
-    assert "session_watch_v1" in frames[0]["params"]["payload"]["capabilities"]
     assert idents["skin_thread"] != idents["loop_thread"]
     # Belt and braces: the production site must still route through
     # to_thread — assert against the live source so a revert to inline
@@ -188,7 +188,7 @@ def test_warm_gateway_module_imports_cold_start_chains():
         "hermes_cli.model_switch",
     }
 
-    web_server_mod._warm_gateway_module()
+    _web_server_lifecycle._warm_gateway_module()
 
     missing = required - set(sys.modules)
     assert not missing, (

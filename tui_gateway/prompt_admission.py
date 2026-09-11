@@ -90,6 +90,7 @@ def request_fingerprint(
     confirm_empty_truncate: Any,
     queued: Any,
     interrupted: Any,
+    extra: dict | None = None,
 ) -> str:
     """Hash every prompt parameter that can change canonical action semantics."""
     payload = {
@@ -101,6 +102,8 @@ def request_fingerprint(
         "text": text,
         "truncate_before_user_ordinal": truncate_before_user_ordinal,
     }
+    if extra:
+        payload["extra"] = extra
     encoded = json.dumps(
         payload,
         ensure_ascii=False,

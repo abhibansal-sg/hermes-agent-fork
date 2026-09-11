@@ -104,8 +104,9 @@ final class SessionRefreshTests: XCTestCase {
         XCTAssertEqual(store.sessions.map(\.id), ["quick"])
         XCTAssertEqual(FirstPairSessionListStubProtocol.requestedOrders, ["created"])
 
-        await store.refresh()
+        let outcome = await store.refreshOutcome()
 
+        XCTAssertEqual(outcome, .success, "the stock recent request must succeed, not retain provisional rows after a rejected request")
         XCTAssertEqual(store.sessions.map(\.id), ["authoritative"])
         XCTAssertEqual(FirstPairSessionListStubProtocol.requestedOrders, ["created", "recent"])
     }
@@ -442,9 +443,12 @@ private final class FirstPairSessionListStubProtocol: URLProtocol, @unchecked Se
         let limit = items.first(where: { $0.name == "limit" })?.value
         Self.requestedOrders.append(order)
 
+        // This fixture serves stock /api/sessions, not the profile aggregate
+        // endpoint: stock accepts at most 100 rows even though the native rail
+        // can hold 200. Reject a regression to the oversized stock request.
         let expectedLimit = order == "created"
             ? String(SessionStore.initialSnapshotLimit)
-            : String(SessionStore.snapshotLimit)
+            : "100"
         guard limit == expectedLimit else {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
             return
