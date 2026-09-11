@@ -195,15 +195,31 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
 
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+    frame_inflight = frame.get("inflight")
+    is_error = (frame.get("type") == "turn.error" or frame.get("status") == "error"
+                or bool(frame.get("error"))
+                or (isinstance(frame_inflight, dict) and bool(frame_inflight.get("error"))))
+    error_message = str(frame.get("error") or frame.get("message")
+                        or (frame_inflight.get("error") if isinstance(frame_inflight, dict) else "")
+                        or "compute host turn failed")
     with session["history_lock"]:
         _compute_host_adopt_frame_meta(session, frame)
         session["running"] = False
         session["last_active"] = time.time()
-        _clear_inflight_turn(session)
+        if is_error:
+            retained = dict(session.get("inflight_turn") or {})
+            if isinstance(frame_inflight, dict):
+                for key in ("user", "assistant", "corrections", "correction_offsets", "error_surface"):
+                    if key in frame_inflight:
+                        retained[key] = frame_inflight[key]
+            session["inflight_turn"] = retained
+            _fail_inflight_turn(session, error_message)
+        else:
+            _clear_inflight_turn(session)
         session.pop("_compute_host_pending_clarify", None)
-    if frame.get("type") == "turn.error":
-        message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+    if is_error and not frame.get("terminal_event_emitted"):
+        _emit("message.complete", sid, {"text": f"Error: {error_message}", "status": "error",
+                                        "error": error_message, "recoverable": True})
     _apply_compute_host_metadata_mirror(session, frame)
     info = _compute_host_session_info(session)
     if not frame.get("session_info_emitted"):

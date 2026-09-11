@@ -245,12 +245,17 @@ class ComputeHost:
             with session["history_lock"]:
                 meta = _history_meta(session)
                 interrupted = bool(session.get("_turn_cancel_requested"))
+                inflight = server._inflight_snapshot(session)
             session_info = server._session_info(session.get("agent"), session)
             with self._progress_lock:
                 self._progress_counter += 1
             self._reply(
                 "turn.end", sid, request_id, **meta, interrupted=interrupted, ended_ns=now_ns(),
-                session_info=session_info, session_info_emitted=True)
+                session_info=session_info, session_info_emitted=True,
+                **({"status": "error", "error": inflight["error"],
+                    "recoverable": bool(inflight.get("recoverable", True)),
+                    "inflight": inflight, "terminal_event_emitted": True}
+                   if isinstance(inflight, dict) and inflight.get("error") else {}))
         except Exception as exc:
             with contextlib.suppress(Exception):
                 from tui_gateway import server
