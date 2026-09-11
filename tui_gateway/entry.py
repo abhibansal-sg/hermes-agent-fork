@@ -258,7 +258,7 @@ def main():
     _write_or_exit({
         "jsonrpc": "2.0", "method": "event",
         "params": {"type": "gateway.ready", "payload": {
-            "skin": resolve_skin(), "change_events": True, "replay_epoch": replay_epoch()}}},
+            **server.gateway_ready_payload(resolve_skin()), "replay_epoch": replay_epoch()}}},
         "startup write failed (broken stdout pipe before first event)")
 
     # Live-apply skins Hermes activates mid-conversation.

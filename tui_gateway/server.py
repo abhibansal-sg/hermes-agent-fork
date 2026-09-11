@@ -727,6 +727,13 @@ def method(name: str):
     return dec
 
 
+GATEWAY_CAPABILITIES = ("session_watch_v1",)
+
+
+def gateway_ready_payload(skin: dict) -> dict:
+    return {"skin": skin, "change_events": True, "capabilities": list(GATEWAY_CAPABILITIES)}
+
+
 def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     """Validate a JSON-RPC request enough for safe local dispatch."""
     if not isinstance(req, dict):
@@ -2693,7 +2700,7 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
 
 def _live_session_payload(
     sid: str, session: dict, *, cols: int | None = None, touch: bool = False,
-    transport: Transport | None = None, omit_messages: bool = False) -> dict:
+    transport: Transport | None = None, omit_messages: bool = False, omit_info: bool = False) -> dict:
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
@@ -2714,13 +2721,15 @@ def _live_session_payload(
         with _session_db(session) as db:
             history = _live_visible_history(session, db, in_memory_history)
     payload = {
-        "info": _fallback_session_info(session), "message_count": len(history),
+        "message_count": len(history),
         "messages": [] if omit_messages else _history_to_messages(history),
         "messages_omitted": omit_messages, "running": running, "turn_started_at": turn_started_at,
         "session_id": sid, "session_key": _session_lookup_key(session, fallback=sid),
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
     }
+    if not omit_info:
+        payload["info"] = _fallback_session_info(session)
     for key, value in (("inflight", inflight), ("queued", queued),
                        ("pending_approval", _pending_approval_request_payload(str(session.get("session_key") or ""))),
                        ("pending_clarify", _pending_clarify_request_payload(sid))):
