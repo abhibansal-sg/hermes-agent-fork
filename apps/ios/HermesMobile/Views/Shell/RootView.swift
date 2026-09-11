@@ -68,6 +68,10 @@ struct RootView: View {
     /// existing Save path writes them).
     @State private var showingSettings = false
 
+    /// The only persistent Bot Mode state: which root presentation the user last
+    /// selected. Everything else remains owned by Hermes or bounded view state.
+    @AppStorage(DefaultsKeys.appPresentationMode) private var appPresentationMode: AppPresentationMode = .sessions
+
     #if DEBUG
     /// STR-716: in-process live size-class override set by the DEBUG deep link
     /// `hermesapp://debug/size-class/<compact|regular|auto>` (see
@@ -279,6 +283,16 @@ struct RootView: View {
 
     @ViewBuilder
     private var mainUI: some View {
+        switch appPresentationMode {
+        case .sessions:
+            sessionModeUI
+        case .bots:
+            BotModeRootView(onOpenSettings: openSettings)
+        }
+    }
+
+    @ViewBuilder
+    private var sessionModeUI: some View {
         // Owner order (2026-07-18): the full-width top status strip ("Offline"/
         // "Syncing"/"Fresh") was removed completely — "remove that element
         // completely… irrelevant because we have the pill under the title bar."
