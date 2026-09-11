@@ -727,6 +727,307 @@ def method(name: str):
     return dec
 
 
+# Live-session action authority errors. These are distinct from ordinary
+# session-busy/not-found failures so clients can offer an explicit takeover
+# instead of retrying a mutation blindly.
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class AuthenticatedPrincipal:
+    """Transport-neutral identity authorized to issue gateway RPCs.
+
+    Authentication providers own credential verification and supply the stable
+    subject. Hermes owns what that identity may do to a live session.
+    """
+
+    subject: str
+    provider: str
+    credential: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}:{self.subject}"
+
+
+ACTION_OWNER_CONFLICT = 4091
+ACTION_REVISION_STALE = 4092
+
+# Central admission list for RPCs that mutate live session state, ordering, or
+# an in-flight authorization prompt. Stored-only operations are admitted here
+# whenever their target currently has a live record; the authenticated HTTP
+# gate remains the boundary when no live record exists.
+_SESSION_MUTATING_METHODS = frozenset(
+    {
+        "approval.respond",
+        "clarify.respond",
+        "clipboard.paste",
+        "command.dispatch",
+        "config.set",
+        "file.attach",
+        "handoff.fail",
+        "handoff.request",
+        "image.attach",
+        "image.attach_bytes",
+        "image.detach",
+        "input.detect_drop",
+        "message.react",
+        "pdf.attach",
+        "preview.read.respond",
+        "preview.restart",
+        "process.kill",
+        "prompt.background",
+        "prompt.submit",
+        "reload.mcp",
+        "rollback.restore",
+        "secret.respond",
+        "session.activate",
+        "session.branch",
+        "session.close",
+        "session.compress",
+        "session.create",
+        "session.cwd.set",
+        "session.delete",
+        "session.interrupt",
+        "session.redirect",
+        "session.resume",
+        "session.save",
+        "session.steer",
+        "session.title",
+        "session.undo",
+        "session.workspace.move",
+        "subagent.interrupt",
+        "subagent.steer",
+        "sudo.respond",
+        "terminal.read.respond",
+        "tools.configure",
+    }
+)
+
+
+def _request_principal(transport: Transport | None = None):
+    active = transport or current_transport() or _stdio_transport
+    explicit = getattr(active, "authenticated_principal", None)
+    if explicit is not None:
+        return explicit
+    identity = getattr(active, "auth_identity", None)
+    if isinstance(identity, dict) and identity.get("user_id") and identity.get("provider"):
+        return AuthenticatedPrincipal(str(identity["user_id"]), str(identity["provider"]), "upstream")
+    return AuthenticatedPrincipal("process", "local", "compatibility")
+
+
+def _initial_action_authority() -> dict:
+    """Ownership fields stamped atomically with a newly registered session."""
+    transport = current_transport() or _stdio_transport
+    return {
+        "action_owner": _request_principal(transport).key,
+        "action_revision": 1,
+        "action_transport": transport,
+    }
+
+
+def _action_target(params: dict, result: dict | None = None) -> tuple[str, str]:
+    """Return possible runtime and stored selectors for an action."""
+    runtime = str(params.get("runtime_session_id") or "").strip()
+    stored = str(params.get("session_key") or "").strip()
+    raw_session = str(params.get("session_id") or "").strip()
+    if raw_session:
+        runtime = runtime or raw_session
+        stored = stored or raw_session
+    if isinstance(result, dict):
+        runtime = str(result.get("session_id") or runtime).strip()
+        stored = str(
+            result.get("stored_session_id")
+            or result.get("session_key")
+            or result.get("resumed")
+            or stored
+        ).strip()
+    return runtime, stored
+
+
+def _find_action_session_locked(
+    params: dict,
+    result: dict | None = None,
+) -> tuple[str, dict] | None:
+    runtime, stored = _action_target(params, result)
+    try:
+        if runtime and (session := _sessions.get(runtime)) is not None:
+            return runtime, session
+        if stored:
+            for sid, session in _sessions.items():
+                if _session_lookup_key(session, fallback=sid) == stored:
+                    return sid, session
+    except (AttributeError, RuntimeError):
+        # Preserve each handler's established fail-closed/error behavior when a
+        # concurrent snapshot cannot be obtained; authority never turns that
+        # failure into permission.
+        return None
+    return None
+
+
+def _expected_action_revision(params: dict) -> tuple[int | None, dict | None]:
+    if "expected_action_revision" not in params:
+        return None, None
+    value = params.get("expected_action_revision")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, _err(None, -32602, "expected_action_revision must be an integer")
+    revision = value
+    if revision < 0:
+        return None, _err(None, -32602, "expected_action_revision must be non-negative")
+    return revision, None
+
+
+def _authorize_session_action(rid, method: str, params: dict) -> dict | None:
+    """Atomically admit one mutation against the session ownership epoch."""
+    if method not in _SESSION_MUTATING_METHODS or method == "session.create":
+        return None
+    # session.title doubles as a read when no replacement title is supplied.
+    if method == "session.title" and "title" not in params:
+        return None
+    expected, invalid = _expected_action_revision(params)
+    if invalid is not None:
+        invalid["id"] = rid
+        return invalid
+    principal = _request_principal()
+    transport = current_transport() or _stdio_transport
+    effective_params = params
+    if request_id := str(params.get("request_id") or "").strip():
+        # clarify/sudo/secret/terminal-read responses carry the opaque prompt
+        # id instead of a public session id. Resolve its server-owned mapping
+        # before taking the sessions lock; _block never holds _prompt_lock while
+        # acquiring session state, so this preserves lock ordering.
+        with _prompt_lock:
+            pending = _pending.get(request_id)
+        if pending is not None:
+            effective_params = dict(params)
+            effective_params["runtime_session_id"] = str(pending[0])
+    if method in {"subagent.interrupt", "subagent.steer"} and not any(
+        effective_params.get(key)
+        for key in ("session_id", "session_key", "runtime_session_id")
+    ):
+        # The process-local TUI predates session-scoped subagent interrupt and
+        # remains one trusted local principal. Remote clients must name the
+        # owning runtime (current iOS already does) so another authenticated
+        # user/device cannot stop an unrelated child by global id.
+        if principal.provider != "local":
+            return _err(rid, 4006, "session_id required for remote subagent action")
+        return None
+    with _sessions_lock:
+        found = _find_action_session_locked(effective_params)
+        if found is None:
+            # The handler owns normal not-found behavior. Cold resume has no live
+            # record yet and is claimed after its successful registration.
+            return None
+        _sid, session = found
+        revision = int(session.get("action_revision") or 0)
+        owner = str(session.get("action_owner") or "")
+        if owner and owner != principal.key:
+            return _err(
+                rid,
+                ACTION_OWNER_CONFLICT,
+                f"session is owned by another client (action revision {revision})",
+            )
+        if expected is not None and expected != revision:
+            return _err(
+                rid,
+                ACTION_REVISION_STALE,
+                f"stale action revision: expected {expected}, current {revision}",
+            )
+        if not owner:
+            revision += 1
+            session["action_owner"] = principal.key
+            session["action_revision"] = revision
+        # A new connection for the same authenticated principal may resume
+        # driving without a takeover. Read/watch methods never reach this seam.
+        # Subagent lifecycle actions are the exception: their authority is bound
+        # to the exact transport + session-record generation captured when the
+        # child was commissioned. Rebinding either transport field here would
+        # manufacture that old capability for the request currently being
+        # checked and defeat the handler's fail-closed generation guard.
+        if method not in {"subagent.interrupt", "subagent.steer"}:
+            _attach_session_transport(session, transport)
+            session["action_transport"] = transport
+    return None
+
+
+def _complete_session_action(
+    method: str,
+    params: dict,
+    response: dict | None,
+) -> dict | None:
+    """Claim newly-created/resumed records and echo the ownership epoch."""
+    if method not in {"session.create", "session.resume"} or not isinstance(response, dict):
+        return response
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return response
+    principal = _request_principal()
+    with _sessions_lock:
+        found = _find_action_session_locked(params, result)
+        if found is None:
+            return response
+        _sid, session = found
+        owner = str(session.get("action_owner") or "")
+        if owner and owner != principal.key:
+            if owner_transport := session.get("action_transport"):
+                session["transport"] = owner_transport
+            return _err(
+                response.get("id"),
+                ACTION_OWNER_CONFLICT,
+                "session was claimed by another client during resume",
+            )
+        if not owner:
+            session["action_owner"] = principal.key
+            session["action_revision"] = int(session.get("action_revision") or 0) + 1
+        session["action_transport"] = current_transport() or _stdio_transport
+        result["action_revision"] = int(session.get("action_revision") or 0)
+    return response
+
+
+
+
+@method("session.takeover")
+def _session_takeover(rid, params: dict) -> dict:
+    """Atomically transfer live action authority and the driver transport."""
+    expected, invalid = _expected_action_revision(params)
+    if invalid is not None:
+        invalid["id"] = rid
+        return invalid
+    if expected is None:
+        return _err(rid, 4006, "expected_action_revision required")
+    principal = _request_principal()
+    transport = current_transport() or _stdio_transport
+    with _sessions_lock:
+        found = _find_action_session_locked(params)
+        if found is None:
+            return _err(rid, 4001, "session not found")
+        sid, session = found
+        revision = int(session.get("action_revision") or 0)
+        if expected != revision:
+            return _err(
+                rid,
+                ACTION_REVISION_STALE,
+                f"stale action revision: expected {expected}, current {revision}",
+            )
+        previous = str(session.get("action_owner") or "")
+        if previous != principal.key:
+            revision += 1
+            session["action_owner"] = principal.key
+            session["action_revision"] = revision
+        session["transport"] = transport
+        session["action_transport"] = transport
+        return _ok(
+            rid,
+            {
+                "session_id": sid,
+                "session_key": _session_lookup_key(session, fallback=sid),
+                "action_revision": revision,
+                "taken_over": previous != principal.key,
+            },
+        )
+
+
+
 PROMPT_ID_CONFLICT = 4093
 _PROMPT_ACCEPTED_DISPOSITIONS = frozenset({"queued", "redirected", "steered", "streaming"})
 
@@ -900,7 +1201,7 @@ def _complete_prompt_admission(rid, admission, response: dict | None):
 
 
 
-GATEWAY_CAPABILITIES = ("session_watch_v1",)
+GATEWAY_CAPABILITIES = ("session_watch_v1", "session_action_authority_v1")
 
 
 def gateway_ready_payload(skin: dict) -> dict:
@@ -933,6 +1234,9 @@ def handle_request(req: dict) -> dict | None:
         return _err(rid, -32601, f"unknown method: {method}")
     token = _current_rpc_method.set(method)
     try:
+        authority_error = _authorize_session_action(rid, method, params)
+        if authority_error is not None:
+            return authority_error
         admission = None
         # Correlation is server-owned; never trust a wire-supplied internal field.
         params = dict(params)
@@ -946,7 +1250,8 @@ def handle_request(req: dict) -> dict | None:
         except Exception:
             _release_prompt_admission(admission)
             raise
-        return _complete_prompt_admission(rid, admission, response)
+        response = _complete_prompt_admission(rid, admission, response)
+        return _complete_session_action(method, params, response)
     finally:
         _current_rpc_method.reset(token)
 
@@ -2545,6 +2850,7 @@ def _init_session(
     now = time.time()
     with _sessions_lock:
         _sessions[sid] = {
+            **_initial_action_authority(),
             "agent": agent, "session_key": key, "history": history, "history_lock": threading.Lock(),
             "history_version": 0, "inflight_turn": None, "created_at": now, "last_active": now,
             "running": False, "attached_images": [], "image_counter": 0, "cwd": cwd or _completion_cwd(),
@@ -2608,6 +2914,7 @@ def _deferred_session_record(
     """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent."""
     now = time.time()
     return {
+        **_initial_action_authority(),
         "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
         "close_on_disconnect": close_on_disconnect, "active_session_lease": lease, "cols": cols,
         "created_at": now, "cwd": cwd, "display_history_prefix": display_history_prefix or [],
@@ -2911,6 +3218,7 @@ def _live_session_payload(
         with _session_db(session) as db:
             history = _live_visible_history(session, db, in_memory_history)
     payload = {
+        "action_revision": int(session.get("action_revision") or 0),
         "message_count": len(history),
         "messages": [] if omit_messages else _history_to_messages(history),
         "messages_omitted": omit_messages, "running": running, "turn_started_at": turn_started_at,

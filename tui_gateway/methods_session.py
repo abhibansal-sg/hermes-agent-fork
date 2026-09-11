@@ -311,6 +311,7 @@ def _(rid, params: dict) -> dict:
     now = time.time()
     with _sessions_lock:
         _sessions[sid] = {
+            **_initial_action_authority(),
             "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
             "close_on_disconnect": _flag(params, "close_on_disconnect"),
             "active_session_lease": None,  # claimed lazily on the first turn (_ensure_active_session_slot)
