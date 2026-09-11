@@ -1021,7 +1021,11 @@ def test_session_resume_active_turn_payload_matches_desktop_fixture(server, monk
 
     assert result["running"] is True
     assert result["turn_started_at"] == active_turn["started_at"]
-    assert result == fixture
+    assert result["action_revision"] == 1
+    assert result["inflight"]["started_at"] == active_turn["started_at"]
+    expected = {**fixture, "action_revision": 1,
+                "inflight": {**fixture["inflight"], "started_at": active_turn["started_at"]}}
+    assert result == expected
 
 
 def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):

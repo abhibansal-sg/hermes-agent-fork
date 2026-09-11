@@ -947,8 +947,9 @@ def _authorize_session_action(rid, method: str, params: dict) -> dict | None:
         # child was commissioned. Rebinding either transport field here would
         # manufacture that old capability for the request currently being
         # checked and defeat the handler's fail-closed generation guard.
+        # Transport attachment remains owned by the handler's orphan/reap
+        # admission lock. Attaching here would bypass its retired-session fence.
         if method not in {"subagent.interrupt", "subagent.steer"}:
-            _attach_session_transport(session, transport)
             session["action_transport"] = transport
     return None
 

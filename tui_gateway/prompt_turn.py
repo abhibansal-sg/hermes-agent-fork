@@ -757,6 +757,7 @@ def _run_prompt_submit(
     if admitted is None:
         return False
     images, agent = admitted
+    from tui_gateway.session_history import _inflight_display_metadata
     with session["history_lock"]:
         display_metadata = _inflight_display_metadata(session, display_metadata)
     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
