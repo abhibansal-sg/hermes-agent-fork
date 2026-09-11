@@ -1,0 +1,23 @@
+{
+  "source": "build-149-device-and-authoritative-gateway-diagnostics",
+  "captured_build": 149,
+  "profile_capability_cache": {
+    "contract_version": 3,
+    "fs": "available",
+    "profiles": "unknown"
+  },
+  "legacy_sessions_request_limit": 200,
+  "legacy_sessions_server_maximum": 100,
+  "failed_turn": {
+    "running": false,
+    "status": "failed",
+    "error": "HTTP 503: all accounts at capacity",
+    "recoverable": true
+  },
+  "clarification_turn": {
+    "canonical_assistant_tool_rows": 1,
+    "pending_clarifications": 1,
+    "observed_working_surfaces": 3
+  },
+  "expected": "Re-probe incomplete capabilities, clamp only the legacy rail, preserve one terminal failure, adopt one authoritative live assistant projection, and show the active clarification inline from the durable inbox mirror."
+}
