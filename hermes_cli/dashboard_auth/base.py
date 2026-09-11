@@ -18,6 +18,7 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    client_id: str = ""
 
 
 @dataclass(frozen=True)

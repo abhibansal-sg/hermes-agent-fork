@@ -812,7 +812,10 @@ def _request_principal(transport: Transport | None = None):
         return explicit
     identity = getattr(active, "auth_identity", None)
     if isinstance(identity, dict) and identity.get("user_id") and identity.get("provider"):
-        return AuthenticatedPrincipal(str(identity["user_id"]), str(identity["provider"]), "upstream")
+        subject = str(identity["user_id"])
+        if identity.get("client_id"):
+            subject = f"{subject}/{identity['client_id']}"
+        return AuthenticatedPrincipal(subject, str(identity["provider"]), "upstream")
     return AuthenticatedPrincipal("process", "local", "compatibility")
 
 

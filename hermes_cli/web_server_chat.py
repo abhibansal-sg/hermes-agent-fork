@@ -251,7 +251,8 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             # Only the two identity fields are carried — bookkeeping such as
             # ``minted_at`` is not part of the identity contract.
             ws._hermes_auth_identity = {
-                "user_id": info.get("user_id"), "provider": info.get("provider")}
+                "user_id": info.get("user_id"), "provider": info.get("provider"),
+                **({"client_id": info["client_id"]} if info.get("client_id") else {})}
 
         internal = ws.query_params.get("internal", "")
         if internal:
