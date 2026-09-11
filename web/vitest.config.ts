@@ -20,5 +20,9 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["src/**/*.test.{ts,tsx}"],
+    // Fork CI runs on 4-core ubuntu-latest (upstream uses 32-core). The
+    // React-rendering page tests (SessionsPage per-row routing, ~5.4s cold)
+    // blow the 5s default under runner contention; they are not slow tests.
+    testTimeout: 30_000,
   },
 });
