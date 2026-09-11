@@ -538,6 +538,7 @@ def _invoke_agent(
         run_kwargs["task_id"] = session["session_key"]
     if display_kind and "persist_user_display_kind" in run_params:
         run_kwargs["persist_user_display_kind"] = display_kind
+    if display_metadata and "persist_user_display_metadata" in run_params:
         run_kwargs["persist_user_display_metadata"] = display_metadata
     # Live-rename hook: auto-titling fires inside the turn prologue.
     _title_key = session.get("session_key") or sid
@@ -756,6 +757,8 @@ def _run_prompt_submit(
     if admitted is None:
         return False
     images, agent = admitted
+    with session["history_lock"]:
+        display_metadata = _inflight_display_metadata(session, display_metadata)
     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
     # session_key and the agent's live session_id together.  No prompt content is logged.
     _turn_started_monotonic = time.monotonic()

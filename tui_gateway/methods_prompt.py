@@ -464,7 +464,7 @@ def _persist_session_row_for_submit(rid, session):
     return None
 
 
-def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback):
+def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, display_metadata=None):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
@@ -494,7 +494,8 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
-        terminal_callback=hosted_terminal_callback)
+        terminal_callback=hosted_terminal_callback,
+        **({"display_metadata": display_metadata} if display_metadata else {}))
 
 
 _TRUNCATION_PARAMS = (
@@ -534,6 +535,9 @@ def _lock_in_submit_turn(
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
     sid = params.get("session_id", "")
+    admitted_id = params.get("_admitted_client_message_id")
+    display_metadata = {"client_message_id": admitted_id} if admitted_id else None
+    metadata_kwargs = {"display_metadata": display_metadata} if display_metadata else {}
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
     # Off-screen sends (widget intents) type the row so no client renders a bubble;
@@ -592,7 +596,7 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4091, "hosted room member session is busy")
             busy_transport = t or session.get("transport")
         busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")))
+            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), **metadata_kwargs)
         if busy_response is not None:
             return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
@@ -605,7 +609,7 @@ def _(rid, params: dict) -> dict:
         return err
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind)
+            rid, sid, session, text, display_kind=display_kind, **metadata_kwargs)
         if not isolated_response.get("error"):
             # The truncation already happened inline above (memory + DB).
             isolated_response["result"].update(survivor_fields)
@@ -628,7 +632,7 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, hosted_terminal_callback),
+            rid, sid, session, text, display_kind, hosted_terminal_callback, **metadata_kwargs),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread

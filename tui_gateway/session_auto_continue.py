@@ -125,7 +125,7 @@ def _ac_inflight_original(session: dict) -> str:
     return str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None) -> None:
+def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None, display_metadata: dict | None = None) -> None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing ones stay separate envelopes so attachment
     chronology survives. ``transport`` is pinned so the drained turn streams to its sender."""
@@ -134,14 +134,16 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     # original after a correction settles.
     # See #84417.
     _drop_queued_duplicates_of_inflight_user(session)
-    text_only = not image_paths and isinstance(text, str)
+    text_only = not image_paths and not display_metadata and isinstance(text, str)
     # Never queue a text-only self-copy of the live prompt: draining it would restart it.
     if text_only and text.strip() == _ac_inflight_original(session) != "":
         return
     queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {})}
+    if display_metadata:
+        queued["display_metadata"] = dict(display_metadata)
     existing = session.get("queued_prompt")
     if (existing and text_only and isinstance(existing.get("text"), str)
-            and not existing.get("image_paths") and not session.get("queued_prompts")):
+            and not existing.get("image_paths") and not existing.get("display_metadata") and not session.get("queued_prompts")):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
     elif existing:
@@ -162,7 +164,7 @@ def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict |
     if not isinstance(entry, dict):
         return None
     text = entry.get("text")
-    if not original or entry.get("image_paths") or not isinstance(text, str):
+    if not original or entry.get("image_paths") or entry.get("display_metadata") or not isinstance(text, str):
         return entry
     # A lossless text-merge may have glued the live original onto a later follow-up: keep the remainder.
     rest = next((text[len(original + sep):] for sep in ("\n\n", "\n") if text.startswith(original + sep)), text).strip()
@@ -233,7 +235,7 @@ def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: 
     return _ok(rid, {"status": status})
 
 
-def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False) -> dict | None:
+def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False, display_metadata: dict | None = None) -> dict | None:
     """Apply ``display.busy_input_mode`` to a mid-turn prompt instead of rejecting it (rejection made clients busy-retry
     and drop sends): ``interrupt`` (default) → redirect, falling back to hard interrupt + queue; ``queue`` → queue only;
     ``steer`` → inject after the current atomic action. ``queued=True`` (client queue drain) forces queue mode: a "run
@@ -264,7 +266,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(session, text, transport, image_paths=image_paths, **({"display_metadata": display_metadata} if display_metadata else {}))
         session["last_active"] = time.time()
     # Attachments need their own model invocation: queue without cancelling so the user gets both results in order.
     # ``steer`` must NEVER escalate to a hard interrupt: it would kill the live turn AND drop ``AIAgent._pending_steer``
@@ -305,6 +307,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     kwargs: dict = {"queued_prompt_generation": queue_generation}
+    if queued.get("display_metadata"):
+        kwargs["display_metadata"] = queued["display_metadata"]
     if queued.get("image_paths"):
         kwargs["image_paths"] = queued["image_paths"]
     dispatch_failed = False
@@ -338,6 +342,11 @@ def _inflight_snapshot(session: dict) -> dict | None:
     if not (user or assistant or streaming or error):
         return None
     snapshot = {"assistant": assistant, "streaming": streaming, "user": user}
+    if turn.get("turn_id"):
+        snapshot["turn_id"] = turn["turn_id"]
+    if turn.get("started_at") is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            snapshot["started_at"] = float(turn["started_at"])
     raw_offsets = turn.get("correction_offsets") or []
     correction_pairs = [(str(c), raw_offsets[i] if i < len(raw_offsets) else None)
                         for i, c in enumerate(turn.get("corrections") or []) if str(c).strip()]

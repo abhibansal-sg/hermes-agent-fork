@@ -239,6 +239,11 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             msg["display_kind"] = display_kind
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
+            if role == "user" and isinstance(m["display_metadata"], dict):
+                if client_id := m["display_metadata"].get("client_message_id"):
+                    msg["client_message_id"] = client_id
+                if turn_id := m["display_metadata"].get("hermes_turn_id"):
+                    msg["turn_id"] = turn_id
         messages.append(msg)
     return messages
 
@@ -260,7 +265,19 @@ def _inflight_text(value: Any) -> str:
 
 def _start_inflight_turn(session: dict, text: Any) -> None:
     now = time.time()
-    session["inflight_turn"] = {"assistant": "", "started_at": now, "streaming": True, "updated_at": now, "user": _inflight_text(text)}
+    session["inflight_turn"] = {"assistant": "", "started_at": now, "turn_id": uuid.uuid4().hex, "streaming": True, "updated_at": now, "user": _inflight_text(text)}
+
+
+def _inflight_display_metadata(session: dict, metadata: dict | None) -> dict | None:
+    """Stamp Hermes' opaque turn identity onto the canonical user row."""
+    turn = session.get("inflight_turn")
+    turn_id = turn.get("turn_id") if isinstance(turn, dict) else None
+    if not isinstance(turn_id, str) or not turn_id:
+        return dict(metadata) if isinstance(metadata, dict) else None
+    stamped = dict(metadata or {})
+    stamped.setdefault("hermes_turn_id", turn_id)
+    return stamped
+
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:

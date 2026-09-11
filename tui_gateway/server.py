@@ -727,11 +727,188 @@ def method(name: str):
     return dec
 
 
+PROMPT_ID_CONFLICT = 4093
+_PROMPT_ACCEPTED_DISPOSITIONS = frozenset({"queued", "redirected", "steered", "streaming"})
+
+
+def _find_prompt_session_locked(params):
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    return (sid, session) if session is not None else None
+
+
+def _begin_prompt_admission(rid, params: dict):
+    """Reserve an ID-enabled prompt before its handler can mutate live state."""
+    if "client_message_id" not in params:
+        return None, None
+    from tui_gateway.prompt_admission import (
+        PromptAdmission,
+        ensure_prompt_receipt_provider,
+        request_fingerprint,
+    )
+
+    provider = ensure_prompt_receipt_provider()
+    if provider is None:
+        # Provider absence is stock compatibility: old clients and installations
+        # without the thin durability edge retain the legacy response exactly.
+        return None, None
+    raw_id = params.get("client_message_id")
+    if not isinstance(raw_id, str):
+        return None, _err(rid, 4004, "client_message_id must be a canonical UUID")
+    try:
+        canonical_id = str(uuid.UUID(raw_id))
+    except (ValueError, AttributeError):
+        canonical_id = ""
+    if canonical_id != raw_id:
+        return None, _err(rid, 4004, "client_message_id must be a canonical UUID")
+
+    with _sessions_lock:
+        found = _find_prompt_session_locked(params)
+        if found is None:
+            # Preserve the prompt handler's established session-not-found error.
+            return None, None
+        _sid, session = found
+        session_key = _session_lookup_key(session, fallback=_sid)
+        profile_home = (
+            Path(str(session["profile_home"]))
+            if session.get("profile_home")
+            else get_hermes_home()
+        )
+    # Compression rotates the physical SessionDB row while preserving one
+    # logical conversation. Fingerprint the lineage root so a retry after an
+    # auto-compression (or after reconnecting to its continuation row) still
+    # identifies the same destination instead of falsely conflicting.
+    try:
+        with _session_db(session) as db:
+            if db is not None:
+                session_key = str(db.get_conversation_root(session_key) or session_key)
+    except Exception:
+        logger.debug("prompt receipt lineage lookup failed", exc_info=True)
+
+    raw_text = params.get("text", "")
+    if isinstance(raw_text, str):
+        try:
+            from hermes_cli.input_sanitize import sanitize_user_prompt_text
+
+            raw_text = sanitize_user_prompt_text(raw_text)
+        except Exception:
+            pass
+    truncate = params.get("truncate_before_user_ordinal")
+    if truncate is not None:
+        try:
+            truncate = int(truncate)
+        except (TypeError, ValueError):
+            return None, _err(
+                rid, 4004, "truncate_before_user_ordinal must be an integer"
+            )
+    fingerprint = request_fingerprint(
+        session_key=session_key,
+        text=raw_text,
+        truncate_before_user_ordinal=truncate,
+        confirm_truncate=is_truthy_value(params.get("confirm_truncate")),
+        confirm_empty_truncate=is_truthy_value(
+            params.get("confirm_empty_truncate")
+        ),
+        queued=params.get("queued", False),
+        interrupted=params.get("interrupted", False),
+        extra={key: params[key] for key in (
+            "truncate_before_row_id", "truncate_before_message_id", "rebind_survivor_row_ids",
+            "display_kind", "surface") if key in params},
+    )
+    try:
+        outcome = provider.reserve(
+            profile_home=profile_home,
+            client_message_id=canonical_id,
+            request_fingerprint=fingerprint,
+        )
+    except Exception as exc:
+        logger.warning("prompt receipt reservation failed: %s", exc)
+        return None, _err(rid, 5037, "prompt receipt store unavailable")
+    state = outcome.get("state") if isinstance(outcome, dict) else None
+    if state == "claimed":
+        # Internal-only correlation passed through the stock prompt handler.
+        # It is never model input; _run_prompt_submit stores it as display
+        # metadata on Hermes' canonical user row.
+        params["_admitted_client_message_id"] = canonical_id
+        return PromptAdmission(
+            provider=provider,
+            reservation=outcome.get("reservation"),
+            client_message_id=canonical_id,
+        ), None
+    if state == "replay" and isinstance(outcome.get("disposition"), dict):
+        disposition = dict(outcome["disposition"])
+        disposition["accepted"] = True
+        disposition["client_message_id"] = canonical_id
+        disposition["deduplicated"] = True
+        return None, _ok(rid, disposition)
+    if state == "conflict":
+        return None, _err(
+            rid,
+            PROMPT_ID_CONFLICT,
+            "client_message_id was already used for a different prompt",
+        )
+    if state in {"in_progress", "indeterminate"}:
+        return None, _ok(
+            rid,
+            {
+                "accepted": False,
+                "client_message_id": canonical_id,
+                "deduplicated": True,
+                "status": state,
+            },
+        )
+    logger.warning("prompt receipt provider returned invalid outcome: %r", outcome)
+    return None, _err(rid, 5037, "prompt receipt store unavailable")
+
+
+def _release_prompt_admission(admission) -> None:
+    if admission is None:
+        return
+    try:
+        admission.provider.release(admission.reservation)
+    except Exception:
+        logger.warning("prompt receipt release failed", exc_info=True)
+
+
+def _complete_prompt_admission(rid, admission, response: dict | None):
+    """Bind a successful handler disposition to its durable reservation."""
+    if admission is None or not isinstance(response, dict):
+        return response
+    result = response.get("result")
+    if not isinstance(result, dict):
+        _release_prompt_admission(admission)
+        return response
+    if result.get("status") not in _PROMPT_ACCEPTED_DISPOSITIONS:
+        # prompt.submit also owns a typed voice-stop shortcut. It is a valid
+        # RPC result but did not admit a model turn, so it must not consume a
+        # durable prompt identity or masquerade as an accepted prompt receipt.
+        _release_prompt_admission(admission)
+        return response
+    disposition = dict(result)
+    disposition["accepted"] = True
+    disposition["client_message_id"] = admission.client_message_id
+    disposition["deduplicated"] = False
+    try:
+        admission.provider.complete(admission.reservation, disposition)
+    except Exception as exc:
+        # The reservation remains owned by this process. A retry receives
+        # in_progress rather than executing twice; a restarted process marks it
+        # indeterminate. Never claim a durable receipt was written when it was not.
+        logger.warning("prompt receipt completion failed: %s", exc)
+        return _err(rid, 5037, "prompt receipt store unavailable")
+    return _ok(rid, disposition)
+
+
+
 GATEWAY_CAPABILITIES = ("session_watch_v1",)
 
 
 def gateway_ready_payload(skin: dict) -> dict:
-    return {"skin": skin, "change_events": True, "capabilities": list(GATEWAY_CAPABILITIES)}
+    from tui_gateway.prompt_admission import ensure_prompt_receipt_provider
+    capabilities = list(GATEWAY_CAPABILITIES)
+    if ensure_prompt_receipt_provider() is not None:
+        capabilities.append("prompt_receipt_admission_v1")
+    return {"skin": skin, "change_events": True, "capabilities": capabilities}
 
 
 def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
@@ -756,7 +933,20 @@ def handle_request(req: dict) -> dict | None:
         return _err(rid, -32601, f"unknown method: {method}")
     token = _current_rpc_method.set(method)
     try:
-        return fn(rid, params)
+        admission = None
+        # Correlation is server-owned; never trust a wire-supplied internal field.
+        params = dict(params)
+        params.pop("_admitted_client_message_id", None)
+        if method == "prompt.submit":
+            admission, immediate = _begin_prompt_admission(rid, params)
+            if immediate is not None:
+                return immediate
+        try:
+            response = fn(rid, params)
+        except Exception:
+            _release_prompt_admission(admission)
+            raise
+        return _complete_prompt_admission(rid, admission, response)
     finally:
         _current_rpc_method.reset(token)
 
