@@ -1237,7 +1237,7 @@ final class SessionStore {
                         "omit_info": .bool(compactSnapshot),
                     ]
                     // Bot Mode has an authoritative profile echo from
-                    // `profiles.ensure_bot_chat`. Thread that identity even
+                    // `profiles.list`. Thread that identity even
                     // while the REST profile probe is still unsettled; the
                     // gateway's stock watch route must not fall back to the
                     // launch profile for a named bot.
@@ -3387,7 +3387,7 @@ final class SessionStore {
         bindRuntime: Bool = true
     ) {
         // Bot Mode receives the owning profile directly from Hermes' canonical
-        // ensure response. Preserve it in the same presentation row used by
+        // registry response. Preserve it in the same presentation row used by
         // the normal drawer path so active identity, watch, resume, and cache
         // scope all agree before any capability probe settles.
         var summary = summary

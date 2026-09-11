@@ -29,8 +29,7 @@ struct BotModeRootView: View {
         .hermesThemed(themeStore)
         // A newly accepted transport gets a fresh profile read. This is a
         // presentation refresh only; the server remains profile authority.
-        .task(id: "\(connection.transportEpoch):\(connection.botModeCapability.rawValue)") {
-            guard connection.botModeCapability == .available else { return }
+        .task(id: "\(connection.transportEpoch):\(connection.capabilities.profiles.rawValue):\(connection.gatewayProtocolCapabilitiesSettled)") {
             await botMode.refresh(using: connection)
         }
         .alert(
@@ -95,10 +94,14 @@ private struct BotRosterView: View {
     private var rosterContent: some View {
         switch connection.botModeCapability {
         case .unknown:
-            capabilityState(
-                title: "Waiting for Hermes",
-                message: "Bot Mode will appear after this gateway advertises support."
-            )
+            if case .failed(let message) = botMode.rosterPhase {
+                errorState(message)
+            } else {
+                capabilityState(
+                    title: "Waiting for Hermes",
+                    message: "Checking this gateway’s profiles and canonical-chat support."
+                )
+            }
         case .unavailable:
             capabilityState(
                 title: "Bot Mode unavailable",

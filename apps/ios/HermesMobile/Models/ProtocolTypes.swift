@@ -146,13 +146,33 @@ struct ProfileSummary: Decodable, Identifiable, Sendable, Equatable {
     /// Optional human description for a switcher subtitle; absent ⇒ `nil`.
     let description: String?
 
+    var canonicalSession: CanonicalBotSession? = nil
+    var hasCanonicalSessionField = false
+
     var id: String { name }
+
+    init(name: String, isDefault: Bool, description: String?) {
+        self.name = name
+        self.isDefault = isDefault
+        self.description = description
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, isDefault, description, canonicalSession
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        isDefault = try c.decode(Bool.self, forKey: .isDefault)
+        description = try c.decodeIfPresent(String.self, forKey: .description)
+        canonicalSession = try c.decodeIfPresent(CanonicalBotSession.self, forKey: .canonicalSession)
+        hasCanonicalSessionField = c.contains(.canonicalSession)
+    }
 }
 
-/// `profiles.ensure_bot_chat` result. `sessionId` is always the durable Hermes
-/// session identity and must enter the normal ``SessionStore`` opening path.
-/// A newly-created chat can additionally expose its live runtime identity, but
-/// iOS deliberately does not use that ephemeral id as its selected session.
+/// ABH-520: local resolution outcome, NOT a gateway RPC response.
+/// `sessionId` is durable; runtime identity never becomes the selected row.
 struct BotChatEnsureResult: Decodable, Sendable, Equatable {
     let sessionId: String
     let profile: String

@@ -555,11 +555,16 @@ final class ConnectionStore {
         return supportsGatewayCapability(capability) ? .available : .unavailable
     }
 
-    /// Bot Mode is a gateway protocol feature, not a client-only presentation
-    /// preference. Keep this read beside the other gateway capability accessors
-    /// so the UI never grows a second capability cache.
+    /// ABH-520: REST proves profiles exist; WS proves the canonical-chat contract.
+    private(set) var botModeProtocolState: ServerCapabilities.State = .unknown
+
     var botModeCapability: ServerCapabilities.State {
-        gatewayCapabilityState("profiles_bot_chat_v1")
+        guard capabilities.profiles == .available else { return capabilities.profiles }
+        return botModeProtocolState
+    }
+
+    func applyBotProfiles(_ result: BotProfilesResult) {
+        botModeProtocolState = result.supportsBotMode ? .available : .unavailable
     }
 
     func applyGatewayReadyCapabilities(_ payload: JSONValue) {
@@ -820,6 +825,7 @@ final class ConnectionStore {
         // never create a runtime epoch that callers could bind to.
         gatewayProtocolCapabilities.removeAll()
         gatewayProtocolCapabilitiesSettled = false
+        botModeProtocolState = .unknown
         let candidateEpoch = transportEpoch &+ 1
         ReliabilityDiagnostics.shared.websocketConnect(epoch: candidateEpoch)
         setTransportReadiness(.connecting(epoch: candidateEpoch))
@@ -839,6 +845,7 @@ final class ConnectionStore {
         // reconnect handshake is still unsettled.
         gatewayProtocolCapabilities.removeAll()
         gatewayProtocolCapabilitiesSettled = false
+        botModeProtocolState = .unknown
         switch transportReadiness {
         case .ready(let epoch), .connecting(let epoch), .unavailable(let epoch):
             ReliabilityDiagnostics.shared.websocketClose(epoch: epoch)
@@ -1832,6 +1839,7 @@ final class ConnectionStore {
         capabilities.reset()
         gatewayProtocolCapabilities.removeAll()
         gatewayProtocolCapabilitiesSettled = false
+        botModeProtocolState = .unknown
         // Forget the resolved model so a fresh connection re-probes it (F0).
         activeModelName = nil
         // Clear the per-session hot-swap state so the next session starts clean.

@@ -37,24 +37,29 @@ final class BotModeStore {
         self.botChatEnsurer = botChatEnsurer
     }
 
-    /// Refresh from the existing native `GET /api/profiles` surface. The roster
-    /// is intentionally not persisted or transformed into a separate model.
+    /// ABH-520: side-effect-free stock registry lookup also settles capability.
     func refresh(using connection: ConnectionStore? = nil) async {
-        if let connection, connection.botModeCapability != .available {
+        refreshGeneration &+= 1
+        if let connection, connection.capabilities.profiles != .available {
             profiles = []
             rosterPhase = .idle
             return
         }
-        refreshGeneration &+= 1
         let generation = refreshGeneration
+        let epoch = connection?.transportEpoch
         rosterPhase = .loading
 
         do {
             let loaded: [ProfileSummary]
             if let profileLoader {
                 loaded = try await profileLoader()
-            } else if let rest = connection?.rest {
-                loaded = try await rest.profiles()
+            } else if let connection {
+                let result = try await connection.client.botProfiles()
+                guard !Task.isCancelled, generation == refreshGeneration,
+                      connection.transportEpoch == epoch,
+                      connection.gatewayProtocolCapabilitiesSettled else { return }
+                connection.applyBotProfiles(result)
+                loaded = result.supportsBotMode ? result.profiles : []
             } else {
                 throw BotModeError.notConnected
             }
@@ -89,6 +94,7 @@ final class BotModeStore {
             return nil
         }
 
+        let epoch = connection?.transportEpoch
         openingProfileID = profile.id
         openError = nil
         defer { openingProfileID = nil }
@@ -103,6 +109,11 @@ final class BotModeStore {
                 throw BotModeError.notConnected
             }
 
+            guard !Task.isCancelled else { return nil }
+            if let connection {
+                guard connection.transportEpoch == epoch,
+                      connection.botModeCapability == .available else { return nil }
+            }
             let sessionID = result.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
             let resolvedProfile = result.profile.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !sessionID.isEmpty,
@@ -125,7 +136,7 @@ final class BotModeStore {
                     && Self.normalizedProfile(candidate.profile) == Self.normalizedProfile(resolvedProfile)
             } ?? SessionSummary(
                 id: sessionID,
-                title: resolvedProfile,
+                title: BotChatResolution.title,
                 preview: nil,
                 startedAt: nil,
                 messageCount: nil,
