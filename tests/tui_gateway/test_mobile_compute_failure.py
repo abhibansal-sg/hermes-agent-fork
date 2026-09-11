@@ -105,4 +105,3 @@ def test_compute_host_normal_turn_end_carries_returned_provider_failure(monkeypa
     assert completed["terminal_event_emitted"] is True
     assert completed["inflight"]["status"] == "error"
     assert completed["inflight"]["turn_id"]
-

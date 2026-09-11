@@ -160,4 +160,3 @@ def test_gateway_ready_advertises_versioned_session_watch_capability():
     assert payload["skin"] == {"name": "default"}
     assert payload["change_events"] is True
     assert "session_watch_v1" in payload["capabilities"]
-
