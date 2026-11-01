@@ -146,7 +146,38 @@ struct ProfileSummary: Decodable, Identifiable, Sendable, Equatable {
     /// Optional human description for a switcher subtitle; absent ⇒ `nil`.
     let description: String?
 
+    var canonicalSession: CanonicalBotSession? = nil
+    var hasCanonicalSessionField = false
+
     var id: String { name }
+
+    init(name: String, isDefault: Bool, description: String?) {
+        self.name = name
+        self.isDefault = isDefault
+        self.description = description
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, isDefault, description, canonicalSession
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        isDefault = try c.decode(Bool.self, forKey: .isDefault)
+        description = try c.decodeIfPresent(String.self, forKey: .description)
+        canonicalSession = try c.decodeIfPresent(CanonicalBotSession.self, forKey: .canonicalSession)
+        hasCanonicalSessionField = c.contains(.canonicalSession)
+    }
+}
+
+/// ABH-520: local resolution outcome, NOT a gateway RPC response.
+/// `sessionId` is durable; runtime identity never becomes the selected row.
+struct BotChatEnsureResult: Decodable, Sendable, Equatable {
+    let sessionId: String
+    let profile: String
+    let created: Bool
+    let runtimeSessionId: String?
 }
 
 /// Wrapper for `GET /api/profiles/sessions` (`web_server.py:1734-1741`) — the

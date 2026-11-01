@@ -128,6 +128,9 @@ struct SettingsView: View {
     /// shared ``DefaultsKeys/displayName`` key so the chat greeting (F3) reads the
     /// same source of truth without re-presenting anything.
     @AppStorage(DefaultsKeys.displayName) private var displayName = ""
+    /// Root presentation preference. Shared with ``RootView`` through
+    /// AppStorage so mode changes apply immediately and survive relaunches.
+    @AppStorage(DefaultsKeys.appPresentationMode) private var appPresentationMode: AppPresentationMode = .sessions
     /// Whether typing `@` in the composer opens the file-mention autocomplete.
     @AppStorage(DefaultsKeys.mentionAutocompleteEnabled) private var mentionAutocompleteEnabled = true
 
@@ -187,6 +190,7 @@ struct SettingsView: View {
                 // "no behavior change" reachability contract in the type
                 // doc above.
                 appearanceSection
+                presentationModeSection
                 connectionSection
                 notificationsSection
                 modelsAndKeysSection
@@ -284,6 +288,26 @@ struct SettingsView: View {
     }
 
     // MARK: - Account (name + Nous credits)
+
+    @ViewBuilder
+    private var presentationModeSection: some View {
+        Section {
+            Picker("Conversation mode", selection: $appPresentationMode) {
+                ForEach(AppPresentationMode.allCases, id: \.rawValue) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityLabel("Conversation mode")
+            .accessibilityValue(appPresentationMode.title)
+            .accessibilityIdentifier("settingsPresentationMode")
+        } header: {
+            Text("Conversation Mode")
+        } footer: {
+            Text(appPresentationMode.detail)
+        }
+        .listRowBackground(theme.card)
+    }
 
     /// The account header card: an avatar circle with the user's initials, the
     /// editable display name, and the server URL. Content, not chrome, so it
