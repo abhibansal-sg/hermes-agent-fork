@@ -37,6 +37,8 @@ PROJ="$REPO_ROOT/apps/ios/HermesMobile.xcodeproj"
 DEFAULT_DD="$REPO_ROOT/apps/ios/.derivedData"
 LOCK_DIR="$HOME/.hermes/ios-build.lock"          # machine-global; stable across worktrees + sessions
 TIMEOUT="${HERMES_BUILD_TIMEOUT:-1200}"
+LOCK_CONF="${HERMES_BUILD_LOCK_CONF:-$HOME/.hermes/ios-build.conf}"  # live settings: LOCK_WAIT_SECONDS=<n>
+LOCK_WAIT_EXIT=76                                  # distinct rc: gave up waiting for the lock
 LOG="${HERMES_BUILD_LOG:-/tmp/hermes-ios-build-$$.log}"
 # Early SWBBuildService-wedge detection (Xcode 26 made SWBBuildService a per-user
 # SINGLETON Mach service — concurrent xcodebuilds race to register on the same XPC
@@ -131,6 +133,12 @@ preflight_wedge_check(){
   # (1) Already-wedged signature: SWBBuildService up, 0 swift-frontend, a live xcodebuild
   #     parked. Starting another build now just stacks a second frozen process on the
   #     poisoned per-user daemon. ABORT (override with HERMES_BUILD_ALLOW_WEDGED=1).
+  # A live lock holder owns that xcodebuild (often still at 0 swift-frontend while it starts): queue behind it
+  # instead of aborting (1 Nov: two queued builds exited 75 in 4 s instead of waiting).
+  local holder; holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    log "preflight: lock held by live pid $holder; queueing, wedge check skipped."; return 0
+  fi
   if [ "${swb:-0}" -gt 0 ] && [ "${sf:-0}" -eq 0 ] && pgrep -x xcodebuild >/dev/null 2>&1; then
     if [ "${HERMES_BUILD_ALLOW_WEDGED:-0}" = "1" ]; then
       log "WARNING: SWBBuildService WEDGE signature present (0 swift-frontend + live xcodebuild)."
@@ -159,7 +167,7 @@ preflight_wedge_check(){
 # ---- machine-global mutex (mkdir is atomic; pid file enables stale reclaim) --
 acquire_lock(){
   mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null || true
-  local waited=0 holder
+  local waited=0 holder limit
   while true; do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
       echo "$$" > "$LOCK_DIR/pid"
@@ -172,8 +180,15 @@ acquire_lock(){
       log "stale lock from dead pid $holder — reclaiming"
       rm -rf "$LOCK_DIR"; continue
     fi
+    # Live wait limit (Abhi, 1 Nov): LOCK_WAIT_SECONDS in ~/.hermes/ios-build.conf, re-read every pass, so a change
+    # applies to builds already waiting. Default 2700 s (45 min). Past it: exit LOCK_WAIT_EXIT, nothing built.
+    limit=$(sed -n 's/^LOCK_WAIT_SECONDS=\([0-9][0-9]*\)$/\1/p' "$LOCK_CONF" 2>/dev/null | tail -1)
+    if [ "$waited" -ge "${limit:-2700}" ]; then
+      log "LOCK WAIT LIMIT ${limit:-2700}s reached (holder pid ${holder:-?}: $(cat "$LOCK_DIR/info" 2>/dev/null)); not building (rc=$LOCK_WAIT_EXIT)."
+      exit "$LOCK_WAIT_EXIT"
+    fi
     [ $((waited % 15)) -eq 0 ] && \
-      log "another iOS build holds the lock (pid ${holder:-?}: $(cat "$LOCK_DIR/info" 2>/dev/null)); waiting…"
+      log "another iOS build holds the lock (pid ${holder:-?}: $(cat "$LOCK_DIR/info" 2>/dev/null)); waiting… (${waited}s of ${limit:-2700}s)"
     sleep 3; waited=$((waited+3))
   done
 }
